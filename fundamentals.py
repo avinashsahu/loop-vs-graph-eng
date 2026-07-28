@@ -9,74 +9,81 @@ from logging_config import setup_logging
 log = setup_logging("fundamentals")
 
 FUNDAMENTALS_CACHE_TTL_HOURS = float(os.environ.get("FUNDAMENTALS_CACHE_TTL_HOURS", "24"))
-_NEXT_API_BASE = "https://www.nseindia.com/api/NextApi/apiClient"
 
-# Endpoint (function-name) identifiers under _NEXT_API_BASE. getPeerComparisonQuaters,
-# getPeerComparisonData and getYearwiseData were confirmed against a live response; the
-# remaining three are best-guess placeholders (same naming convention, not individually
-# re-confirmed in this session) -- fix these against a real response before trusting the
-# announcements/actions/shareholding fields.
-_FN_CORP_ANNOUNCEMENTS = "GetCorpAnnouncementsApi"
-_FN_CORP_ACTIONS = "GetCorpActionsApi"
-_FN_SHAREHOLDING_PATTERN = "GetShareholdingPatternApi"
-_FN_YEARWISE_DATA = "getYearwiseData"
-_FN_PEER_COMPARISON_QUARTERS = "getPeerComparisonQuaters"
-_FN_PEER_COMPARISON_DATA = "getPeerComparisonData"
+# All 8 endpoints share this one path -- functionName is a query param, not a path segment.
+# Confirmed live against HDFCBANK for all of: getSymbolName, getCorporateAnnouncement,
+# getCorpAction, getShareholdingPattern, getYearwiseData, getPeerComparisonQuaters,
+# getPeerComparisonData.
+_NEXT_API_URL = "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
 
 
 def _next_api_get(function_name, params):
-    resp = get_request(f"{_NEXT_API_BASE}/{function_name}", params=params)
+    resp = get_request(_NEXT_API_URL, params={"functionName": function_name, **params})
     if resp is None:
         return None
     return resp.json()
 
 
+def _get_symbol_name(symbol):
+    data = _next_api_get("getSymbolName", {"symbol": symbol})
+    return (data or {}).get("companyName")
+
+
 def _get_corp_announcements(symbol):
-    data = _next_api_get(_FN_CORP_ANNOUNCEMENTS, {"symbol": symbol})
+    data = _next_api_get(
+        "getCorporateAnnouncement",
+        {"symbol": symbol, "marketApiType": "equities", "noOfRecords": 3},
+    )
     items = data if isinstance(data, list) else (data or {}).get("data", [])
     return items[:3]
 
 
 def _get_corp_actions(symbol):
-    data = _next_api_get(_FN_CORP_ACTIONS, {"symbol": symbol})
+    data = _next_api_get(
+        "getCorpAction",
+        {"symbol": symbol, "marketApiType": "equities", "noOfRecords": 3},
+    )
     items = data if isinstance(data, list) else (data or {}).get("data", [])
     return items[:3]
 
 
 def _get_shareholding_pattern(symbol):
-    data = _next_api_get(_FN_SHAREHOLDING_PATTERN, {"symbol": symbol})
-    items = data if isinstance(data, list) else (data or {}).get("data", [])
-    return items[:5]
+    # Shape confirmed live: a dict keyed by period date (not a list), e.g.
+    # {"30-Jun-2026": {"public": {...}, "Total": "100.00", ...}, "31-Mar-2026": {...}, ...}
+    data = _next_api_get("getShareholdingPattern", {"symbol": symbol, "noOfRecords": 5})
+    if not isinstance(data, dict):
+        return []
+    return [{"period": period, **fields} for period, fields in list(data.items())[:5]]
 
 
 def _get_yearwise_returns(symbol):
     # NSE API quirk: this endpoint (only this one) expects the symbol suffixed with "EQN".
-    return _next_api_get(_FN_YEARWISE_DATA, {"symbol": f"{symbol}EQN"})
+    return _next_api_get("getYearwiseData", {"symbol": f"{symbol}EQN"})
 
 
 def _get_peer_comparison(symbol):
-    quarters_resp = _next_api_get(_FN_PEER_COMPARISON_QUARTERS, {"symbol": symbol})
+    quarters_resp = _next_api_get("getPeerComparisonQuaters", {"symbol": symbol})
     quarters = quarters_resp if isinstance(quarters_resp, list) else (quarters_resp or {}).get("data", [])
     if not quarters:
         return None, None
-    latest_quarter = quarters[0]
-    peer_data = _next_api_get(_FN_PEER_COMPARISON_DATA, {"symbol": symbol, "quarter": latest_quarter})
+    latest_quarter = quarters[0]["value"]
+    peer_data = _next_api_get(
+        "getPeerComparisonData",
+        {"symbol": symbol, "type": "S", "quarter": latest_quarter, "param": "industry", "index": ""},
+    )
     return latest_quarter, peer_data
 
 
 def _extract_eps_pat(symbol, peer_data):
-    """Best-effort EPS/PAT lookup for `symbol`'s own row in the peer-comparison table.
+    """EPS/PAT lookup for `symbol`'s own row in the peer-comparison table.
 
-    Field names weren't confirmed against a live response in this session -- verify these
-    key names locally and extend the fallback lists below if they don't match.
+    Confirmed live: peer_data is a flat list of dicts, each with plain "eps"/"pat" keys.
     """
     rows = peer_data if isinstance(peer_data, list) else (peer_data or {}).get("data", [])
     row = next((r for r in rows if r.get("symbol") == symbol), None)
     if row is None:
         return None, None
-    eps = next((row[k] for k in ("eps", "EPS", "basicEPS") if k in row), None)
-    pat = next((row[k] for k in ("pat", "PAT", "netProfit") if k in row), None)
-    return eps, pat
+    return row.get("eps"), row.get("pat")
 
 
 def get_fundamental_snapshot(symbol: str) -> dict:
@@ -94,6 +101,7 @@ def get_fundamental_snapshot(symbol: str) -> dict:
         }
 
         for field, fetch in (
+            ("company_name", lambda: _get_symbol_name(symbol)),
             ("corp_announcements", lambda: _get_corp_announcements(symbol)),
             ("corp_actions", lambda: _get_corp_actions(symbol)),
             ("shareholding_pattern", lambda: _get_shareholding_pattern(symbol)),
