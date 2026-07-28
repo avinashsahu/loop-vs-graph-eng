@@ -1,0 +1,11 @@
+[project]
+name = "loop-vs-graph-eng"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.14"
+dependencies = [
+    "anthropic>=0.120.0",
+    "nsemine>=1.5",
+    "openai>=2.49.0",
+    "python-dotenv>=1.2.2",
+]
