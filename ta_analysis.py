@@ -3,24 +3,73 @@ import talib
 
 def compute_indicators(hist):
     close = hist["close"].to_numpy(dtype=float)
+    high = hist["high"].to_numpy(dtype=float)
+    low = hist["low"].to_numpy(dtype=float)
     sma20 = talib.SMA(close, timeperiod=20)
     sma50 = talib.SMA(close, timeperiod=50)
     rsi14 = talib.RSI(close, timeperiod=14)
     macd, macd_signal, macd_hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
+    atr14 = talib.ATR(high, low, close, timeperiod=14)
+    last_close = close[-1]
     return {
-        "close": round(close[-1], 2),
+        "close": round(last_close, 2),
         "sma20": round(sma20[-1], 2),
         "sma50": round(sma50[-1], 2),
         "rsi14": round(rsi14[-1], 2),
         "macd": round(macd[-1], 2),
         "macd_signal": round(macd_signal[-1], 2),
         "macd_hist": round(macd_hist[-1], 2),
+        "atr14": round(atr14[-1], 2),
+        # ATR as a % of price -- volatility measure independent of the stock's price
+        # level, used below to widen/narrow the RSI overbought/oversold bands.
+        "atr_pct": round(atr14[-1] / last_close * 100, 2),
     }
 
 
 # Daily counts most, matching the "weight the daily trend most heavily, use intraday to
 # confirm timing" rule this scoring replaces an LLM call for.
 _TIMEFRAME_WEIGHTS = {"D": 3, "30": 2, "15": 1, "5": 1}
+
+# Scale for the SMA20/50 gap: a 3% separation maxes out the trend score at +/-1. Picked
+# because a 3% SMA20/50 gap is already a well-established trend on NSE large caps, not
+# backtested against this app's own data (see README/commit for the sourcing caveat).
+_SMA_GAP_SCALE_PCT = 3.0
+
+
+def _clip(value, lo=-1.0, hi=1.0):
+    # float() up front -- indicators are numpy floats, and numpy comparisons/arithmetic
+    # produce numpy scalars that repr as "np.float64(...)" in log strings.
+    return max(lo, min(hi, float(value)))
+
+
+def _adaptive_rsi_bands(atr_pct):
+    """Overbought/oversold RSI band, widened or narrowed by recent volatility (ATR% of
+    price) instead of Wilder's fixed 70/30 -- that fixed pair is an unvalidated 1978
+    convention, not something derived from data. Volatility-adjusted bands are a real,
+    established improvement direction (see README/commit), but the specific cutoffs
+    below are a reasonable starting heuristic, not calibrated against this app's own
+    universe -- that calibration needs a backtest harness over the bhavcopy history,
+    which doesn't exist yet.
+    """
+    if atr_pct < 1.0:
+        return 35.0, 65.0
+    if atr_pct < 2.5:
+        return 30.0, 70.0
+    return 20.0, 80.0
+
+
+def _rsi_penalty(rsi, lower, upper):
+    """0 inside the neutral band; ramps toward -1 the further RSI sits beyond either
+    edge, hitting -1 exactly at 0 or 100. Extremes on either side are treated as
+    caution, matching the old rule ("overbought = momentum may be exhausted",
+    "oversold = conflicts with a genuine uptrend claim") but graduated instead of a
+    step function.
+    """
+    if rsi > upper:
+        return -_clip((rsi - upper) / (100.0 - upper))
+    if rsi < lower:
+        return -_clip((lower - rsi) / lower)
+    return 0.0
 
 
 def score_technical(indicators):
@@ -30,43 +79,85 @@ def score_technical(indicators):
     numeric thresholds here: gemma4 produced byte-identical verdicts regardless of RSI
     value (completely ignoring the stated RSI rule); Fin-R1 engaged with the numbers in
     its reasoning text but still never once flipped to BAD across 11 deliberately-
-    bearish test cases, and in one case asserted "90.0 > 95.0" as fact. This isn't a
-    model-quality problem -- threshold/comparison logic just doesn't belong in a
-    free-text LLM prompt. Every comparison below is the same one the old prompt stated
-    in English ("SMA20 above SMA50 is a bullish trend", "RSI above 70 is overbought",
-    "positive MACD histogram is bullish momentum"), just applied exactly instead of
-    hoping the model applies it.
+    bearish test cases, and in one case asserted "90.0 > 95.0" as fact. Threshold and
+    comparison logic doesn't belong in a free-text LLM prompt -- it belongs here.
 
-    Returns a dict with the per-timeframe/RSI breakdown and a final GOOD/BAD verdict,
-    so the log/email can show the same kind of "why" a verdict string used to carry.
+    Two upgrades over a plain weighted point-sum:
+    1. Graduated scores. SMA trend and MACD momentum are scored by how far apart the
+       values are (as a fraction of a scale, clipped to +/-1), not just which side of
+       zero they land on -- a 0.1% SMA gap and a 3% SMA gap used to count the same.
+    2. Confluence gating. A positive total score is only trusted as GOOD if a genuine
+       majority of the independent signal components (trend + momentum across 4
+       timeframes, plus daily RSI) actually agree on direction. A single strong
+       component dragging a lot of disagreeing ones to a barely-positive sum is exactly
+       the fragile case "confluence" is meant to rule out -- so that case is BAD, not GOOD.
     """
     breakdown = {}
-    score = 0
+    total_score = 0.0
+    agree = 0
+    votes = 0
+
+    daily_atr_pct = indicators["D"]["atr_pct"]
+    rsi_lower, rsi_upper = _adaptive_rsi_bands(daily_atr_pct)
+
     for tf, weight in _TIMEFRAME_WEIGHTS.items():
         ind = indicators[tf]
-        # bool()/int() -- compute_indicators' values are numpy floats, and comparisons
-        # against them produce numpy.bool_, which reprs as "np.True_" in log strings.
-        sma_bullish = bool(ind["sma20"] > ind["sma50"])
-        macd_bullish = bool(ind["macd_hist"] > 0)
-        tf_score = int(weight * ((1 if sma_bullish else -1) + (1 if macd_bullish else -1)))
-        breakdown[tf] = {"sma_bullish": sma_bullish, "macd_bullish": macd_bullish, "weighted_score": tf_score}
-        score += tf_score
+        sma_gap_pct = (ind["sma20"] - ind["sma50"]) / ind["sma50"] * 100
+        trend_score = _clip(sma_gap_pct / _SMA_GAP_SCALE_PCT)
 
-    # RSI only checked at the daily level -- it's a caution flag on the primary trend
-    # read, not an intraday-timing signal like the other two.
-    daily_rsi = indicators["D"]["rsi14"]
-    rsi_note = "neutral"
-    if daily_rsi > 70:
-        rsi_note = "overbought (caution -- momentum may be exhausted)"
-        score -= 2
-    elif daily_rsi < 30:
-        rsi_note = "oversold (conflicts with a genuine uptrend claim)"
-        score -= 2
+        atr = ind["atr14"] or 1e-9  # guard against a zero-ATR flat series
+        momentum_score = _clip(ind["macd_hist"] / (atr * 0.5))
+
+        tf_score = weight * (trend_score + momentum_score)
+        breakdown[tf] = {
+            "trend_score": round(trend_score, 3),
+            "momentum_score": round(momentum_score, 3),
+            "weighted_score": round(tf_score, 3),
+        }
+        total_score += tf_score
+        for component in (trend_score, momentum_score):
+            if component != 0:
+                votes += 1
+                if component > 0:
+                    agree += 1
+
+    daily_rsi = float(indicators["D"]["rsi14"])
+    rsi_score = _rsi_penalty(daily_rsi, rsi_lower, rsi_upper)
+    # Weighted the same as one daily trend/momentum component so it can meaningfully
+    # move the total without dominating it.
+    total_score += rsi_score * _TIMEFRAME_WEIGHTS["D"]
+    if rsi_score != 0:
+        votes += 1
+        if rsi_score > 0:
+            agree += 1
+
+    if rsi_score > 0:
+        rsi_note = "neutral"
+    elif daily_rsi > rsi_upper:
+        rsi_note = f"overbought vs adaptive band >{rsi_upper:.0f} (caution -- momentum may be exhausted)"
+    elif daily_rsi < rsi_lower:
+        rsi_note = f"oversold vs adaptive band <{rsi_lower:.0f} (conflicts with a genuine uptrend claim)"
+    else:
+        rsi_note = "neutral"
+
+    # Direction each voting component points is compared against the FINAL sign, not
+    # the raw agree/disagree split -- a total_score <= 0 needs every component pulling
+    # down to count as "confluent bearishness"; disagreement there doesn't matter
+    # because the verdict is already BAD.
+    if total_score <= 0:
+        verdict = "BAD"
+        confluence_ratio = (votes - agree) / votes if votes else 0.0
+    else:
+        confluence_ratio = agree / votes if votes else 0.0
+        verdict = "GOOD" if confluence_ratio >= 0.5 else "BAD"
 
     return {
-        "score": score,
-        "verdict": "GOOD" if score > 0 else "BAD",
+        "score": round(total_score, 2),
+        "verdict": verdict,
+        "confluence_ratio": round(confluence_ratio, 2),
+        "votes": votes,
         "breakdown": breakdown,
         "daily_rsi": daily_rsi,
         "rsi_note": rsi_note,
+        "rsi_band": (rsi_lower, rsi_upper),
     }

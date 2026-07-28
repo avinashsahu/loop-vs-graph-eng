@@ -72,8 +72,9 @@ def node_technical(state):
     # LLM (gemma4 or Fin-R1) applies reliably, regardless of model quality.
     result = ta_analysis.score_technical(indicators)
     state["technical_verdict"] = (
-        f"{result['verdict']} (score={result['score']}): daily RSI14={result['daily_rsi']} "
-        f"{result['rsi_note']}; per-timeframe {result['breakdown']}"
+        f"{result['verdict']} (score={result['score']}, confluence={result['confluence_ratio']} "
+        f"of {result['votes']} signals): daily RSI14={result['daily_rsi']} {result['rsi_note']} "
+        f"(adaptive band={result['rsi_band']}); per-timeframe {result['breakdown']}"
     )
     log.info("iter=%d technical_verdict=%r", state["iters"], state["technical_verdict"])
 
