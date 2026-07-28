@@ -97,16 +97,30 @@ def _get_peer_comparison(symbol):
     return latest_quarter, peer_data
 
 
+def _coerce_float(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
 def _extract_eps_pat(symbol, peer_data):
     """EPS/PAT lookup for `symbol`'s own row in the peer-comparison table.
 
-    Confirmed live: peer_data is a flat list of dicts, each with plain "eps"/"pat" keys.
+    Confirmed live: peer_data is a flat list of dicts, each with plain "eps"/"pat" keys,
+    though field types have been inconsistent across symbols (e.g. numeric vs numeric
+    string) -- _coerce_float handles both so a hard-check downstream doesn't silently
+    skip a negative value just because it arrived as a string.
     """
     rows = peer_data if isinstance(peer_data, list) else (peer_data or {}).get("data", [])
     row = next((r for r in rows if r.get("symbol") == symbol), None)
     if row is None:
         return None, None
-    return row.get("eps"), row.get("pat")
+    return _coerce_float(row.get("eps")), _coerce_float(row.get("pat"))
 
 
 def get_fundamental_snapshot(symbol: str) -> dict:
@@ -149,6 +163,13 @@ def get_fundamental_snapshot(symbol: str) -> dict:
         snapshot["peer_comparison_quarter"] = quarter
         snapshot["peer_comparison"] = peer_data
         snapshot["eps"], snapshot["pat"] = _extract_eps_pat(symbol, peer_data)
+        if snapshot["eps"] is None or snapshot["pat"] is None:
+            # Not a request failure (peer_data came back fine) -- the symbol just wasn't
+            # found in its own peer table, or eps/pat weren't parseable. Either way the
+            # EPS/PAT hard check downstream can't run reliably, so treat this the same
+            # as an incomplete fetch rather than silently caching it as fully-checked.
+            log.warning("fundamentals[%s]: eps/pat not found in peer comparison table", symbol)
+            all_ok = False
     except Exception:
         log.warning("fundamentals[%s]: peer comparison fetch failed", symbol, exc_info=True)
         all_ok = False

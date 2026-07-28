@@ -88,17 +88,9 @@ if __name__ == "__main__":
         if final_state["status"] not in ("proposed", "flagged_for_review"):
             continue  # dropped to aborted since the overnight scan -- no longer actionable
 
-        record = {
-            "symbol": symbol,
-            "company_name": (final_state.get("quote") or {}).get("name"),
-            "status": final_state["status"],
-            "timestamp": now_ist().isoformat(),
-            "technical_indicators": final_state.get("technical_indicators"),
-            "technical_verdict": final_state.get("technical_verdict"),
-            "fundamental_verdict": final_state.get("fundamental_verdict"),
-            "risk_verdict": final_state.get("risk_verdict"),
-            "sentiment_verdict": final_state.get("sentiment_verdict"),
-            "proposal": final_state.get("proposal"),
-        }
+        # Same builder node_log already used internally (run() logs as part of the graph
+        # itself) -- guarantees the email has exactly what's in trade_log.jsonl, not a
+        # hand-maintained near-copy that can silently drift from it.
+        record = nse_trade_graph.build_record(final_state)
         subject = f"NSE Intraday Alert -- {symbol} -- {final_state['status']}"
         send_email(subject, format_symbol_section(record))
