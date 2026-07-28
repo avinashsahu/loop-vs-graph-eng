@@ -2,6 +2,7 @@ import json
 import os
 from datetime import datetime, timedelta
 
+import talib
 from nsemine.historical import get_stock_historical_data
 from nsemine.live import get_stock_live_quotes
 
@@ -21,16 +22,41 @@ def _verdict_prompt(question):
 def node_fetch(state):
     state["iters"] += 1
     state["quote"] = get_stock_live_quotes(state["symbol"])
-    start = datetime.now() - timedelta(days=30)
+    # 150 calendar days ~ 100 trading sessions — enough lookback for SMA50/MACD(12,26,9).
+    start = datetime.now() - timedelta(days=150)
     state["hist"] = get_stock_historical_data(state["symbol"], start_datetime=start, interval="D")
     return "technical", state
 
 
+def _compute_indicators(hist):
+    close = hist["close"].to_numpy(dtype=float)
+    sma20 = talib.SMA(close, timeperiod=20)
+    sma50 = talib.SMA(close, timeperiod=50)
+    rsi14 = talib.RSI(close, timeperiod=14)
+    macd, macd_signal, macd_hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
+    return {
+        "close": round(close[-1], 2),
+        "sma20": round(sma20[-1], 2),
+        "sma50": round(sma50[-1], 2),
+        "rsi14": round(rsi14[-1], 2),
+        "macd": round(macd[-1], 2),
+        "macd_signal": round(macd_signal[-1], 2),
+        "macd_hist": round(macd_hist[-1], 2),
+    }
+
+
 def node_technical(state):
-    recent = state["hist"].tail(10).to_string(index=False)
+    ind = _compute_indicators(state["hist"])
+    state["technical_indicators"] = ind
+    log.info("iter=%d indicators=%s", state["iters"], ind)
+
     verdict = call_llm(
         _verdict_prompt(
-            f"Recent daily OHLCV for {state['symbol']}:\n{recent}\n\n"
+            f"Technical indicators for {state['symbol']}: close={ind['close']}, "
+            f"SMA20={ind['sma20']}, SMA50={ind['sma50']}, RSI14={ind['rsi14']}, "
+            f"MACD={ind['macd']}, MACD_signal={ind['macd_signal']}, MACD_hist={ind['macd_hist']}.\n"
+            "Rules of thumb: SMA20 above SMA50 is a bullish trend; RSI above 70 is overbought "
+            "(caution), below 30 is oversold; positive MACD histogram is bullish momentum.\n"
             "Is there a clear short-term uptrend/momentum worth considering a BUY?"
         ),
         mode="check",
@@ -128,6 +154,7 @@ def node_log(state):
         "principal": state["principal"],
         "risk_pct": state["risk_pct"],
         "iters": state["iters"],
+        "technical_indicators": state.get("technical_indicators"),
         "technical_verdict": state.get("technical_verdict"),
         "risk_verdict": state.get("risk_verdict"),
         "sentiment_verdict": state.get("sentiment_verdict"),
@@ -161,6 +188,7 @@ def run(symbol, principal, risk_pct=10.0, start="fetch"):
         "iters": 0,
         "quote": None,
         "hist": None,
+        "technical_indicators": None,
         "technical_verdict": None,
         "risk_verdict": None,
         "sentiment_verdict": None,

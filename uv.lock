@@ -163,6 +163,20 @@ wheels = [
 ]
 
 [[package]]
+name = "build"
+version = "1.5.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "os_name == 'nt'" },
+    { name = "packaging" },
+    { name = "pyproject-hooks" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/78/e0/df5e171f685f82f37b12e1f208064e24244911079d7b767447d1af7e0d70/build-1.5.0.tar.gz", hash = "sha256:302c22c3ba2a0fd5f3911918651341ebb3896176cbdec15bd421f80b1afc7647", size = 89796, upload-time = "2026-04-30T03:18:25.17Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0d/fe/6bea5c9162869c5beba5d9c8abbed835ec85bf1ec1fba05a3822325c45f3/build-1.5.0-py3-none-any.whl", hash = "sha256:13f3eecb844759ab66efec90ca17639bbf14dc06cb2fdf37a9010322d9c50a6f", size = 26018, upload-time = "2026-04-30T03:18:23.644Z" },
+]
+
+[[package]]
 name = "certifi"
 version = "2026.7.22"
 source = { registry = "https://pypi.org/simple" }
@@ -365,6 +379,7 @@ dependencies = [
     { name = "nsemine" },
     { name = "openai" },
     { name = "python-dotenv" },
+    { name = "ta-lib" },
 ]
 
 [package.metadata]
@@ -373,6 +388,7 @@ requires-dist = [
     { name = "nsemine", specifier = ">=1.5" },
     { name = "openai", specifier = ">=2.49.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
+    { name = "ta-lib", specifier = ">=0.7.1" },
 ]
 
 [[package]]
@@ -493,6 +509,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/d3/9a/275bee8349b766906741223b98c668fcd4e17e1982a87597778743b4156f/openai-2.49.0.tar.gz", hash = "sha256:80f934333b5b83cef2fde9af7151dacaa72e150f43f92b7675f7647ca6157f48", size = 1080973, upload-time = "2026-07-27T22:51:40.014Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b1/ca/53357e460a1172e831ecbe43dd0c37342b7211a1eb09f4cf21a412adbbdf/openai-2.49.0-py3-none-any.whl", hash = "sha256:b694201eaa42a1ccf2aa125fe29458150108fb22df1abfb55d7188599da81d8c", size = 1648589, upload-time = "2026-07-27T22:51:38Z" },
+]
+
+[[package]]
+name = "packaging"
+version = "26.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d7/f1/e7a6dd94a8d4a5626c03e4e99c87f241ba9e350cd9e6d75123f992427270/packaging-26.2.tar.gz", hash = "sha256:ff452ff5a3e828ce110190feff1178bb1f2ea2281fa2075aadb987c2fb221661", size = 228134, upload-time = "2026-04-24T20:15:23.917Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/df/b2/87e62e8c3e2f4b32e5fe99e0b86d576da1312593b39f47d8ceef365e95ed/packaging-26.2-py3-none-any.whl", hash = "sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e", size = 100195, upload-time = "2026-04-24T20:15:22.081Z" },
 ]
 
 [[package]]
@@ -624,6 +649,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pyproject-hooks"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e7/82/28175b2414effca1cdac8dc99f76d660e7a4fb0ceefa4b4ab8f5f6742925/pyproject_hooks-1.2.0.tar.gz", hash = "sha256:1e859bd5c40fae9448642dd871adf459e5e2084186e8d2c2a79a824c970da1f8", size = 19228, upload-time = "2024-09-29T09:24:13.293Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bd/24/12818598c362d7f300f18e74db45963dbcb85150324092410c8b49405e42/pyproject_hooks-1.2.0-py3-none-any.whl", hash = "sha256:9e5c6bfa8dcc30091c74b0cf803c81fdd29d94f01992a7707bc97babb1141913", size = 10216, upload-time = "2024-09-29T09:24:11.978Z" },
+]
+
+[[package]]
 name = "python-dateutil"
 version = "2.9.0.post0"
 source = { registry = "https://pypi.org/simple" }
@@ -684,6 +718,27 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/a2/87/a6771e1546d97e7e041b6ae58d80074f81b7d5121207425c964ddf5cfdbd/sniffio-1.3.1.tar.gz", hash = "sha256:f4324edc670a0f49750a81b895f35c3adb843cca46f0530f79fc1babb23789dc", size = 20372, upload-time = "2024-02-25T23:20:04.057Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e9/44/75a9c9421471a6c4805dbf2356f7c181a29c1879239abab1ea2cc8f38b40/sniffio-1.3.1-py3-none-any.whl", hash = "sha256:2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2", size = 10235, upload-time = "2024-02-25T23:20:01.196Z" },
+]
+
+[[package]]
+name = "ta-lib"
+version = "0.7.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "build" },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/83/f3/8324d0439577d48f8ab45f347a418de59a5ed48e884f792aef01c8de1030/ta_lib-0.7.1.tar.gz", hash = "sha256:d28ec282d58294c6ed3c604c3b11cc3b5843cedd84bf3831c512ca4139d0caf4", size = 410207, upload-time = "2026-07-16T19:07:27.24Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ee/90/d1f366f79439a1986a9a5ef0e34bdc9d114e5030a87b82e56522c9dc181c/ta_lib-0.7.1-cp314-cp314-macosx_13_0_x86_64.whl", hash = "sha256:a1047772d383085b14a0ec61be7e98f47f94024f0d461da160388d11393a31ef", size = 1249181, upload-time = "2026-07-16T19:07:00.242Z" },
+    { url = "https://files.pythonhosted.org/packages/ea/92/e14e04100cac31c5209dc2bd108c3a205c2a1d27881e30cc72ad93a9d92d/ta_lib-0.7.1-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:8ed37a8bcb85298b88760c41a62d3ba669c91ec3f58cf349c8779656cacd5bf3", size = 1119653, upload-time = "2026-07-16T19:07:01.718Z" },
+    { url = "https://files.pythonhosted.org/packages/7a/68/4426857aecbd2d632360eb6fb7ad2d2a50aa0c114e0ee25b2595e31461fc/ta_lib-0.7.1-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2e3c0d60d3303215b5efd66377b9d0a0ecc2eca33977475a7c2693d3d90d52e1", size = 1324751, upload-time = "2026-07-16T19:07:03.209Z" },
+    { url = "https://files.pythonhosted.org/packages/25/11/d3662c71436eae509ef8253b3418b81d22d2a74de18110f2e7798424defe/ta_lib-0.7.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:76cc90b7aecbdc5a3093c9e1ebc66517acbd7b372c6606483b9bcf3264b6f9bc", size = 1451582, upload-time = "2026-07-16T19:07:04.699Z" },
+    { url = "https://files.pythonhosted.org/packages/6a/ba/0eff2fa66f13e8cbebf550034282e583c0ef4ad580467999c338ee6f075c/ta_lib-0.7.1-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:ecc82e4a86431e9ec5e230d76a349705a8c2c9860366ce3a343dcabd5e780e93", size = 1333342, upload-time = "2026-07-16T19:07:06.265Z" },
+    { url = "https://files.pythonhosted.org/packages/f2/c5/860ac6094a13b15bb0fb2bfbeeb23e4071062b21d10c70d3bc390ecc8a1e/ta_lib-0.7.1-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:7e440d033525d7bd3597d4eb506f269c567b71b3e85616565e0085e84030a666", size = 1469678, upload-time = "2026-07-16T19:07:07.882Z" },
+    { url = "https://files.pythonhosted.org/packages/1a/12/141f482a16d828986f84c6308081d65bac76ffa27832e0c00b627d67f232/ta_lib-0.7.1-cp314-cp314-win32.whl", hash = "sha256:e8cfe36452ffd8b6e0465250c032a17fb11ece1e5ab362197155838c143f76d5", size = 793956, upload-time = "2026-07-16T19:07:12.172Z" },
+    { url = "https://files.pythonhosted.org/packages/1e/79/158b1146e3ecff9533446e7d902108f20349b654a4c98ff6fa8153ef6692/ta_lib-0.7.1-cp314-cp314-win_amd64.whl", hash = "sha256:aa8e8edcfc04e1cfe66208e1fa6f833270e66d52dec4d523b8ba2d661cbadfe2", size = 920544, upload-time = "2026-07-16T19:07:09.438Z" },
+    { url = "https://files.pythonhosted.org/packages/22/8c/82fb94452c26e5d4a3247814eb919bbead796354937b67651d3c646d3ee6/ta_lib-0.7.1-cp314-cp314-win_arm64.whl", hash = "sha256:681c554543082d985492efc3de507e35c3845e80125c113841d3a460c87c94bf", size = 785830, upload-time = "2026-07-16T19:07:10.705Z" },
 ]
 
 [[package]]

@@ -12,13 +12,25 @@ See `NOTES.md` for the tradeoffs between the loop and graph styles.
 
 ## Setup
 
-Requires [`uv`](https://github.com/astral-sh/uv).
+Requires [`uv`](https://github.com/astral-sh/uv) and, for the `nse_trade_graph.py` technical indicators, the TA-Lib C library (macOS via Homebrew):
+
+```bash
+brew install ta-lib
+```
+
+Then:
 
 ```bash
 uv sync
 ```
 
-This creates `.venv` and installs the pinned dependencies (`anthropic`, `openai`, `nsemine`, `python-dotenv`).
+This creates `.venv` and installs the pinned dependencies (`anthropic`, `openai`, `nsemine`, `python-dotenv`, `ta-lib`).
+
+If `uv add ta-lib` / `uv sync` ever fails to find the C library's headers, point it explicitly:
+
+```bash
+TA_LIBRARY_PATH="$(brew --prefix ta-lib)/lib" TA_INCLUDE_PATH="$(brew --prefix ta-lib)/include" uv sync
+```
 
 Copy `.env.example` to `.env` and adjust as needed — all config below is read from `.env` via `python-dotenv` (loaded in `llm.py`), so no manual `export` is required.
 
@@ -94,7 +106,7 @@ fetch -> technical -> [BAD] -> technical_retry_guard -> fetch (retry) or abort
              log (appends a record to trade_log.jsonl)
 ```
 
-- **technical** — LLM checks recent OHLCV (from `nsemine`) for a short-term buy signal. Retries (re-fetches data) up to `MAX_ITERS` on a `BAD` verdict, then aborts.
+- **technical** — computes real indicators from OHLCV history (from `nsemine`) via **TA-Lib** — SMA20, SMA50, RSI14, MACD(12,26,9) — then asks the LLM to interpret those numbers (not a raw table) for a short-term buy signal. Retries (re-fetches data) up to `MAX_ITERS` on a `BAD` verdict, then aborts. Grounding the LLM in computed indicators instead of a raw OHLCV table gives consistent verdicts across retries instead of the model re-reading the same table differently each time.
 - **risk** — deterministic code, not an LLM call. Computes position size from `principal * risk_pct / 100`, validates `risk_pct` is sane (0-25%), and aborts if the stock's current low is within 2% of its lower circuit limit. Kept out of the LLM's hands on purpose: risk sizing is exactly the kind of check where a hallucinated "looks fine" verdict is the expensive failure mode.
 - **sentiment** — LLM checks whether today's price move looks like a reasonable entry (not a crash or a spike), using the live quote's `changepct` and sector. Include the company's full name, not just the ticker, in the prompt — a bare ticker (e.g. `ACE`) can be genuinely ambiguous to the model and has been observed to send gemma4 into a repetitive non-terminating reasoning loop.
 - **propose** — never calls a broker. Only ever produces a proposal string for a human to review and act on manually.
