@@ -5,11 +5,10 @@ from dotenv import load_dotenv
 # script's import chain was loading .env before.
 load_dotenv()
 
-import json
 import os
 import sys
 
-from digest import format_symbol_section
+from digest import format_symbol_section, read_jsonl_records
 from logging_config import setup_logging
 from market_time import is_market_hours, now_ist
 from notify import send_email
@@ -24,27 +23,20 @@ TRADE_LOG_PATH = os.environ.get("TRADE_LOG_PATH", "trade_log.jsonl")
 
 
 def _find_latest_overnight_label():
-    if not os.path.exists(TRADE_LOG_PATH):
-        return None
     # "overnight_YYYYMMDD_HHMM" sorts lexicographically == chronologically for this format.
-    with open(TRADE_LOG_PATH) as f:
-        labels = {json.loads(line).get("scan_label", "") for line in f}
+    labels = {r.get("scan_label", "") for r in read_jsonl_records(TRADE_LOG_PATH)}
     overnight_labels = [label for label in labels if label.startswith("overnight_")]
     return max(overnight_labels) if overnight_labels else None
 
 
 def _load_pick_symbols(run_id):
-    if not os.path.exists(TRADE_LOG_PATH):
-        return []
     symbols = []
     seen = set()
-    with open(TRADE_LOG_PATH) as f:
-        for line in f:
-            record = json.loads(line)
-            if record.get("scan_label") == run_id and record["status"] in ("proposed", "flagged_for_review"):
-                if record["symbol"] not in seen:
-                    seen.add(record["symbol"])
-                    symbols.append(record["symbol"])
+    for record in read_jsonl_records(TRADE_LOG_PATH):
+        if record.get("scan_label") == run_id and record["status"] in ("proposed", "flagged_for_review"):
+            if record["symbol"] not in seen:
+                seen.add(record["symbol"])
+                symbols.append(record["symbol"])
     return symbols
 
 

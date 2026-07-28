@@ -33,6 +33,7 @@ def _verdict_prompt(question):
 def node_fetch(state):
     state["iters"] += 1
     state["quote"] = get_stock_live_quotes(state["symbol"])
+    time.sleep(nse_data.NSE_CALL_DELAY_SECONDS)  # was the one unthrottled call in the pipeline
 
     # get_stock_live_quotes returns None on error, and can occasionally return a raw
     # dict missing expected keys on an internal nsemine exception -- checking here once
@@ -106,11 +107,12 @@ def node_fundamental(state):
         _verdict_prompt(
             f"Fundamental snapshot for {state['symbol']} ({snap.get('company_name')}): "
             f"corp actions={snap.get('corp_actions')}, "
+            f"corp announcements={snap.get('corp_announcements')}, "
             f"shareholding pattern (recent periods)={snap.get('shareholding_pattern')}, "
             f"yearwise returns={snap.get('yearwise_returns')}, "
             f"peer comparison (quarter {snap.get('peer_comparison_quarter')})={snap.get('peer_comparison')}.\n"
-            "Does the company look fundamentally sound -- no red flags in recent corporate actions "
-            "or shareholding trend, and reasonable standing versus peers?"
+            "Does the company look fundamentally sound -- no red flags in recent corporate actions, "
+            "announcements, or shareholding trend, and reasonable standing versus peers?"
         ),
         mode="check",
     )
@@ -268,7 +270,7 @@ GRAPH = {
 }
 
 
-def run(symbol, principal, risk_pct=10.0, start="fetch"):
+def run(symbol, principal, risk_pct=10.0):
     state = {
         "symbol": symbol,
         "principal": principal,
@@ -286,7 +288,7 @@ def run(symbol, principal, risk_pct=10.0, start="fetch"):
         "status": None,
         "proposal": None,
     }
-    node = start
+    node = "fetch"
 
     while node is not None:
         log.debug("node=%s", node)

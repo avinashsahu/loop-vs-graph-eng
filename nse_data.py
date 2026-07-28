@@ -1,5 +1,6 @@
 import io
 import os
+import time
 from datetime import timedelta
 
 import pandas as pd
@@ -10,6 +11,7 @@ import cache
 from market_time import now_host_local, now_ist_naive
 
 INTRADAY_CACHE_TTL_MINUTES = float(os.environ.get("INTRADAY_CACHE_TTL_MINUTES", "5"))
+NSE_CALL_DELAY_SECONDS = float(os.environ.get("NSE_CALL_DELAY_SECONDS", "0.3"))
 
 # interval -> lookback days, tuned for enough bars to warm up RSI14/MACD(12,26,9) at each granularity
 # without pulling excessive intraday rows.
@@ -36,7 +38,12 @@ def _fetch_history(symbol, interval, lookback_days):
     # host-local on a non-IST host, silently shifting the whole fetch window.)
     end = now_host_local()
     start = end - timedelta(days=lookback_days)
-    return get_stock_historical_data(symbol, start_datetime=start, end_datetime=end, interval=interval)
+    result = get_stock_historical_data(symbol, start_datetime=start, end_datetime=end, interval=interval)
+    # Only fires on an actual cache miss (fetch_fn only runs then) -- was previously the
+    # only unthrottled NSE call in the whole pipeline, opening every symbol with a burst
+    # of up to 4 back-to-back requests (fundamentals staggers, this didn't).
+    time.sleep(NSE_CALL_DELAY_SECONDS)
+    return result
 
 
 def _cache_key_and_ttl(symbol, interval):
