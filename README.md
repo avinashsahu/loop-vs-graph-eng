@@ -129,7 +129,7 @@ uv run nse_trade_graph.py RELIANCE ACE HDFCBANK
 uv run nse_trade_graph.py RELIANCE,ACE,HDFCBANK
 ```
 
-Every run appends one JSON line to `trade_log.jsonl`: timestamp, symbol, principal, risk_pct, iters, each node's verdict, final status (`proposed` / `flagged_for_review` / `aborted`), and the proposal text. Inspect it with `jq`, e.g.:
+Every run appends one JSON line to `trade_log.jsonl`: timestamp, symbol, principal, risk_pct, iters, computed technical indicators, each node's verdict, final status (`proposed` / `flagged_for_review` / `aborted`), and the proposal text. Inspect it with `jq`, e.g.:
 
 ```bash
 jq -c '{symbol, status, technical_verdict}' trade_log.jsonl
