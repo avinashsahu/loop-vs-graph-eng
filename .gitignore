@@ -14,3 +14,6 @@ wheels/
 
 # Trade run log
 trade_log.jsonl
+
+# On-disk data cache
+.cache/

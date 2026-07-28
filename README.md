@@ -4,7 +4,8 @@ Small side-by-side comparison of two ways to structure an LLM retry/verify agent
 
 - `loop_agent.py` — plain `while` loop, state in local vars, control flow via `if`/`break`.
 - `graph_agent.py` — explicit node graph, state in a dict, control flow via `(next_node, state)` return values.
-- `nse_trade_graph.py` — real use case for the graph style: an NSE (Indian stock exchange) trade-proposal pipeline with three independent, differently-failing checks.
+- `nse_trade_graph.py` — real use case for the graph style: an NSE (Indian stock exchange) trade-proposal pipeline with four independent, differently-failing checks, runnable over a single symbol, an explicit list, or a whole index's constituents.
+- `nse_data.py`, `fundamentals.py`, `ta_analysis.py`, `cache.py` — data/analysis layers used by `nse_trade_graph.py` (see below).
 
 Both toy agents implement the same task: answer a question, check the answer, retry up to `MAX_ITERS` times until the check passes.
 
@@ -85,11 +86,15 @@ Each run prints the answer/verdict per iteration and the final result.
 
 ## NSE trade graph (`nse_trade_graph.py`)
 
-A real branching use case for the graph style: propose (never execute) an NSE stock trade, gated behind three independent checks that each fail differently.
+A real branching use case for the graph style: propose (never execute) an NSE stock trade, gated behind four independent checks that each fail differently.
 
 ```
 fetch -> technical -> [BAD] -> technical_retry_guard -> fetch (retry) or abort
               |
+            [GOOD]
+              v
+          fundamental -> [hard BAD: negative EPS/PAT] -> abort (no retry, deterministic)
+              |          -> [soft BAD: LLM read] -> flag_review
             [GOOD]
               v
             risk -> [BAD] -> abort (no retry — bad risk config or price near circuit limit)
@@ -106,16 +111,24 @@ fetch -> technical -> [BAD] -> technical_retry_guard -> fetch (retry) or abort
              log (appends a record to trade_log.jsonl)
 ```
 
-- **technical** — computes real indicators from OHLCV history (from `nsemine`) via **TA-Lib** — SMA20, SMA50, RSI14, MACD(12,26,9) — then asks the LLM to interpret those numbers (not a raw table) for a short-term buy signal. Retries (re-fetches data) up to `MAX_ITERS` on a `BAD` verdict, then aborts. Grounding the LLM in computed indicators instead of a raw OHLCV table gives consistent verdicts across retries instead of the model re-reading the same table differently each time.
+- **technical** — computes real indicators (SMA20, SMA50, RSI14, MACD(12,26,9), via `ta_analysis.compute_indicators`, **TA-Lib**-backed) independently for four timeframes — daily plus 30/15/5-minute (from `nse_data.get_multi_timeframe_history`) — and asks the LLM to interpret all four together (one prompt, one verdict) for a short-term buy signal. Retries (re-fetches data) up to `MAX_ITERS` on a `BAD` verdict, then aborts. Grounding the LLM in computed indicators instead of a raw OHLCV table gives consistent verdicts across retries instead of the model re-reading the same table differently each time. Deliberately not split into one node per timeframe — this project only splits nodes when the retry/remediation path genuinely differs, and all four timeframes share the same retry loop.
+- **fundamental** — `fundamentals.get_fundamental_snapshot` pulls corporate announcements, corporate actions, shareholding pattern, yearwise returns, and a peer comparison (all via raw NSE `NextApi` endpoints, see `fundamentals.py`). A deterministic hard check runs first: negative EPS or PAT aborts immediately, same philosophy as `risk`'s circuit-limit check — an objective number isn't the LLM's job to hallucinate over. Otherwise the LLM reads the qualitative parts (corp actions, shareholding trend, peer standing) for a `GOOD`/`BAD` verdict; a soft `BAD` here routes to `flag_review`, same policy as `sentiment`, not an abort.
 - **risk** — deterministic code, not an LLM call. Computes position size from `principal * risk_pct / 100`, validates `risk_pct` is sane (0-25%), and aborts if the stock's current low is within 2% of its lower circuit limit. Kept out of the LLM's hands on purpose: risk sizing is exactly the kind of check where a hallucinated "looks fine" verdict is the expensive failure mode.
 - **sentiment** — LLM checks whether today's price move looks like a reasonable entry (not a crash or a spike), using the live quote's `changepct` and sector. Include the company's full name, not just the ticker, in the prompt — a bare ticker (e.g. `ACE`) can be genuinely ambiguous to the model and has been observed to send gemma4 into a repetitive non-terminating reasoning loop.
 - **propose** — never calls a broker. Only ever produces a proposal string for a human to review and act on manually.
 
-Known data quirk: `nsemine`'s `get_stock_live_quotes` returns `upper_circuit` and `lower_circuit` swapped (confirmed against the raw NSE `priceInfo.priceBand` field, which is always `"lower-upper"`). `node_risk` in `nse_trade_graph.py` corrects for this on read — don't trust those two field names at face value if you use `nsemine` elsewhere.
+Known data quirks:
+- `nsemine`'s `get_stock_live_quotes` returns `upper_circuit` and `lower_circuit` swapped (confirmed against the raw NSE `priceInfo.priceBand` field, which is always `"lower-upper"`). `node_risk` in `nse_trade_graph.py` corrects for this on read — don't trust those two field names at face value if you use `nsemine` elsewhere.
+- `nsemine.live.get_index_constituents_live_snapshot`'s own docstring example calls its index parameter `index_name=`, but the real keyword is `index` — `nse_data.get_index_symbols` calls it correctly, just don't copy the docstring.
+- The `getYearwiseData` fundamentals endpoint (only that one) needs the symbol suffixed with `EQN` (e.g. `HDFCBANKEQN`); every other fundamentals endpoint uses the bare symbol — see `fundamentals.py`.
+
+### Index scan / batch mode
+
+Besides one symbol or an explicit list, `nse_trade_graph.py` can resolve and scan an entire index's constituents via `nse_data.get_index_symbols` (wraps `nsemine.live.get_index_constituents_live_snapshot`). A per-symbol failure (e.g. one blocked/slow fetch) is caught and logged so it doesn't abort the rest of the batch. `cache.py` backs both the multi-timeframe history and fundamentals fetches with a per-key JSON file under `CACHE_DIR` — this matters at batch scale: a full-index scan is ~13 HTTP calls per symbol (quote + 4 historical timeframes + several fundamentals endpoints), and the `technical_retry_guard` loop would otherwise re-fetch all of it, including same-day fundamentals, on every retry.
 
 ### Config (`.env`)
 
-`NSE_SYMBOL` (default `RELIANCE`, used only when no symbols are passed on the command line), `NSE_PRINCIPAL` (default `100000`), `NSE_RISK_PCT` (default `10`, meant to scale with your actual principal, not be hardcoded), `TRADE_LOG_PATH` (default `trade_log.jsonl`, gitignored).
+`NSE_SYMBOL` (default `RELIANCE`, used only when no symbols are passed on the command line and `NSE_INDEX` is unset), `NSE_PRINCIPAL` (default `100000`), `NSE_RISK_PCT` (default `10`, meant to scale with your actual principal, not be hardcoded), `TRADE_LOG_PATH` (default `trade_log.jsonl`, gitignored), `NSE_INDEX` (e.g. `NIFTY 50` — if set and no symbols are passed on the command line, scans the index's constituents instead of falling back to `NSE_SYMBOL`), `NSE_SCAN_LIMIT` (optional, caps how many constituents are scanned), `NSE_SCAN_DELAY_SECONDS` (default `1`, pause between symbols in a batch/index scan), `CACHE_DIR` (default `.cache`, gitignored), `FUNDAMENTALS_CACHE_TTL_HOURS` (default `24`), `INTRADAY_CACHE_TTL_MINUTES` (default `5`).
 
 ### Running
 
@@ -127,9 +140,12 @@ uv run nse_trade_graph.py
 uv run nse_trade_graph.py RELIANCE
 uv run nse_trade_graph.py RELIANCE ACE HDFCBANK
 uv run nse_trade_graph.py RELIANCE,ACE,HDFCBANK
+
+# scan an index's constituents (no symbols on the command line, NSE_INDEX set in .env)
+NSE_INDEX="NIFTY 50" NSE_SCAN_LIMIT=5 uv run nse_trade_graph.py
 ```
 
-Every run appends one JSON line to `trade_log.jsonl`: timestamp, symbol, principal, risk_pct, iters, computed technical indicators, each node's verdict, final status (`proposed` / `flagged_for_review` / `aborted`), and the proposal text. Inspect it with `jq`, e.g.:
+Every run appends one JSON line to `trade_log.jsonl`: timestamp, symbol, principal, risk_pct, iters, computed technical indicators (nested per timeframe), each node's verdict (including `fundamental_verdict`), final status (`proposed` / `flagged_for_review` / `aborted`), and the proposal text. Inspect it with `jq`, e.g.:
 
 ```bash
 jq -c '{symbol, status, technical_verdict}' trade_log.jsonl

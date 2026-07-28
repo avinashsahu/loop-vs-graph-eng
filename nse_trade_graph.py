@@ -1,11 +1,13 @@
 import json
 import os
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
 
-import talib
-from nsemine.historical import get_stock_historical_data
 from nsemine.live import get_stock_live_quotes
 
+import fundamentals
+import nse_data
+import ta_analysis
 from llm import call_llm
 from logging_config import setup_logging
 
@@ -22,41 +24,29 @@ def _verdict_prompt(question):
 def node_fetch(state):
     state["iters"] += 1
     state["quote"] = get_stock_live_quotes(state["symbol"])
-    # 150 calendar days ~ 100 trading sessions — enough lookback for SMA50/MACD(12,26,9).
-    start = datetime.now() - timedelta(days=150)
-    state["hist"] = get_stock_historical_data(state["symbol"], start_datetime=start, interval="D")
+    state["hist_multi"] = nse_data.get_multi_timeframe_history(state["symbol"])
+    state["hist"] = state["hist_multi"]["D"]
+    state["fundamental_snapshot"] = fundamentals.get_fundamental_snapshot(state["symbol"])
     return "technical", state
 
 
-def _compute_indicators(hist):
-    close = hist["close"].to_numpy(dtype=float)
-    sma20 = talib.SMA(close, timeperiod=20)
-    sma50 = talib.SMA(close, timeperiod=50)
-    rsi14 = talib.RSI(close, timeperiod=14)
-    macd, macd_signal, macd_hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
-    return {
-        "close": round(close[-1], 2),
-        "sma20": round(sma20[-1], 2),
-        "sma50": round(sma50[-1], 2),
-        "rsi14": round(rsi14[-1], 2),
-        "macd": round(macd[-1], 2),
-        "macd_signal": round(macd_signal[-1], 2),
-        "macd_hist": round(macd_hist[-1], 2),
-    }
-
-
 def node_technical(state):
-    ind = _compute_indicators(state["hist"])
-    state["technical_indicators"] = ind
-    log.info("iter=%d indicators=%s", state["iters"], ind)
+    indicators = {tf: ta_analysis.compute_indicators(hist) for tf, hist in state["hist_multi"].items()}
+    state["technical_indicators"] = indicators
+    log.info("iter=%d indicators=%s", state["iters"], indicators)
 
+    timeframe_lines = "\n".join(
+        f"{tf}: close={ind['close']}, SMA20={ind['sma20']}, SMA50={ind['sma50']}, "
+        f"RSI14={ind['rsi14']}, MACD={ind['macd']}, MACD_signal={ind['macd_signal']}, MACD_hist={ind['macd_hist']}"
+        for tf, ind in indicators.items()
+    )
     verdict = call_llm(
         _verdict_prompt(
-            f"Technical indicators for {state['symbol']}: close={ind['close']}, "
-            f"SMA20={ind['sma20']}, SMA50={ind['sma50']}, RSI14={ind['rsi14']}, "
-            f"MACD={ind['macd']}, MACD_signal={ind['macd_signal']}, MACD_hist={ind['macd_hist']}.\n"
+            f"Multi-timeframe technical indicators for {state['symbol']} (D=daily, 30/15/5=minutes):\n"
+            f"{timeframe_lines}\n"
             "Rules of thumb: SMA20 above SMA50 is a bullish trend; RSI above 70 is overbought "
-            "(caution), below 30 is oversold; positive MACD histogram is bullish momentum.\n"
+            "(caution), below 30 is oversold; positive MACD histogram is bullish momentum. "
+            "Weight the daily trend most heavily, use the intraday timeframes to confirm timing.\n"
             "Is there a clear short-term uptrend/momentum worth considering a BUY?"
         ),
         mode="check",
@@ -65,7 +55,7 @@ def node_technical(state):
     log.info("iter=%d technical_verdict=%r", state["iters"], verdict)
 
     if verdict.startswith("GOOD"):
-        return "risk", state
+        return "fundamental", state
     return "technical_retry_guard", state
 
 
@@ -74,6 +64,35 @@ def node_technical_retry_guard(state):
         log.warning("technical check never GOOD after MAX_ITERS=%d", MAX_ITERS)
         return "abort", state
     return "fetch", state
+
+
+def node_fundamental(state):
+    snap = state["fundamental_snapshot"] or {}
+    eps, pat = snap.get("eps"), snap.get("pat")
+
+    if (isinstance(eps, (int, float)) and eps < 0) or (isinstance(pat, (int, float)) and pat < 0):
+        state["fundamental_verdict"] = f"BAD: negative EPS/PAT (eps={eps}, pat={pat})"
+        log.warning(state["fundamental_verdict"])
+        return "abort", state
+
+    verdict = call_llm(
+        _verdict_prompt(
+            f"Fundamental snapshot for {state['symbol']} ({snap.get('company_name')}): "
+            f"corp actions={snap.get('corp_actions')}, "
+            f"shareholding pattern (recent periods)={snap.get('shareholding_pattern')}, "
+            f"yearwise returns={snap.get('yearwise_returns')}, "
+            f"peer comparison (quarter {snap.get('peer_comparison_quarter')})={snap.get('peer_comparison')}.\n"
+            "Does the company look fundamentally sound -- no red flags in recent corporate actions "
+            "or shareholding trend, and reasonable standing versus peers?"
+        ),
+        mode="check",
+    )
+    state["fundamental_verdict"] = verdict
+    log.info("fundamental_verdict=%r", verdict)
+
+    if verdict.startswith("GOOD"):
+        return "risk", state
+    return "flag_review", state
 
 
 def node_risk(state):
@@ -134,10 +153,13 @@ def node_propose(state):
 
 def node_flag_review(state):
     state["status"] = "flagged_for_review"
-    state["proposal"] = (
-        f"FLAGGED FOR MANUAL REVIEW: sentiment check failed for {state['symbol']} "
-        f"— {state['sentiment_verdict']!r}"
-    )
+    # fundamental and sentiment are the only two checks that route here; whichever one
+    # actually ran and came back BAD is the one worth surfacing.
+    if state.get("sentiment_verdict"):
+        check, verdict = "sentiment", state["sentiment_verdict"]
+    else:
+        check, verdict = "fundamental", state["fundamental_verdict"]
+    state["proposal"] = f"FLAGGED FOR MANUAL REVIEW: {check} check failed for {state['symbol']} — {verdict!r}"
     return "log", state
 
 
@@ -156,6 +178,7 @@ def node_log(state):
         "iters": state["iters"],
         "technical_indicators": state.get("technical_indicators"),
         "technical_verdict": state.get("technical_verdict"),
+        "fundamental_verdict": state.get("fundamental_verdict"),
         "risk_verdict": state.get("risk_verdict"),
         "sentiment_verdict": state.get("sentiment_verdict"),
         "status": state["status"],
@@ -171,6 +194,7 @@ GRAPH = {
     "fetch": node_fetch,
     "technical": node_technical,
     "technical_retry_guard": node_technical_retry_guard,
+    "fundamental": node_fundamental,
     "risk": node_risk,
     "sentiment": node_sentiment,
     "propose": node_propose,
@@ -188,8 +212,11 @@ def run(symbol, principal, risk_pct=10.0, start="fetch"):
         "iters": 0,
         "quote": None,
         "hist": None,
+        "hist_multi": None,
+        "fundamental_snapshot": None,
         "technical_indicators": None,
         "technical_verdict": None,
+        "fundamental_verdict": None,
         "risk_verdict": None,
         "sentiment_verdict": None,
         "status": None,
@@ -211,11 +238,24 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         symbols = [s.strip().upper() for s in " ".join(sys.argv[1:]).replace(",", " ").split()]
     else:
-        symbols = [os.environ.get("NSE_SYMBOL", "RELIANCE")]
+        index_name = os.environ.get("NSE_INDEX", "").strip()
+        if index_name:
+            symbols = nse_data.get_index_symbols(index_name)
+            scan_limit = os.environ.get("NSE_SCAN_LIMIT", "").strip()
+            if scan_limit:
+                symbols = symbols[: int(scan_limit)]
+        else:
+            symbols = [os.environ.get("NSE_SYMBOL", "RELIANCE")]
 
     principal = float(os.environ.get("NSE_PRINCIPAL", "100000"))
     risk_pct = float(os.environ.get("NSE_RISK_PCT", "10"))
+    scan_delay_seconds = float(os.environ.get("NSE_SCAN_DELAY_SECONDS", "1"))
 
-    for symbol in symbols:
-        final_state = run(symbol, principal, risk_pct)
-        log.info("final[%s]: %s", symbol, final_state["proposal"])
+    for i, symbol in enumerate(symbols):
+        if i > 0:
+            time.sleep(scan_delay_seconds)
+        try:
+            final_state = run(symbol, principal, risk_pct)
+            log.info("final[%s]: %s", symbol, final_state["proposal"])
+        except Exception:
+            log.warning("run failed for %s, continuing batch", symbol, exc_info=True)
