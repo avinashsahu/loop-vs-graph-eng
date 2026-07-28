@@ -2,8 +2,8 @@ import json
 import os
 import sys
 from collections import defaultdict
-from datetime import datetime
 
+from market_time import now_ist
 from notify import send_email
 
 # Read directly rather than `from nse_trade_graph import TRADE_LOG_PATH` -- that import
@@ -60,7 +60,7 @@ def build_digest(run_id):
     total = len(records)
 
     subject = (
-        f"NSE Morning Digest -- {datetime.now():%Y-%m-%d} -- "
+        f"NSE Morning Digest -- {now_ist():%Y-%m-%d} -- "
         f"{len(proposed)} proposed, {len(flagged)} flagged ({total} scanned)"
     )
 
