@@ -206,9 +206,16 @@ def run(symbol, principal, risk_pct=10.0, start="fetch"):
 
 
 if __name__ == "__main__":
-    symbol = os.environ.get("NSE_SYMBOL", "RELIANCE")
+    import sys
+
+    if len(sys.argv) > 1:
+        symbols = [s.strip().upper() for s in " ".join(sys.argv[1:]).replace(",", " ").split()]
+    else:
+        symbols = [os.environ.get("NSE_SYMBOL", "RELIANCE")]
+
     principal = float(os.environ.get("NSE_PRINCIPAL", "100000"))
     risk_pct = float(os.environ.get("NSE_RISK_PCT", "10"))
 
-    final_state = run(symbol, principal, risk_pct)
-    log.info("final: %s", final_state["proposal"])
+    for symbol in symbols:
+        final_state = run(symbol, principal, risk_pct)
+        log.info("final[%s]: %s", symbol, final_state["proposal"])

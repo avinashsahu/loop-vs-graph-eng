@@ -115,12 +115,18 @@ Known data quirk: `nsemine`'s `get_stock_live_quotes` returns `upper_circuit` an
 
 ### Config (`.env`)
 
-`NSE_SYMBOL` (default `RELIANCE`), `NSE_PRINCIPAL` (default `100000`), `NSE_RISK_PCT` (default `10`, meant to scale with your actual principal, not be hardcoded), `TRADE_LOG_PATH` (default `trade_log.jsonl`, gitignored).
+`NSE_SYMBOL` (default `RELIANCE`, used only when no symbols are passed on the command line), `NSE_PRINCIPAL` (default `100000`), `NSE_RISK_PCT` (default `10`, meant to scale with your actual principal, not be hardcoded), `TRADE_LOG_PATH` (default `trade_log.jsonl`, gitignored).
 
 ### Running
 
 ```bash
+# one symbol, falls back to NSE_SYMBOL from .env
 uv run nse_trade_graph.py
+
+# one or more symbols on the command line (space- or comma-separated), each run independently through the full graph
+uv run nse_trade_graph.py RELIANCE
+uv run nse_trade_graph.py RELIANCE ACE HDFCBANK
+uv run nse_trade_graph.py RELIANCE,ACE,HDFCBANK
 ```
 
 Every run appends one JSON line to `trade_log.jsonl`: timestamp, symbol, principal, risk_pct, iters, each node's verdict, final status (`proposed` / `flagged_for_review` / `aborted`), and the proposal text. Inspect it with `jq`, e.g.:
