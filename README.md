@@ -89,7 +89,7 @@ Each run prints the answer/verdict per iteration and the final result.
 A real branching use case for the graph style: propose (never execute) an NSE stock trade, gated behind four independent checks that each fail differently.
 
 ```
-fetch -> technical -> [BAD] -> technical_retry_guard -> fetch (retry) or abort
+fetch -> technical -> [BAD] -> abort (no retry -- see below)
               |
             [GOOD]
               v
@@ -111,7 +111,7 @@ fetch -> technical -> [BAD] -> technical_retry_guard -> fetch (retry) or abort
              log (appends a record to trade_log.jsonl)
 ```
 
-- **technical** — computes real indicators (SMA20, SMA50, RSI14, MACD(12,26,9), via `ta_analysis.compute_indicators`, **TA-Lib**-backed) independently for four timeframes — daily plus 30/15/5-minute (from `nse_data.get_multi_timeframe_history`) — and asks the LLM to interpret all four together (one prompt, one verdict) for a short-term buy signal. Retries (re-fetches data) up to `MAX_ITERS` on a `BAD` verdict, then aborts. Grounding the LLM in computed indicators instead of a raw OHLCV table gives consistent verdicts across retries instead of the model re-reading the same table differently each time. Deliberately not split into one node per timeframe — this project only splits nodes when the retry/remediation path genuinely differs, and all four timeframes share the same retry loop.
+- **technical** — computes real indicators (SMA20, SMA50, RSI14, MACD(12,26,9), via `ta_analysis.compute_indicators`, **TA-Lib**-backed) independently for four timeframes — daily plus 30/15/5-minute (from `nse_data.get_multi_timeframe_history`) — and asks the LLM to interpret all four together (one prompt, one verdict) for a short-term buy signal. A `BAD` verdict aborts immediately, no retry: history is cache-backed (5 min intraday TTL, 24h daily TTL), so a retry loop here used to fire seconds apart and feed the LLM a byte-identical prompt every time — 3x the LLM calls for a foregone conclusion, not a real second look, found and removed during a later review pass. Grounding the LLM in computed indicators instead of a raw OHLCV table still gives more consistent verdicts than free-form table reading would. Deliberately not split into one node per timeframe — this project only splits nodes when the retry/remediation path genuinely differs, and all four timeframes feed one verdict either way.
 - **fundamental** — `fundamentals.get_fundamental_snapshot` pulls corporate announcements, corporate actions, shareholding pattern, yearwise returns, and a peer comparison (all via raw NSE `NextApi` endpoints, see `fundamentals.py`). A deterministic hard check runs first: negative EPS or PAT aborts immediately, same philosophy as `risk`'s circuit-limit check — an objective number isn't the LLM's job to hallucinate over. Otherwise the LLM reads the qualitative parts (corp actions, shareholding trend, peer standing) for a `GOOD`/`BAD` verdict; a soft `BAD` here routes to `flag_review`, same policy as `sentiment`, not an abort.
 - **risk** — deterministic code, not an LLM call. Computes position size from `principal * risk_pct / 100`, validates `risk_pct` is sane (0-25%), and aborts if the stock's current low is within 2% of its lower circuit limit. Kept out of the LLM's hands on purpose: risk sizing is exactly the kind of check where a hallucinated "looks fine" verdict is the expensive failure mode.
 - **sentiment** — LLM checks whether today's price move looks like a reasonable entry (not a crash or a spike), using the live quote's `changepct` and sector. Include the company's full name, not just the ticker, in the prompt — a bare ticker (e.g. `ACE`) can be genuinely ambiguous to the model and has been observed to send gemma4 into a repetitive non-terminating reasoning loop.
@@ -124,7 +124,7 @@ Known data quirks:
 
 ### Index scan / batch mode
 
-Besides one symbol or an explicit list, `nse_trade_graph.py` can resolve and scan an entire index's constituents via `nse_data.get_index_symbols` (wraps `nsemine.live.get_index_constituents_live_snapshot`). A per-symbol failure (e.g. one blocked/slow fetch) is caught and logged so it doesn't abort the rest of the batch. `cache.py` backs both the multi-timeframe history and fundamentals fetches with a per-key JSON file under `CACHE_DIR` — this matters at batch scale: a full-index scan is ~13 HTTP calls per symbol (quote + 4 historical timeframes + several fundamentals endpoints), and the `technical_retry_guard` loop would otherwise re-fetch all of it, including same-day fundamentals, on every retry.
+Besides one symbol or an explicit list, `nse_trade_graph.py` can resolve and scan an entire index's constituents via `nse_data.get_index_symbols` (wraps `nsemine.live.get_index_constituents_live_snapshot`). A per-symbol failure (e.g. one blocked/slow fetch) is caught and logged so it doesn't abort the rest of the batch. `cache.py` backs both the multi-timeframe history and fundamentals fetches with a per-key JSON file under `CACHE_DIR` — this matters at batch scale: a full-index scan is ~13 HTTP calls per symbol (quote + 4 historical timeframes + several fundamentals endpoints), and repeated same-symbol fetches (e.g. `intraday_recheck.py` rechecking the same picks through the day) would otherwise re-hit NSE for same-day data that hasn't changed.
 
 ### Config (`.env`)
 

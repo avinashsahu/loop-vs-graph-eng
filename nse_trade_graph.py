@@ -20,7 +20,6 @@ from llm import call_llm
 from logging_config import setup_logging
 from market_time import now_ist
 
-MAX_ITERS = 3
 TRADE_LOG_PATH = os.environ.get("TRADE_LOG_PATH", "trade_log.jsonl")
 NSE_SCAN_LABEL = os.environ.get("NSE_SCAN_LABEL", "manual")
 
@@ -66,14 +65,11 @@ def node_technical(state):
 
     if verdict.startswith("GOOD"):
         return "fundamental", state
-    return "technical_retry_guard", state
 
-
-def node_technical_retry_guard(state):
-    if state["iters"] >= MAX_ITERS:
-        log.warning("technical check never GOOD after MAX_ITERS=%d", MAX_ITERS)
-        return "abort", state
-    return "fetch", state
+    # No retry: history is cache-backed (5 min intraday TTL, 24h daily TTL) and retries
+    # would fire seconds apart, so a retry loop here fed the LLM a byte-identical prompt
+    # every time -- 3x the LLM calls for a foregone conclusion, not a real second look.
+    return "abort", state
 
 
 def node_fundamental(state):
@@ -84,6 +80,15 @@ def node_fundamental(state):
         state["fundamental_verdict"] = f"BAD: negative EPS/PAT (eps={eps}, pat={pat})"
         log.warning(state["fundamental_verdict"])
         return "abort", state
+
+    if not snap.get("complete", True):
+        # One or more fetches failed (NSE rate-limit/block, transient error) -- judging a
+        # prompt full of Nones isn't a real fundamental read, and silently defaulting to
+        # GOOD would present an unvetted symbol as fully checked. Surface it for a human
+        # to look at instead of guessing.
+        state["fundamental_verdict"] = "BAD: fundamental data fetch was incomplete, not evaluated"
+        log.warning(state["fundamental_verdict"])
+        return "flag_review", state
 
     verdict = call_llm(
         _verdict_prompt(
@@ -116,9 +121,23 @@ def node_risk(state):
         log.warning(state["risk_verdict"])
         return "abort", state
 
-    day_low = state["hist"].iloc[-1]["low"]
+    # Compute today's low/high from the 5-minute bars (5 min TTL, refreshes through the
+    # day) rather than the daily bar's row (cached until IST midnight -- its low/high
+    # freeze at whatever they were when first fetched today). Otherwise a stock crashing
+    # through its circuit limit later in the day still reads as fine on a later recheck.
+    today = now_ist().date()
+    intraday_5m = state["hist_multi"]["5"]
+    today_bars = intraday_5m[intraday_5m["datetime"].dt.date == today]
+    day_low = today_bars["low"].min() if not today_bars.empty else state["hist"].iloc[-1]["low"]
+    day_high = today_bars["high"].max() if not today_bars.empty else state["hist"].iloc[-1]["high"]
+
     if day_low <= lower_circuit * 1.02:
         state["risk_verdict"] = f"BAD: price near lower circuit ({day_low} vs {lower_circuit})"
+        log.warning(state["risk_verdict"])
+        return "abort", state
+
+    if day_high >= upper_circuit * 0.98:
+        state["risk_verdict"] = f"BAD: price near upper circuit ({day_high} vs {upper_circuit}) -- likely unfillable"
         log.warning(state["risk_verdict"])
         return "abort", state
 
@@ -214,7 +233,6 @@ def node_log(state):
 GRAPH = {
     "fetch": node_fetch,
     "technical": node_technical,
-    "technical_retry_guard": node_technical_retry_guard,
     "fundamental": node_fundamental,
     "risk": node_risk,
     "sentiment": node_sentiment,

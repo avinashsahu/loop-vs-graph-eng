@@ -127,6 +127,7 @@ def get_fundamental_snapshot(symbol: str) -> dict:
         "peer_comparison": None,
         "eps": None,
         "pat": None,
+        "complete": True,
     }
     all_ok = True
 
@@ -151,6 +152,8 @@ def get_fundamental_snapshot(symbol: str) -> dict:
     except Exception:
         log.warning("fundamentals[%s]: peer comparison fetch failed", symbol, exc_info=True)
         all_ok = False
+
+    snapshot["complete"] = all_ok
 
     # Only cache a fully-successful fetch -- a snapshot degraded by a transient NSE
     # failure shouldn't get stuck for FUNDAMENTALS_CACHE_TTL_HOURS; retry it next run instead.
