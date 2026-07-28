@@ -33,6 +33,18 @@ def _verdict_prompt(question):
 def node_fetch(state):
     state["iters"] += 1
     state["quote"] = get_stock_live_quotes(state["symbol"])
+
+    # get_stock_live_quotes returns None on error, and can occasionally return a raw
+    # dict missing expected keys on an internal nsemine exception -- checking here once
+    # avoids a raw crash (and a missing log record) deeper in node_risk/node_sentiment.
+    required_quote_keys = (
+        "name", "sector", "changepct", "previous_close", "change", "upper_circuit", "lower_circuit",
+    )
+    if not state["quote"] or not all(k in state["quote"] for k in required_quote_keys):
+        state["risk_verdict"] = f"BAD: quote fetch failed or malformed for {state['symbol']}"
+        log.warning(state["risk_verdict"])
+        return "abort", state
+
     state["hist_multi"] = nse_data.get_multi_timeframe_history(state["symbol"])
     state["hist"] = state["hist_multi"]["D"]
     state["fundamental_snapshot"] = fundamentals.get_fundamental_snapshot(state["symbol"])
@@ -207,8 +219,15 @@ def node_abort(state):
     return "log", state
 
 
-def node_log(state):
-    record = {
+def build_record(state):
+    """The one place a state dict becomes a log/email record -- used by node_log and by
+    intraday_recheck.py (which re-runs the graph outside the normal fetch->...->log path
+    and used to hand-rebuild a near-copy of this, which is exactly the kind of drift that
+    lets a field show up in the digest but silently render as None in an intraday alert).
+    Uses this module's NSE_SCAN_LABEL constant -- intraday_recheck.py relies on getting
+    its own label here, which is why it sets os.environ["NSE_SCAN_LABEL"] *before*
+    importing this module (module-level constants are computed once, at import time)."""
+    return {
         "timestamp": now_ist().isoformat(),
         "scan_label": NSE_SCAN_LABEL,
         "symbol": state["symbol"],
@@ -219,11 +238,17 @@ def node_log(state):
         "technical_indicators": state.get("technical_indicators"),
         "technical_verdict": state.get("technical_verdict"),
         "fundamental_verdict": state.get("fundamental_verdict"),
+        "eps": (state.get("fundamental_snapshot") or {}).get("eps"),
+        "pat": (state.get("fundamental_snapshot") or {}).get("pat"),
         "risk_verdict": state.get("risk_verdict"),
         "sentiment_verdict": state.get("sentiment_verdict"),
         "status": state["status"],
         "proposal": state["proposal"],
     }
+
+
+def node_log(state):
+    record = build_record(state)
     with open(TRADE_LOG_PATH, "a") as f:
         f.write(json.dumps(record) + "\n")
     log.info("status=%s proposal=%r", state["status"], state["proposal"])
