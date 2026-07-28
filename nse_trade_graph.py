@@ -13,6 +13,7 @@ import time
 
 from nsemine.live import get_stock_live_quotes
 
+import bhavcopy
 import fundamentals
 import nse_data
 import ta_analysis
@@ -49,6 +50,15 @@ def node_fetch(state):
     state["hist_multi"] = nse_data.get_multi_timeframe_history(state["symbol"])
     state["hist"] = state["hist_multi"]["D"]
     state["fundamental_snapshot"] = fundamentals.get_fundamental_snapshot(state["symbol"])
+
+    try:
+        state["delivery_trend"] = bhavcopy.get_delivery_trend(state["symbol"])
+    except Exception:
+        # bhavcopy.db may not exist/be backfilled yet -- this is additional context,
+        # not a required input, so a missing/fresh DB shouldn't abort the whole run.
+        log.warning("bhavcopy delivery trend unavailable for %s", state["symbol"], exc_info=True)
+        state["delivery_trend"] = None
+
     return "technical", state
 
 
@@ -97,9 +107,11 @@ def node_fundamental(state):
             f"corp announcements={snap.get('corp_announcements')}, "
             f"shareholding pattern (recent periods)={snap.get('shareholding_pattern')}, "
             f"yearwise returns={snap.get('yearwise_returns')}, "
-            f"peer comparison (quarter {snap.get('peer_comparison_quarter')})={snap.get('peer_comparison')}.\n"
+            f"peer comparison (quarter {snap.get('peer_comparison_quarter')})={snap.get('peer_comparison')}, "
+            f"delivery-volume trend (from NSE bhavcopy, recent vs prior average, rising means "
+            f"more genuine buying interest not just intraday churn)={state.get('delivery_trend')}.\n"
             "Does the company look fundamentally sound -- no red flags in recent corporate actions, "
-            "announcements, or shareholding trend, and reasonable standing versus peers?"
+            "announcements, shareholding trend, or delivery trend, and reasonable standing versus peers?"
         ),
         mode="check",
     )
@@ -229,6 +241,7 @@ def build_record(state):
         "fundamental_verdict": state.get("fundamental_verdict"),
         "eps": (state.get("fundamental_snapshot") or {}).get("eps"),
         "pat": (state.get("fundamental_snapshot") or {}).get("pat"),
+        "delivery_trend": state.get("delivery_trend"),
         "risk_verdict": state.get("risk_verdict"),
         "sentiment_verdict": state.get("sentiment_verdict"),
         "status": state["status"],
@@ -267,6 +280,7 @@ def run(symbol, principal, risk_pct=10.0):
         "hist": None,
         "hist_multi": None,
         "fundamental_snapshot": None,
+        "delivery_trend": None,
         "technical_indicators": None,
         "technical_verdict": None,
         "fundamental_verdict": None,
