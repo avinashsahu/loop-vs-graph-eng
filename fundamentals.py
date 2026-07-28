@@ -20,7 +20,9 @@ _NEXT_API_URL = "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
 def _next_api_get(function_name, params):
     resp = get_request(_NEXT_API_URL, params={"functionName": function_name, **params})
     if resp is None:
-        return None
+        # get_request already retried internally and gave up -- treat as a real failure,
+        # not "no data", so the caller doesn't cache a snapshot degraded by this field.
+        raise ConnectionError(f"NSE request failed for functionName={function_name}")
     return resp.json()
 
 
@@ -87,40 +89,50 @@ def _extract_eps_pat(symbol, peer_data):
 
 
 def get_fundamental_snapshot(symbol: str) -> dict:
-    def fetch_fn():
-        snapshot = {
-            "company_name": None,
-            "corp_announcements": None,
-            "corp_actions": None,
-            "shareholding_pattern": None,
-            "yearwise_returns": None,
-            "peer_comparison_quarter": None,
-            "peer_comparison": None,
-            "eps": None,
-            "pat": None,
-        }
-
-        for field, fetch in (
-            ("company_name", lambda: _get_symbol_name(symbol)),
-            ("corp_announcements", lambda: _get_corp_announcements(symbol)),
-            ("corp_actions", lambda: _get_corp_actions(symbol)),
-            ("shareholding_pattern", lambda: _get_shareholding_pattern(symbol)),
-            ("yearwise_returns", lambda: _get_yearwise_returns(symbol)),
-        ):
-            try:
-                snapshot[field] = fetch()
-            except Exception:
-                log.warning("fundamentals[%s]: %s fetch failed", symbol, field, exc_info=True)
-
-        try:
-            quarter, peer_data = _get_peer_comparison(symbol)
-            snapshot["peer_comparison_quarter"] = quarter
-            snapshot["peer_comparison"] = peer_data
-            snapshot["eps"], snapshot["pat"] = _extract_eps_pat(symbol, peer_data)
-        except Exception:
-            log.warning("fundamentals[%s]: peer comparison fetch failed", symbol, exc_info=True)
-
-        return snapshot
-
     key = f"fundamentals_{symbol}_{datetime.now():%Y%m%d}"
-    return cache.cached(key, FUNDAMENTALS_CACHE_TTL_HOURS * 3600, fetch_fn)
+    ttl_seconds = FUNDAMENTALS_CACHE_TTL_HOURS * 3600
+
+    hit = cache.read(key, ttl_seconds)
+    if hit is not None:
+        return hit
+
+    snapshot = {
+        "company_name": None,
+        "corp_announcements": None,
+        "corp_actions": None,
+        "shareholding_pattern": None,
+        "yearwise_returns": None,
+        "peer_comparison_quarter": None,
+        "peer_comparison": None,
+        "eps": None,
+        "pat": None,
+    }
+    all_ok = True
+
+    for field, fetch in (
+        ("company_name", lambda: _get_symbol_name(symbol)),
+        ("corp_announcements", lambda: _get_corp_announcements(symbol)),
+        ("corp_actions", lambda: _get_corp_actions(symbol)),
+        ("shareholding_pattern", lambda: _get_shareholding_pattern(symbol)),
+        ("yearwise_returns", lambda: _get_yearwise_returns(symbol)),
+    ):
+        try:
+            snapshot[field] = fetch()
+        except Exception:
+            log.warning("fundamentals[%s]: %s fetch failed", symbol, field, exc_info=True)
+            all_ok = False
+
+    try:
+        quarter, peer_data = _get_peer_comparison(symbol)
+        snapshot["peer_comparison_quarter"] = quarter
+        snapshot["peer_comparison"] = peer_data
+        snapshot["eps"], snapshot["pat"] = _extract_eps_pat(symbol, peer_data)
+    except Exception:
+        log.warning("fundamentals[%s]: peer comparison fetch failed", symbol, exc_info=True)
+        all_ok = False
+
+    # Only cache a fully-successful fetch -- a snapshot degraded by a transient NSE
+    # failure shouldn't get stuck for FUNDAMENTALS_CACHE_TTL_HOURS; retry it next run instead.
+    if all_ok:
+        cache.write(key, snapshot)
+    return snapshot

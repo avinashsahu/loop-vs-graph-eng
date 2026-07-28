@@ -378,6 +378,7 @@ dependencies = [
     { name = "anthropic" },
     { name = "nsemine" },
     { name = "openai" },
+    { name = "pandas" },
     { name = "python-dotenv" },
     { name = "ta-lib" },
 ]
@@ -387,6 +388,7 @@ requires-dist = [
     { name = "anthropic", specifier = ">=0.120.0" },
     { name = "nsemine", specifier = ">=1.5" },
     { name = "openai", specifier = ">=2.49.0" },
+    { name = "pandas", specifier = ">=3.0.5" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "ta-lib", specifier = ">=0.7.1" },
 ]
