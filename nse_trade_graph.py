@@ -13,6 +13,7 @@ from logging_config import setup_logging
 
 MAX_ITERS = 3
 TRADE_LOG_PATH = os.environ.get("TRADE_LOG_PATH", "trade_log.jsonl")
+NSE_SCAN_LABEL = os.environ.get("NSE_SCAN_LABEL", "manual")
 
 log = setup_logging("nse")
 
@@ -172,7 +173,9 @@ def node_abort(state):
 def node_log(state):
     record = {
         "timestamp": datetime.now().isoformat(),
+        "scan_label": NSE_SCAN_LABEL,
         "symbol": state["symbol"],
+        "company_name": (state.get("quote") or {}).get("name"),
         "principal": state["principal"],
         "risk_pct": state["risk_pct"],
         "iters": state["iters"],

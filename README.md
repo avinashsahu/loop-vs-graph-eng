@@ -152,3 +152,38 @@ jq -c '{symbol, status, technical_verdict}' trade_log.jsonl
 ```
 
 This log is the intended way to eventually judge whether the checks are any good — log now, join against actual price outcomes later. No live grading is implemented; that's a deliberate second-phase feature, not an oversight.
+
+## Automated email alerts
+
+`notify.py`, `digest.py`, and `intraday_recheck.py` turn the trade graph into a cron-driven alert pipeline: scan the whole market overnight, email a full-detail digest in the morning, then keep an eye on just that morning's picks during the day.
+
+- **`notify.py`** — generic email sending (`smtplib`, stdlib only). Stub by default (`EMAIL_ENABLED=0`): composes the email and logs it instead of sending, so everything downstream is testable without real SMTP credentials. `EMAIL_TO` is a comma-separated list — one address today, more later, no code change needed. Slack/Telegram aren't built (deliberately out of scope for now), but adding one later means adding one function here, not touching `digest.py`/`intraday_recheck.py`.
+- **`scan_label`** — every row `nse_trade_graph.py` appends to `trade_log.jsonl` is tagged with `NSE_SCAN_LABEL` (default `manual`). This is how `digest.py`/`intraday_recheck.py` find "this run's" records without relying on calendar-date matching, which would be fragile for an overnight scan spanning midnight.
+- **`run_overnight_scan.sh`** — the actual cron target. Generates a run id (`overnight_YYYYMMDD_HHMM`), runs `nse_trade_graph.py` over `NSE_INDEX="NIFTY TOTAL MKT"` tagged with that id, then calls `digest.py` with the same id. (`nsemine` recognizes the index name `NIFTY TOTAL MKT` — 750 constituents; `"NIFTY TOTAL MARKET"` does not, it hits an internal `nsemine` bug and returns `None`.)
+- **`digest.py <run_id>`** — reads `trade_log.jsonl` filtered to that `scan_label`, emails one full-detail section (all four timeframes' indicators, every node's verdict text, the proposal) per `proposed`/`flagged_for_review` symbol, plus a one-line count of everything scanned/aborted for context.
+- **`intraday_recheck.py [run_id]`** — finds the most recent `overnight_*` label (or takes one explicitly), collects the symbols that were `proposed`/`flagged_for_review` in that run, re-runs the full graph on just those (not the full 750 — confirmed too slow for a 15-30 min cadence), and emails a full-detail alert for any still `proposed`/`flagged_for_review`. A symbol that dropped to `aborted` since morning is logged but not emailed. Meant to run every 15-30 minutes during market hours.
+
+Runs on a different machine or a different local model port with zero code changes — everything routes through the existing `LOCAL_LLM_URL`/`LOCAL_LLM_MODEL` `.env` config already described above.
+
+### Config (`.env`)
+
+`NSE_SCAN_LABEL` (default `manual`), `EMAIL_ENABLED` (default `0`, stub), `SMTP_HOST`, `SMTP_PORT` (default `587`), `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_USE_TLS` (default `1`), `EMAIL_FROM`, `EMAIL_TO` (comma-separated).
+
+### Cron setup
+
+Add to `crontab -e` (adjust the path and market hours for your timezone):
+
+```cron
+# Overnight full-market scan + morning digest, once after market close
+0 22 * * 1-5 /path/to/loop-vs-graph-eng/run_overnight_scan.sh >> /path/to/loop-vs-graph-eng/cron.log 2>&1
+
+# Intraday recheck of the morning's picks, every 20 minutes during market hours
+*/20 9-15 * * 1-5 cd /path/to/loop-vs-graph-eng && uv run intraday_recheck.py >> cron.log 2>&1
+```
+
+### Running manually
+
+```bash
+uv run digest.py <run_id>
+uv run intraday_recheck.py [run_id]   # defaults to the most recent overnight_* label
+```
