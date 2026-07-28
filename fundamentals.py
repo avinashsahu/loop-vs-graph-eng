@@ -1,4 +1,5 @@
 import os
+import time
 from datetime import datetime
 
 from nsemine.bin.scraper import get_request
@@ -9,6 +10,7 @@ from logging_config import setup_logging
 log = setup_logging("fundamentals")
 
 FUNDAMENTALS_CACHE_TTL_HOURS = float(os.environ.get("FUNDAMENTALS_CACHE_TTL_HOURS", "24"))
+FUNDAMENTALS_CALL_DELAY_SECONDS = float(os.environ.get("FUNDAMENTALS_CALL_DELAY_SECONDS", "0.5"))
 
 # All 8 endpoints share this one path -- functionName is a query param, not a path segment.
 # Confirmed live against HDFCBANK for all of: getSymbolName, getCorporateAnnouncement,
@@ -19,6 +21,11 @@ _NEXT_API_URL = "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
 
 def _next_api_get(function_name, params):
     resp = get_request(_NEXT_API_URL, params={"functionName": function_name, **params})
+    # Stagger every call through this one choke point (all 7 fundamentals endpoints go
+    # through here, including the two sequential calls inside _get_peer_comparison) --
+    # get_fundamental_snapshot fires ~7 requests back to back for one symbol, on top of
+    # NSE_SCAN_DELAY_SECONDS between symbols in a batch scan.
+    time.sleep(FUNDAMENTALS_CALL_DELAY_SECONDS)
     if resp is None:
         # get_request already retried internally and gave up -- treat as a real failure,
         # not "no data", so the caller doesn't cache a snapshot degraded by this field.
@@ -60,7 +67,21 @@ def _get_shareholding_pattern(symbol):
 
 def _get_yearwise_returns(symbol):
     # NSE API quirk: this endpoint (only this one) expects the symbol suffixed with "EQN".
-    return _next_api_get("getYearwiseData", {"symbol": f"{symbol}EQN"})
+    data = _next_api_get("getYearwiseData", {"symbol": f"{symbol}EQN"})
+    items = data if isinstance(data, list) else (data or {}).get("data", [])
+    if not items:
+        return None
+    row = dict(items[0])
+    # NSE mislabels these fields -- despite the name, they're year-to-date change, not a
+    # single day's change. Confirmed live: HDFCBANK showed index_yesterday_chng_per=-8.27
+    # and ACE showed index_yesterday_chng_per=-3.32 on the same real trading day for
+    # overlapping indices -- a single-day NIFTY move of that size never happened; both
+    # values are plausible as year-to-date instead.
+    if "yesterday_chng_per" in row:
+        row["ytd_chng_per"] = row.pop("yesterday_chng_per")
+    if "index_yesterday_chng_per" in row:
+        row["index_ytd_chng_per"] = row.pop("index_yesterday_chng_per")
+    return row
 
 
 def _get_peer_comparison(symbol):
