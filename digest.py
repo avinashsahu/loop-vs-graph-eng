@@ -9,6 +9,7 @@ import os
 import sys
 from collections import defaultdict
 
+from logging_config import setup_logging
 from market_time import now_ist
 from notify import send_email
 
@@ -18,12 +19,30 @@ from notify import send_email
 # it sets NSE_SCAN_LABEL for its own run.
 TRADE_LOG_PATH = os.environ.get("TRADE_LOG_PATH", "trade_log.jsonl")
 
+log = setup_logging("digest")
+
+
+def read_jsonl_records(path):
+    """All of trade_log.jsonl's readers (this module and intraday_recheck.py) go
+    through here -- one truncated/corrupt line (e.g. a partial write on disk-full, or
+    two processes appending at once) shouldn't crash the whole digest/recheck."""
+    if not os.path.exists(path):
+        return []
+    records = []
+    with open(path) as f:
+        for i, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except ValueError:
+                log.warning("skipping malformed line %d in %s", i + 1, path)
+    return records
+
 
 def _load_records(run_id):
-    if not os.path.exists(TRADE_LOG_PATH):
-        return []
-    with open(TRADE_LOG_PATH) as f:
-        return [r for line in f if (r := json.loads(line)).get("scan_label") == run_id]
+    return [r for r in read_jsonl_records(TRADE_LOG_PATH) if r.get("scan_label") == run_id]
 
 
 def _format_indicators(indicators):
@@ -66,7 +85,7 @@ def build_digest(run_id):
     total = len(records)
 
     subject = (
-        f"NSE Morning Digest -- {now_ist():%Y-%m-%d} -- "
+        f"NSE Overnight Scan Digest -- {now_ist():%Y-%m-%d} -- "
         f"{len(proposed)} proposed, {len(flagged)} flagged ({total} scanned)"
     )
 

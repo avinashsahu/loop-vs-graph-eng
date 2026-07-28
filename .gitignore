@@ -17,3 +17,7 @@ trade_log.jsonl
 
 # On-disk data cache
 .cache/
+
+# Cron output -- with EMAIL_ENABLED=0, notify.py logs full email bodies (real trade
+# verdicts/proposals) here; never commit it.
+cron.log

@@ -25,7 +25,7 @@ Then:
 uv sync
 ```
 
-This creates `.venv` and installs the pinned dependencies (`anthropic`, `openai`, `nsemine`, `python-dotenv`, `ta-lib`).
+This creates `.venv` and installs the pinned dependencies (`anthropic`, `openai`, `nsemine`, `pandas`, `python-dotenv`, `ta-lib`).
 
 If `uv add ta-lib` / `uv sync` ever fails to find the C library's headers, point it explicitly:
 
@@ -112,7 +112,7 @@ fetch -> technical -> [BAD] -> abort (no retry -- see below)
 ```
 
 - **technical** — computes real indicators (SMA20, SMA50, RSI14, MACD(12,26,9), via `ta_analysis.compute_indicators`, **TA-Lib**-backed) independently for four timeframes — daily plus 30/15/5-minute (from `nse_data.get_multi_timeframe_history`) — and asks the LLM to interpret all four together (one prompt, one verdict) for a short-term buy signal. A `BAD` verdict aborts immediately, no retry: history is cache-backed (5 min intraday TTL, 24h daily TTL), so a retry loop here used to fire seconds apart and feed the LLM a byte-identical prompt every time — 3x the LLM calls for a foregone conclusion, not a real second look, found and removed during a later review pass. Grounding the LLM in computed indicators instead of a raw OHLCV table still gives more consistent verdicts than free-form table reading would. Deliberately not split into one node per timeframe — this project only splits nodes when the retry/remediation path genuinely differs, and all four timeframes feed one verdict either way.
-- **fundamental** — `fundamentals.get_fundamental_snapshot` pulls corporate announcements, corporate actions, shareholding pattern, yearwise returns, and a peer comparison (all via raw NSE `NextApi` endpoints, see `fundamentals.py`). A deterministic hard check runs first: negative EPS or PAT aborts immediately, same philosophy as `risk`'s circuit-limit check — an objective number isn't the LLM's job to hallucinate over. Otherwise the LLM reads the qualitative parts (corp actions, shareholding trend, peer standing) for a `GOOD`/`BAD` verdict; a soft `BAD` here routes to `flag_review`, same policy as `sentiment`, not an abort.
+- **fundamental** — `fundamentals.get_fundamental_snapshot` pulls corporate announcements, corporate actions, shareholding pattern, yearwise returns, and a peer comparison (all via raw NSE `NextApi` endpoints, see `fundamentals.py`). A deterministic hard check runs first: negative EPS or PAT aborts immediately, same philosophy as `risk`'s circuit-limit check — an objective number isn't the LLM's job to hallucinate over. Otherwise the LLM reads the qualitative parts (corp actions, corp announcements, shareholding trend, peer standing) for a `GOOD`/`BAD` verdict; a soft `BAD` here routes to `flag_review`, same policy as `sentiment`, not an abort.
 - **risk** — deterministic code, not an LLM call. Computes position size from `principal * risk_pct / 100`, validates `risk_pct` is sane (0-25%), and aborts if the stock's current low is within 2% of its lower circuit limit. Kept out of the LLM's hands on purpose: risk sizing is exactly the kind of check where a hallucinated "looks fine" verdict is the expensive failure mode.
 - **sentiment** — LLM checks whether today's price move looks like a reasonable entry (not a crash or a spike), using the live quote's `changepct` and sector. Include the company's full name, not just the ticker, in the prompt — a bare ticker (e.g. `ACE`) can be genuinely ambiguous to the model and has been observed to send gemma4 into a repetitive non-terminating reasoning loop.
 - **propose** — never calls a broker. Only ever produces a proposal string for a human to review and act on manually.
@@ -128,7 +128,7 @@ Besides one symbol or an explicit list, `nse_trade_graph.py` can resolve and sca
 
 ### Config (`.env`)
 
-`NSE_SYMBOL` (default `RELIANCE`, used only when no symbols are passed on the command line and `NSE_INDEX` is unset), `NSE_PRINCIPAL` (default `100000`), `NSE_RISK_PCT` (default `10`, meant to scale with your actual principal, not be hardcoded), `TRADE_LOG_PATH` (default `trade_log.jsonl`, gitignored), `NSE_INDEX` (e.g. `NIFTY 50` — if set and no symbols are passed on the command line, scans the index's constituents instead of falling back to `NSE_SYMBOL`), `NSE_SCAN_LIMIT` (optional, caps how many constituents are scanned), `NSE_SCAN_DELAY_SECONDS` (default `1`, pause between symbols in a batch/index scan), `CACHE_DIR` (default `.cache`, gitignored), `FUNDAMENTALS_CACHE_TTL_HOURS` (default `24`), `INTRADAY_CACHE_TTL_MINUTES` (default `5`).
+`NSE_SYMBOL` (default `RELIANCE`, used only when no symbols are passed on the command line and `NSE_INDEX` is unset), `NSE_PRINCIPAL` (default `100000`), `NSE_RISK_PCT` (default `10`, meant to scale with your actual principal, not be hardcoded), `TRADE_LOG_PATH` (default `trade_log.jsonl`, gitignored), `NSE_INDEX` (e.g. `NIFTY 50` — if set and no symbols are passed on the command line, scans the index's constituents instead of falling back to `NSE_SYMBOL`), `NSE_SCAN_LIMIT` (optional, caps how many constituents are scanned), `NSE_SCAN_DELAY_SECONDS` (default `1`, pause between symbols in a batch/index scan), `NSE_CALL_DELAY_SECONDS` (default `0.3`, pause after each quote/historical-data call), `CACHE_DIR` (default `.cache`, gitignored), `FUNDAMENTALS_CACHE_TTL_HOURS` (default `24`), `FUNDAMENTALS_CALL_DELAY_SECONDS` (default `0.5`, pause after each of the ~7 fundamentals API calls per symbol), `INTRADAY_CACHE_TTL_MINUTES` (default `5`).
 
 ### Running
 
@@ -153,15 +153,17 @@ jq -c '{symbol, status, technical_verdict}' trade_log.jsonl
 
 This log is the intended way to eventually judge whether the checks are any good — log now, join against actual price outcomes later. No live grading is implemented; that's a deliberate second-phase feature, not an oversight.
 
+Malformed lines (partial writes from a disk-full condition, concurrent appends) are skipped with a warning rather than crashing `digest.py`/`intraday_recheck.py` — but neither `trade_log.jsonl` nor `.cache/` are rotated or pruned. At `NIFTY TOTAL MKT` (750-symbol) overnight-scan scale this grows by roughly 1.5-2MB/night; archiving or trimming old entries is a real need before running this unattended for months, just not built yet.
+
 ## Automated email alerts
 
-`notify.py`, `digest.py`, and `intraday_recheck.py` turn the trade graph into a cron-driven alert pipeline: scan the whole market overnight, email a full-detail digest in the morning, then keep an eye on just that morning's picks during the day.
+`notify.py`, `digest.py`, and `intraday_recheck.py` turn the trade graph into a cron-driven alert pipeline: scan the whole market overnight, email a full-detail digest once that scan completes, then keep an eye on that run's picks during the day.
 
 - **`notify.py`** — generic email sending (`smtplib`, stdlib only). Stub by default (`EMAIL_ENABLED=0`): composes the email and logs it instead of sending, so everything downstream is testable without real SMTP credentials. `EMAIL_TO` is a comma-separated list — one address today, more later, no code change needed. Slack/Telegram aren't built (deliberately out of scope for now), but adding one later means adding one function here, not touching `digest.py`/`intraday_recheck.py`.
 - **`scan_label`** — every row `nse_trade_graph.py` appends to `trade_log.jsonl` is tagged with `NSE_SCAN_LABEL` (default `manual`). This is how `digest.py`/`intraday_recheck.py` find "this run's" records without relying on calendar-date matching, which would be fragile for an overnight scan spanning midnight.
 - **`run_overnight_scan.sh`** — the actual cron target. Generates a run id (`overnight_YYYYMMDD_HHMM`), runs `nse_trade_graph.py` over `NSE_INDEX="NIFTY TOTAL MKT"` tagged with that id, then calls `digest.py` with the same id. (`nsemine` recognizes the index name `NIFTY TOTAL MKT` — 750 constituents; `"NIFTY TOTAL MARKET"` does not, it hits an internal `nsemine` bug and returns `None`.)
 - **`digest.py <run_id>`** — reads `trade_log.jsonl` filtered to that `scan_label`, emails one full-detail section (all four timeframes' indicators, every node's verdict text, the proposal) per `proposed`/`flagged_for_review` symbol, plus a one-line count of everything scanned/aborted for context.
-- **`intraday_recheck.py [run_id]`** — finds the most recent `overnight_*` label (or takes one explicitly), collects the symbols that were `proposed`/`flagged_for_review` in that run, re-runs the full graph on just those (not the full 750 — confirmed too slow for a 15-30 min cadence), and emails a full-detail alert for any still `proposed`/`flagged_for_review`. A symbol that dropped to `aborted` since morning is logged but not emailed.
+- **`intraday_recheck.py [run_id]`** — finds the most recent `overnight_*` label (or takes one explicitly), collects the symbols that were `proposed`/`flagged_for_review` in that run, re-runs the full graph on just those (not the full 750 — confirmed too slow for a 15-30 min cadence), and emails a full-detail alert for any still `proposed`/`flagged_for_review`. A symbol that dropped to `aborted` since the overnight scan is logged but not emailed.
 
 Runs on a different machine or a different local model port with zero code changes — everything routes through the existing `LOCAL_LLM_URL`/`LOCAL_LLM_MODEL` `.env` config already described above.
 
@@ -182,7 +184,7 @@ Fixed via `market_time.py`: `now_ist()` / `now_ist_naive()` return the real IST 
 Add to `crontab -e` (adjust the path):
 
 ```cron
-# Overnight full-market scan + morning digest, once after market close. cron itself
+# Overnight full-market scan + digest, once after market close. cron itself
 # interprets "22" in the host's own system timezone, not necessarily IST -- if this
 # machine isn't set to IST, adjust the hour accordingly (or set CRON_TZ=Asia/Kolkata
 # if your cron implementation supports it).
