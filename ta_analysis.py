@@ -35,6 +35,11 @@ _TIMEFRAME_WEIGHTS = {"D": 3, "30": 2, "15": 1, "5": 1}
 # backtested against this app's own data (see README/commit for the sourcing caveat).
 _SMA_GAP_SCALE_PCT = 3.0
 
+# A family score below this magnitude is "not really saying anything" -- excluded from
+# the confluence vote so it can't count as either agreement or disagreement. Same class
+# of heuristic as the other constants here: reasonable, not backtested.
+_FAMILY_ENGAGEMENT_THRESHOLD = 0.1
+
 
 def _clip(value, lo=-1.0, hi=1.0):
     # float() up front -- indicators are numpy floats, and numpy comparisons/arithmetic
@@ -72,6 +77,9 @@ def _rsi_penalty(rsi, lower, upper):
     return 0.0
 
 
+_TOTAL_TIMEFRAME_WEIGHT = sum(_TIMEFRAME_WEIGHTS.values())
+
+
 def score_technical(indicators):
     """Deterministic replacement for what node_technical used to ask an LLM to judge.
 
@@ -86,16 +94,28 @@ def score_technical(indicators):
     1. Graduated scores. SMA trend and MACD momentum are scored by how far apart the
        values are (as a fraction of a scale, clipped to +/-1), not just which side of
        zero they land on -- a 0.1% SMA gap and a 3% SMA gap used to count the same.
-    2. Confluence gating. A positive total score is only trusted as GOOD if a genuine
-       majority of the independent signal components (trend + momentum across 4
-       timeframes, plus daily RSI) actually agree on direction. A single strong
-       component dragging a lot of disagreeing ones to a barely-positive sum is exactly
-       the fragile case "confluence" is meant to rule out -- so that case is BAD, not GOOD.
+    2. Confluence across independent signal *families*, not across timeframes. Trend
+       (SMA) and momentum (MACD) are each computed at 4 timeframes to weight daily
+       heaviest and use intraday for timing -- but those 4 readings are correlated (same
+       price series), not 4 independent opinions. Treating them as separate "votes"
+       double- and quadruple-counts the same underlying trend. So each family is first
+       collapsed to one weighted-average family score across its 4 timeframes, and
+       confluence is measured across the resulting 3 genuinely-distinct families (trend,
+       momentum, RSI): verdict is GOOD only if the total is positive AND at least 2 of
+       the (up to 3) "engaged" families -- those with |score| above a small deadzone,
+       so near-zero noise doesn't get a vote -- actually agree on direction. A first
+       attempt defined "agreement" relative to the total score's own sign, which is a
+       circular definition: if total_score > 0 then agreeing weight necessarily exceeds
+       disagreeing weight by simple algebra, so that check could never fail. Requiring
+       an independent majority of engaged families (not compared to the sum they
+       produce) is what actually makes confluence a real constraint instead of a
+       relabeling of "score > 0" -- confirmed with a trend/momentum divergence case
+       (strong bullish trend, real bearish momentum, RSI neutral) that has a positive
+       weighted score but only 1 of 2 engaged families agreeing: correctly BAD.
     """
     breakdown = {}
-    total_score = 0.0
-    agree = 0
-    votes = 0
+    trend_weighted_sum = 0.0
+    momentum_weighted_sum = 0.0
 
     daily_atr_pct = indicators["D"]["atr_pct"]
     rsi_lower, rsi_upper = _adaptive_rsi_bands(daily_atr_pct)
@@ -108,30 +128,19 @@ def score_technical(indicators):
         atr = ind["atr14"] or 1e-9  # guard against a zero-ATR flat series
         momentum_score = _clip(ind["macd_hist"] / (atr * 0.5))
 
-        tf_score = weight * (trend_score + momentum_score)
-        breakdown[tf] = {
-            "trend_score": round(trend_score, 3),
-            "momentum_score": round(momentum_score, 3),
-            "weighted_score": round(tf_score, 3),
-        }
-        total_score += tf_score
-        for component in (trend_score, momentum_score):
-            if component != 0:
-                votes += 1
-                if component > 0:
-                    agree += 1
+        breakdown[tf] = {"trend_score": round(trend_score, 3), "momentum_score": round(momentum_score, 3)}
+        trend_weighted_sum += weight * trend_score
+        momentum_weighted_sum += weight * momentum_score
+
+    # Weighted average (not sum) -- each family score stays on the same +/-1 scale as
+    # its inputs, comparable to the RSI family score below.
+    trend_family = trend_weighted_sum / _TOTAL_TIMEFRAME_WEIGHT
+    momentum_family = momentum_weighted_sum / _TOTAL_TIMEFRAME_WEIGHT
 
     daily_rsi = float(indicators["D"]["rsi14"])
-    rsi_score = _rsi_penalty(daily_rsi, rsi_lower, rsi_upper)
-    # Weighted the same as one daily trend/momentum component so it can meaningfully
-    # move the total without dominating it.
-    total_score += rsi_score * _TIMEFRAME_WEIGHTS["D"]
-    if rsi_score != 0:
-        votes += 1
-        if rsi_score > 0:
-            agree += 1
+    rsi_family = _rsi_penalty(daily_rsi, rsi_lower, rsi_upper)
 
-    if rsi_score > 0:
+    if rsi_family > 0:
         rsi_note = "neutral"
     elif daily_rsi > rsi_upper:
         rsi_note = f"overbought vs adaptive band >{rsi_upper:.0f} (caution -- momentum may be exhausted)"
@@ -140,22 +149,27 @@ def score_technical(indicators):
     else:
         rsi_note = "neutral"
 
-    # Direction each voting component points is compared against the FINAL sign, not
-    # the raw agree/disagree split -- a total_score <= 0 needs every component pulling
-    # down to count as "confluent bearishness"; disagreement there doesn't matter
-    # because the verdict is already BAD.
-    if total_score <= 0:
-        verdict = "BAD"
-        confluence_ratio = (votes - agree) / votes if votes else 0.0
-    else:
-        confluence_ratio = agree / votes if votes else 0.0
-        verdict = "GOOD" if confluence_ratio >= 0.5 else "BAD"
+    families = {"trend": trend_family, "momentum": momentum_family, "rsi": rsi_family}
+    total_score = sum(families.values())
+
+    # Confluence: at least 2 of the (up to 3) "engaged" families -- magnitude above the
+    # deadzone, so a near-zero reading can't vote either way -- must independently agree
+    # on direction. Independent of total_score's own sign, unlike an earlier version
+    # that compared each family against the sum they produced (circular -- see
+    # docstring). A lone strong family with no confirmation is exactly what "confluence"
+    # (multiple signals agreeing) is meant to exclude, even if the raw sum is positive.
+    engaged = {k: v for k, v in families.items() if abs(v) > _FAMILY_ENGAGEMENT_THRESHOLD}
+    agree_count = sum(1 for v in engaged.values() if v > 0)
+    disagree_count = len(engaged) - agree_count
+    confluence_ratio = agree_count / len(engaged) if engaged else 0.0
+    verdict = "GOOD" if (total_score > 0 and len(engaged) >= 2 and agree_count > disagree_count) else "BAD"
 
     return {
-        "score": round(total_score, 2),
+        "score": round(total_score, 3),
         "verdict": verdict,
         "confluence_ratio": round(confluence_ratio, 2),
-        "votes": votes,
+        "engaged_families": len(engaged),
+        "families": {k: round(v, 3) for k, v in families.items()},
         "breakdown": breakdown,
         "daily_rsi": daily_rsi,
         "rsi_note": rsi_note,

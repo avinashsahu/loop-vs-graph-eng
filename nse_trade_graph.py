@@ -73,8 +73,9 @@ def node_technical(state):
     result = ta_analysis.score_technical(indicators)
     state["technical_verdict"] = (
         f"{result['verdict']} (score={result['score']}, confluence={result['confluence_ratio']} "
-        f"of {result['votes']} signals): daily RSI14={result['daily_rsi']} {result['rsi_note']} "
-        f"(adaptive band={result['rsi_band']}); per-timeframe {result['breakdown']}"
+        f"of {result['engaged_families']} engaged families): families={result['families']}; "
+        f"daily RSI14={result['daily_rsi']} {result['rsi_note']} (adaptive band={result['rsi_band']}); "
+        f"per-timeframe {result['breakdown']}"
     )
     log.info("iter=%d technical_verdict=%r", state["iters"], state["technical_verdict"])
 
