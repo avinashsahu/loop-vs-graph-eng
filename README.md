@@ -47,21 +47,23 @@ cp .env.example .env
 |---|---|---|
 | Stub (default) | nothing set | Hardcoded fake answers, no network calls. Good for testing control flow only. |
 | Anthropic (Claude) | `USE_REAL_LLM=1` | Requires `ANTHROPIC_API_KEY`. Uses `claude-haiku-4-5`. |
-| Local (gemma4 via MLX) | `USE_LOCAL_LLM=1` | Talks to a local `mlx_lm.server` over its OpenAI-compatible API. |
+| Local (any `mlx_lm.server` model) | `USE_LOCAL_LLM=1` | Talks to a local `mlx_lm.server` over its OpenAI-compatible API. |
 
 If both `USE_REAL_LLM` and `USE_LOCAL_LLM` are set, local wins.
 
-### Running the local gemma4 backend
+### Running the local backend
 
-Start the model server once (leave it running in the background):
+Start the model server once (leave it running in the background) with whatever model `LOCAL_LLM_MODEL` in `.env` points at:
 
 ```bash
-mlx_lm.server --model mlx-community/gemma-4-12B-it-4bit --port 8080
+mlx_lm.server --model Wwayu/Fin-R1-mlx-8Bit --port 8080
 ```
 
-Config (`.env`): `LOCAL_LLM_URL` (default `http://localhost:8080/v1`), `LOCAL_LLM_MODEL` (default `mlx-community/gemma-4-12B-it-4bit`), `LOCAL_LLM_MAX_TOKENS` (default `300`).
+Config (`.env`): `LOCAL_LLM_URL` (default `http://localhost:8080/v1`), `LOCAL_LLM_MODEL` (default `Wwayu/Fin-R1-mlx-8Bit` — see below for why), `LOCAL_LLM_MAX_TOKENS` (default `400`).
 
-gemma4 is a reasoning model — by default it burns tokens on an internal "thinking" channel before answering, which can leave `content` empty if `max_tokens` is too low. `llm.py` disables this per-request via `chat_template_kwargs: {"enable_thinking": false}`, and falls back to the raw reasoning text if `content` ever comes back `None` anyway, so `call_llm` never returns `None`.
+**Why Fin-R1 instead of gemma4**: only `node_fundamental`/`node_sentiment` still make an LLM call (`node_technical` is deterministic code — see below), and head-to-head testing (same prompts, both models) showed Fin-R1 (7B, RL fine-tuned on financial reasoning chain-of-thought data) synthesizes free-text fundamental data — corp actions, peer P/E comparisons — noticeably more thoroughly than gemma4. Not a clean win across the board: in one test Fin-R1 caught 2 of 3 deliberately-planted red flags where gemma4 caught all 3, and showed an internal inconsistency (praised the same shareholding-concentration fact as positive in one case, suspicious in another). Worth the swap on balance, not worth trusting blindly.
+
+Many reasoning-tuned local models (gemma4 included) burn tokens on an internal "thinking" channel before answering, which can leave `content` empty if `max_tokens` is too low. If you switch back to gemma4, `llm.py` already disables this per-request via `chat_template_kwargs: {"enable_thinking": false}`, and falls back to the raw reasoning text if `content` ever comes back `None` anyway, so `call_llm` never returns `None` regardless of which model is loaded.
 
 ## Logging
 
@@ -74,7 +76,7 @@ Both `loop_agent.py` and `graph_agent.py` (and `nse_trade_graph.py`) log through
 uv run loop_agent.py
 uv run graph_agent.py
 
-# against local gemma4 (server must already be running, see above; set USE_LOCAL_LLM=1 in .env)
+# against the local backend (server must already be running, see above; set USE_LOCAL_LLM=1 in .env)
 uv run loop_agent.py
 uv run graph_agent.py
 
@@ -111,8 +113,8 @@ fetch -> technical -> [BAD] -> abort (no retry -- see below)
              log (appends a record to trade_log.jsonl)
 ```
 
-- **technical** — computes real indicators (SMA20, SMA50, RSI14, MACD(12,26,9), via `ta_analysis.compute_indicators`, **TA-Lib**-backed) independently for four timeframes — daily plus 30/15/5-minute (from `nse_data.get_multi_timeframe_history`) — and asks the LLM to interpret all four together (one prompt, one verdict) for a short-term buy signal. A `BAD` verdict aborts immediately, no retry: history is cache-backed (5 min intraday TTL, 24h daily TTL), so a retry loop here used to fire seconds apart and feed the LLM a byte-identical prompt every time — 3x the LLM calls for a foregone conclusion, not a real second look, found and removed during a later review pass. Grounding the LLM in computed indicators instead of a raw OHLCV table still gives more consistent verdicts than free-form table reading would. Deliberately not split into one node per timeframe — this project only splits nodes when the retry/remediation path genuinely differs, and all four timeframes feed one verdict either way.
-- **fundamental** — `fundamentals.get_fundamental_snapshot` pulls corporate announcements, corporate actions, shareholding pattern, yearwise returns, and a peer comparison (all via raw NSE `NextApi` endpoints, see `fundamentals.py`), plus a delivery-percentage trend from `bhavcopy.get_delivery_trend` (see below). A deterministic hard check runs first: negative EPS or PAT aborts immediately, same philosophy as `risk`'s circuit-limit check — an objective number isn't the LLM's job to hallucinate over. Otherwise the LLM reads the qualitative parts (corp actions, corp announcements, shareholding trend, delivery trend, peer standing) for a `GOOD`/`BAD` verdict; a soft `BAD` here routes to `flag_review`, same policy as `sentiment`, not an abort. Caveat observed in testing: putting delivery trend in the prompt doesn't guarantee the LLM actually weighs it — seen a `GOOD` verdict that didn't engage with a >20% relative drop in delivery interest at all. Same class of issue as `node_technical` silently ignoring its RSI rule; the prompt containing a signal isn't proof the model uses it.
+- **technical** — computes real indicators (SMA20, SMA50, RSI14, MACD(12,26,9), via `ta_analysis.compute_indicators`, **TA-Lib**-backed) independently for four timeframes — daily plus 30/15/5-minute (from `nse_data.get_multi_timeframe_history`) — and scores them with `ta_analysis.score_technical`: **deterministic code, not an LLM call.** It wasn't always this way — the original design asked an LLM to interpret all four timeframes in one prompt. Live head-to-head testing (gemma4 and Fin-R1, 11+ deliberately-constructed cases including engineered-bearish setups) showed this specific threshold/comparison task isn't something either model applies reliably: gemma4 produced byte-identical verdicts regardless of RSI value (ignoring the stated rule outright); Fin-R1 engaged with the numbers in its reasoning text but never once flipped to `BAD` across the whole battery, and in one case asserted a false numeric comparison ("90.0 > 95.0") as fact. Not a model-quality problem — exact comparisons just don't belong in a free-text prompt, regardless of which LLM runs it. `score_technical` applies the same rules the old prompt used to state in English (SMA20 above SMA50 = bullish, RSI>70/<30 = caution, positive MACD histogram = bullish), weighted daily-heaviest same as the original instruction, just applied exactly instead of hoping a model applies them. A `BAD` verdict (score ≤ 0) aborts immediately, no retry — history is cache-backed (5 min intraday TTL, 24h daily TTL), so a retry here would just re-score identical numbers. Deliberately not split into one node per timeframe — this project only splits nodes when the retry/remediation path genuinely differs, and all four timeframes feed one score either way.
+- **fundamental** — `fundamentals.get_fundamental_snapshot` pulls corporate announcements, corporate actions, shareholding pattern, yearwise returns, and a peer comparison (all via raw NSE `NextApi` endpoints, see `fundamentals.py`), plus a delivery-percentage trend from `bhavcopy.get_delivery_trend` (see below). A deterministic hard check runs first: negative EPS or PAT aborts immediately, same philosophy as `risk`'s circuit-limit check — an objective number isn't the LLM's job to hallucinate over. Otherwise the LLM reads the qualitative parts (corp actions, corp announcements, shareholding trend, delivery trend, peer standing) for a `GOOD`/`BAD` verdict; a soft `BAD` here routes to `flag_review`, same policy as `sentiment`, not an abort. Caveat observed in testing: putting delivery trend in the prompt doesn't guarantee the LLM actually weighs it — seen a `GOOD` verdict that didn't engage with a >20% relative drop in delivery interest at all. Same class of unreliable-rule-following found (and, for `node_technical`, fixed by removing the LLM entirely) during the technical-node testing above; the prompt containing a signal isn't proof the model uses it.
 - **risk** — deterministic code, not an LLM call. Computes position size from `principal * risk_pct / 100`, validates `risk_pct` is sane (0-25%), and aborts if the stock's current low is within 2% of its lower circuit limit. Kept out of the LLM's hands on purpose: risk sizing is exactly the kind of check where a hallucinated "looks fine" verdict is the expensive failure mode.
 - **sentiment** — LLM checks whether today's price move looks like a reasonable entry (not a crash or a spike), using the live quote's `changepct` and sector. Include the company's full name, not just the ticker, in the prompt — a bare ticker (e.g. `ACE`) can be genuinely ambiguous to the model and has been observed to send gemma4 into a repetitive non-terminating reasoning loop.
 - **propose** — never calls a broker. Only ever produces a proposal string for a human to review and act on manually.

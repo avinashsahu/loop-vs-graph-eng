@@ -67,31 +67,18 @@ def node_technical(state):
     state["technical_indicators"] = indicators
     log.info("iter=%d indicators=%s", state["iters"], indicators)
 
-    timeframe_lines = "\n".join(
-        f"{tf}: close={ind['close']}, SMA20={ind['sma20']}, SMA50={ind['sma50']}, "
-        f"RSI14={ind['rsi14']}, MACD={ind['macd']}, MACD_signal={ind['macd_signal']}, MACD_hist={ind['macd_hist']}"
-        for tf, ind in indicators.items()
+    # Deterministic, not an LLM call -- see ta_analysis.score_technical's docstring for
+    # why: live testing showed this exact threshold/comparison task isn't something an
+    # LLM (gemma4 or Fin-R1) applies reliably, regardless of model quality.
+    result = ta_analysis.score_technical(indicators)
+    state["technical_verdict"] = (
+        f"{result['verdict']} (score={result['score']}): daily RSI14={result['daily_rsi']} "
+        f"{result['rsi_note']}; per-timeframe {result['breakdown']}"
     )
-    verdict = call_llm(
-        _verdict_prompt(
-            f"Multi-timeframe technical indicators for {state['symbol']} (D=daily, 30/15/5=minutes):\n"
-            f"{timeframe_lines}\n"
-            "Rules of thumb: SMA20 above SMA50 is a bullish trend; RSI above 70 is overbought "
-            "(caution), below 30 is oversold; positive MACD histogram is bullish momentum. "
-            "Weight the daily trend most heavily, use the intraday timeframes to confirm timing.\n"
-            "Is there a clear short-term uptrend/momentum worth considering a BUY?"
-        ),
-        mode="check",
-    )
-    state["technical_verdict"] = verdict
-    log.info("iter=%d technical_verdict=%r", state["iters"], verdict)
+    log.info("iter=%d technical_verdict=%r", state["iters"], state["technical_verdict"])
 
-    if verdict.startswith("GOOD"):
+    if result["verdict"] == "GOOD":
         return "fundamental", state
-
-    # No retry: history is cache-backed (5 min intraday TTL, 24h daily TTL) and retries
-    # would fire seconds apart, so a retry loop here fed the LLM a byte-identical prompt
-    # every time -- 3x the LLM calls for a foregone conclusion, not a real second look.
     return "abort", state
 
 
