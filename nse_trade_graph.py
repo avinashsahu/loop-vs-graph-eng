@@ -1,3 +1,12 @@
+from dotenv import load_dotenv
+
+# Must run before any of this project's own modules are imported below -- several of
+# them (fundamentals, nse_data, cache) read env-configured constants at module level,
+# and .env was previously only ever loaded as a side effect of importing llm.py, which
+# doesn't reliably happen first. Confirmed live: FUNDAMENTALS_CACHE_TTL_HOURS from .env
+# was silently ignored because `import fundamentals` (below) ran before load_dotenv().
+load_dotenv()
+
 import json
 import os
 import time
@@ -113,8 +122,17 @@ def node_risk(state):
         log.warning(state["risk_verdict"])
         return "abort", state
 
+    # quote["open"] is the session's opening print, fixed all day -- not what you'd
+    # actually pay. get_stock_live_quotes exposes no live/last-price field at all, so
+    # reconstruct it: previous_close + change (verified against real data: matches the
+    # actual last-traded price seen elsewhere in the same quote response).
+    price = quote["previous_close"] + quote["change"]
+    if not price or price <= 0:
+        state["risk_verdict"] = f"BAD: no usable price for sizing (price={price})"
+        log.warning(state["risk_verdict"])
+        return "abort", state
+
     position_size = state["principal"] * (state["risk_pct"] / 100)
-    price = quote["open"]
     state["position_size"] = position_size
     state["max_shares"] = int(position_size // price)
     state["risk_verdict"] = (
