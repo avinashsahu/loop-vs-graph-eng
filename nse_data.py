@@ -7,7 +7,7 @@ from nsemine.historical import get_stock_historical_data
 from nsemine.live import get_index_constituents_live_snapshot
 
 import cache
-from market_time import now_ist_naive
+from market_time import now_host_local, now_ist_naive
 
 INTRADAY_CACHE_TTL_MINUTES = float(os.environ.get("INTRADAY_CACHE_TTL_MINUTES", "5"))
 
@@ -28,11 +28,13 @@ def get_index_symbols(index_name: str = "NIFTY 50") -> list[str]:
 
 
 def _fetch_history(symbol, interval, lookback_days):
-    # Explicit end_datetime too -- nsemine's own default for it is a naive datetime frozen
-    # at import time from *its* internal datetime.now(), same host-timezone dependency
-    # we're avoiding here. now_ist_naive() keeps both ends correct regardless of the host
-    # machine's system timezone.
-    end = now_ist_naive()
+    # now_host_local(), NOT now_ist_naive() -- nsemine converts these to an epoch via
+    # .timestamp(), which interprets a naive datetime as host-local time. now_host_local()
+    # is the real current instant expressed in the host's own local time, which is exactly
+    # what .timestamp() needs to round-trip to the correct absolute instant regardless of
+    # what the host's timezone actually is. (now_ist_naive() would get misinterpreted as
+    # host-local on a non-IST host, silently shifting the whole fetch window.)
+    end = now_host_local()
     start = end - timedelta(days=lookback_days)
     return get_stock_historical_data(symbol, start_datetime=start, end_datetime=end, interval=interval)
 

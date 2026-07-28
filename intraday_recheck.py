@@ -1,10 +1,20 @@
+from dotenv import load_dotenv
+
+# Must run before `digest`/`notify` are imported below -- they read env-configured
+# constants (EMAIL_ENABLED/SMTP_*/etc) at module level, and nothing else in this
+# script's import chain was loading .env before.
+load_dotenv()
+
 import json
 import os
 import sys
 
 from digest import format_symbol_section
+from logging_config import setup_logging
 from market_time import is_market_hours, now_ist
 from notify import send_email
+
+log = setup_logging("intraday_recheck")
 
 # Read directly, not `from nse_trade_graph import TRADE_LOG_PATH` -- importing
 # nse_trade_graph here would run its module-level NSE_SCAN_LABEL read before this
@@ -24,6 +34,8 @@ def _find_latest_overnight_label():
 
 
 def _load_pick_symbols(run_id):
+    if not os.path.exists(TRADE_LOG_PATH):
+        return []
     symbols = []
     seen = set()
     with open(TRADE_LOG_PATH) as f:
@@ -63,7 +75,16 @@ if __name__ == "__main__":
     risk_pct = float(os.environ.get("NSE_RISK_PCT", "10"))
 
     for symbol in symbols:
-        final_state = nse_trade_graph.run(symbol, principal, risk_pct)
+        try:
+            final_state = nse_trade_graph.run(symbol, principal, risk_pct)
+        except Exception:
+            # nsemine can return None (not raise) for illiquid/no-data symbols, which
+            # crashes deeper in the fetch chain -- one bad symbol shouldn't cost every
+            # remaining alert in this run, same as the batch scanner's own per-symbol
+            # try/except in nse_trade_graph.py's __main__.
+            log.warning("recheck failed for %s, continuing", symbol, exc_info=True)
+            continue
+
         if final_state["status"] not in ("proposed", "flagged_for_review"):
             continue  # dropped to aborted since the overnight scan -- no longer actionable
 

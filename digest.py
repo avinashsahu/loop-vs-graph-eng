@@ -1,3 +1,9 @@
+from dotenv import load_dotenv
+
+# Must run before `notify` is imported below -- it reads EMAIL_ENABLED/SMTP_*/etc at
+# module level, and nothing else in this script's import chain was loading .env before.
+load_dotenv()
+
 import json
 import os
 import sys
