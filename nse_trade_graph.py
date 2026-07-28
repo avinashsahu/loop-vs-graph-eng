@@ -1,7 +1,6 @@
 import json
 import os
 import time
-from datetime import datetime
 
 from nsemine.live import get_stock_live_quotes
 
@@ -10,6 +9,7 @@ import nse_data
 import ta_analysis
 from llm import call_llm
 from logging_config import setup_logging
+from market_time import now_ist
 
 MAX_ITERS = 3
 TRADE_LOG_PATH = os.environ.get("TRADE_LOG_PATH", "trade_log.jsonl")
@@ -172,7 +172,7 @@ def node_abort(state):
 
 def node_log(state):
     record = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": now_ist().isoformat(),
         "scan_label": NSE_SCAN_LABEL,
         "symbol": state["symbol"],
         "company_name": (state.get("quote") or {}).get("name"),

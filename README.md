@@ -161,29 +161,42 @@ This log is the intended way to eventually judge whether the checks are any good
 - **`scan_label`** — every row `nse_trade_graph.py` appends to `trade_log.jsonl` is tagged with `NSE_SCAN_LABEL` (default `manual`). This is how `digest.py`/`intraday_recheck.py` find "this run's" records without relying on calendar-date matching, which would be fragile for an overnight scan spanning midnight.
 - **`run_overnight_scan.sh`** — the actual cron target. Generates a run id (`overnight_YYYYMMDD_HHMM`), runs `nse_trade_graph.py` over `NSE_INDEX="NIFTY TOTAL MKT"` tagged with that id, then calls `digest.py` with the same id. (`nsemine` recognizes the index name `NIFTY TOTAL MKT` — 750 constituents; `"NIFTY TOTAL MARKET"` does not, it hits an internal `nsemine` bug and returns `None`.)
 - **`digest.py <run_id>`** — reads `trade_log.jsonl` filtered to that `scan_label`, emails one full-detail section (all four timeframes' indicators, every node's verdict text, the proposal) per `proposed`/`flagged_for_review` symbol, plus a one-line count of everything scanned/aborted for context.
-- **`intraday_recheck.py [run_id]`** — finds the most recent `overnight_*` label (or takes one explicitly), collects the symbols that were `proposed`/`flagged_for_review` in that run, re-runs the full graph on just those (not the full 750 — confirmed too slow for a 15-30 min cadence), and emails a full-detail alert for any still `proposed`/`flagged_for_review`. A symbol that dropped to `aborted` since morning is logged but not emailed. Meant to run every 15-30 minutes during market hours.
+- **`intraday_recheck.py [run_id]`** — finds the most recent `overnight_*` label (or takes one explicitly), collects the symbols that were `proposed`/`flagged_for_review` in that run, re-runs the full graph on just those (not the full 750 — confirmed too slow for a 15-30 min cadence), and emails a full-detail alert for any still `proposed`/`flagged_for_review`. A symbol that dropped to `aborted` since morning is logged but not emailed.
 
 Runs on a different machine or a different local model port with zero code changes — everything routes through the existing `LOCAL_LLM_URL`/`LOCAL_LLM_MODEL` `.env` config already described above.
 
+### IST timezone safety
+
+NSE market hours are IST, but every timestamp in this codebase used to be a naive `datetime.now()` — silently using whichever timezone the *host machine's system clock* happened to be set to. Harmless on a box that's already IST, wrong by however many hours otherwise (confirmed live: `datetime.now()` under `TZ=UTC` showed 13:04 when the real IST time was 18:34 — a 5.5 hour gap). `nsemine` itself has the same issue internally (its `end_datetime` default is a naive datetime frozen at import time from its own `datetime.now()`).
+
+Fixed via `market_time.py`: `now_ist()` / `now_ist_naive()` return the real IST time regardless of host timezone (`zoneinfo`, stdlib, no new dependency), and `is_market_hours()` checks 9:15-15:30 IST, Monday-Friday. Every log timestamp, cache-rollover date, and historical-data lookback window in `nse_trade_graph.py`/`nse_data.py`/`fundamentals.py`/`digest.py`/`intraday_recheck.py` goes through it. `run_overnight_scan.sh`'s run-id generation uses `TZ='Asia/Kolkata' date` explicitly for the same reason. `trade_log.jsonl` timestamps are now timezone-aware ISO strings (e.g. `...+05:30`) — unambiguous regardless of who's reading them or where.
+
+`intraday_recheck.py` self-gates on `is_market_hours()` and exits immediately outside that window — this means the cron schedule itself doesn't need to get IST right; a simple "every 15-20 minutes, every day" entry is safe on any machine, any system timezone. Override the gate for manual testing with `NSE_SKIP_MARKET_HOURS_CHECK=1`.
+
 ### Config (`.env`)
 
-`NSE_SCAN_LABEL` (default `manual`), `EMAIL_ENABLED` (default `0`, stub), `SMTP_HOST`, `SMTP_PORT` (default `587`), `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_USE_TLS` (default `1`), `EMAIL_FROM`, `EMAIL_TO` (comma-separated).
+`NSE_SCAN_LABEL` (default `manual`), `EMAIL_ENABLED` (default `0`, stub), `SMTP_HOST`, `SMTP_PORT` (default `587`), `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_USE_TLS` (default `1`), `EMAIL_FROM`, `EMAIL_TO` (comma-separated), `NSE_SKIP_MARKET_HOURS_CHECK` (testing only, bypasses `intraday_recheck.py`'s market-hours gate).
 
 ### Cron setup
 
-Add to `crontab -e` (adjust the path and market hours for your timezone):
+Add to `crontab -e` (adjust the path):
 
 ```cron
-# Overnight full-market scan + morning digest, once after market close
+# Overnight full-market scan + morning digest, once after market close. cron itself
+# interprets "22" in the host's own system timezone, not necessarily IST -- if this
+# machine isn't set to IST, adjust the hour accordingly (or set CRON_TZ=Asia/Kolkata
+# if your cron implementation supports it).
 0 22 * * 1-5 /path/to/loop-vs-graph-eng/run_overnight_scan.sh >> /path/to/loop-vs-graph-eng/cron.log 2>&1
 
-# Intraday recheck of the morning's picks, every 20 minutes during market hours
-*/20 9-15 * * 1-5 cd /path/to/loop-vs-graph-eng && uv run intraday_recheck.py >> cron.log 2>&1
+# Intraday recheck every 20 minutes, every day -- the script itself no-ops outside
+# 9:15-15:30 IST via is_market_hours(), so this line doesn't need the host's system
+# timezone to match IST at all.
+*/20 * * * * cd /path/to/loop-vs-graph-eng && uv run intraday_recheck.py >> cron.log 2>&1
 ```
 
 ### Running manually
 
 ```bash
 uv run digest.py <run_id>
-uv run intraday_recheck.py [run_id]   # defaults to the most recent overnight_* label
+uv run intraday_recheck.py [run_id]   # defaults to the most recent overnight_* label; skipped outside market hours unless NSE_SKIP_MARKET_HOURS_CHECK=1
 ```

@@ -1,11 +1,11 @@
 import os
 import time
-from datetime import datetime
 
 from nsemine.bin.scraper import get_request
 
 import cache
 from logging_config import setup_logging
+from market_time import now_ist_naive
 
 log = setup_logging("fundamentals")
 
@@ -110,7 +110,7 @@ def _extract_eps_pat(symbol, peer_data):
 
 
 def get_fundamental_snapshot(symbol: str) -> dict:
-    key = f"fundamentals_{symbol}_{datetime.now():%Y%m%d}"
+    key = f"fundamentals_{symbol}_{now_ist_naive():%Y%m%d}"
     ttl_seconds = FUNDAMENTALS_CACHE_TTL_HOURS * 3600
 
     hit = cache.read(key, ttl_seconds)

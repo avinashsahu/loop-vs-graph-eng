@@ -1,9 +1,9 @@
 import json
 import os
 import sys
-from datetime import datetime
 
 from digest import format_symbol_section
+from market_time import is_market_hours, now_ist
 from notify import send_email
 
 # Read directly, not `from nse_trade_graph import TRADE_LOG_PATH` -- importing
@@ -37,6 +37,13 @@ def _load_pick_symbols(run_id):
 
 
 if __name__ == "__main__":
+    # Self-gate on IST market hours rather than relying on the cron schedule/host
+    # timezone to line up -- makes this safe to run on any machine, any system timezone,
+    # even a broad "every 15 min, every day" cron entry. Override for manual testing.
+    if not is_market_hours() and os.environ.get("NSE_SKIP_MARKET_HOURS_CHECK") != "1":
+        print(f"Outside NSE market hours (now={now_ist().isoformat()}), skipping.")
+        sys.exit(0)
+
     run_id = sys.argv[1] if len(sys.argv) > 1 else _find_latest_overnight_label()
     if not run_id:
         print("No overnight scan_label found in trade_log.jsonl -- nothing to recheck.")
@@ -49,7 +56,7 @@ if __name__ == "__main__":
 
     # Set before importing nse_trade_graph -- its NSE_SCAN_LABEL constant is read once at
     # import time, same pattern every other config value in that module already uses.
-    os.environ["NSE_SCAN_LABEL"] = f"intraday_{datetime.now():%Y%m%d_%H%M%S}"
+    os.environ["NSE_SCAN_LABEL"] = f"intraday_{now_ist():%Y%m%d_%H%M%S}"
     import nse_trade_graph
 
     principal = float(os.environ.get("NSE_PRINCIPAL", "100000"))
@@ -64,7 +71,7 @@ if __name__ == "__main__":
             "symbol": symbol,
             "company_name": (final_state.get("quote") or {}).get("name"),
             "status": final_state["status"],
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_ist().isoformat(),
             "technical_indicators": final_state.get("technical_indicators"),
             "technical_verdict": final_state.get("technical_verdict"),
             "fundamental_verdict": final_state.get("fundamental_verdict"),
