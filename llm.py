@@ -268,7 +268,7 @@ def _parse_fundamental_assessment(text):
     verdict = verdict_value.upper()
     reason_code = reason_code_value.upper()
     reason = reason_value.strip()
-    evidence = tuple(item.upper() for item in evidence_value)
+    evidence = tuple(dict.fromkeys(item.upper() for item in evidence_value))
     if verdict not in {"GOOD", "BAD"}:
         raise ValueError("invalid fundamental verdict")
     if reason_code not in FUNDAMENTAL_REASON_CODES:
@@ -279,7 +279,6 @@ def _parse_fundamental_assessment(text):
         raise ValueError("fundamental reason must contain 1-160 characters")
     if (
         len(evidence) > 2
-        or len(set(evidence)) != len(evidence)
         or any(item not in FUNDAMENTAL_EVIDENCE_CATEGORIES for item in evidence)
     ):
         raise ValueError("invalid fundamental evidence categories")

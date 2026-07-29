@@ -4,7 +4,11 @@ import smtplib
 import urllib.request
 from email.message import EmailMessage
 
+from dotenv import load_dotenv
+
 from logging_config import setup_logging
+
+load_dotenv()
 
 log = setup_logging("notify")
 

@@ -114,6 +114,18 @@ class LocalLlmTests(unittest.TestCase):
         self.assertEqual(schema["properties"]["evidence"]["maxItems"], 2)
         self.assertEqual(self.completions.request["temperature"], 0)
 
+    def test_fundamental_assessment_deduplicates_repeated_evidence_tags(self):
+        self.completions.content = (
+            '{"verdict":"BAD","reason_code":"INSUFFICIENT_EVIDENCE",'
+            '"reason":"The supplied evidence is incomplete.",'
+            '"evidence":["CORPORATE_ACTIONS","CORPORATE_ACTIONS"]}'
+        )
+
+        with patch.multiple(llm, USE_LOCAL_LLM=True, USE_REAL_LLM=False):
+            assessment = llm.assess_fundamentals("Judge these fundamentals")
+
+        self.assertEqual(assessment.evidence, ("CORPORATE_ACTIONS",))
+
     def test_fundamental_assessment_repairs_one_invalid_structured_response(self):
         completions = _SequencedCompletions(
             [
