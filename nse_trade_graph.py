@@ -12,6 +12,8 @@ import math
 import os
 import time
 from dataclasses import asdict
+from datetime import datetime, timedelta
+from pathlib import Path
 
 from nsemine.live import get_stock_live_quotes
 
@@ -36,6 +38,10 @@ from market_time import now_ist
 from shareholding import get_shareholding_history
 
 TRADE_LOG_PATH = os.environ.get("TRADE_LOG_PATH", "trade_log.jsonl")
+SCAN_RUN_LOG_PATH = os.environ.get("SCAN_RUN_LOG_PATH", "scan_runs.jsonl")
+SCAN_RUN_STALE_AFTER_SECONDS = float(
+    os.environ.get("SCAN_RUN_STALE_AFTER_SECONDS", "21600")
+)
 EVALUATION_DB_PATH = os.environ.get("EVALUATION_DB_PATH", "evaluation.db")
 NSE_SCAN_LABEL = os.environ.get("NSE_SCAN_LABEL", "manual")
 NSE_POLICY_VERSION = os.environ.get(
@@ -44,6 +50,80 @@ NSE_POLICY_VERSION = os.environ.get(
 )
 
 log = setup_logging("nse")
+
+
+def _record_scan_event(event):
+    record = {
+        "recorded_at": now_ist().isoformat(),
+        **event,
+    }
+    try:
+        with open(SCAN_RUN_LOG_PATH, "a") as journal:
+            journal.write(json.dumps(record, sort_keys=True) + "\n")
+    except Exception:
+        log.warning("scan-run JSONL write failed", exc_info=True)
+
+
+def _recover_stale_scan_events():
+    path = Path(SCAN_RUN_LOG_PATH)
+    if not path.exists():
+        return
+    runs = {}
+    try:
+        with path.open() as journal:
+            for line in journal:
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                run_id = event.get("run_id")
+                if not run_id:
+                    continue
+                event_type = event.get("event")
+                if event_type == "scan_started":
+                    try:
+                        recorded_at = datetime.fromisoformat(event["recorded_at"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    runs[run_id] = {
+                        "recorded_at": recorded_at,
+                        "pending": set(event.get("requested_symbols") or []),
+                    }
+                elif event_type in {"symbol_completed", "symbol_failed"}:
+                    if run_id in runs:
+                        runs[run_id]["pending"].discard(event.get("symbol"))
+                elif event_type == "scan_finished":
+                    runs.pop(run_id, None)
+    except OSError:
+        log.warning("scan-run JSONL recovery read failed", exc_info=True)
+        return
+
+    current_time = now_ist()
+    for run_id, run in runs.items():
+        recorded_at = run["recorded_at"]
+        if recorded_at.tzinfo is None:
+            continue
+        age_seconds = (current_time - recorded_at).total_seconds()
+        if age_seconds < SCAN_RUN_STALE_AFTER_SECONDS:
+            continue
+        for symbol in sorted(run["pending"]):
+            _record_scan_event(
+                {
+                    "event": "symbol_failed",
+                    "run_id": run_id,
+                    "symbol": symbol,
+                    "error_type": "RecoveredIncompleteScan",
+                    "reason": "No terminal event before the stale-run timeout",
+                }
+            )
+        _record_scan_event(
+            {
+                "event": "scan_finished",
+                "run_id": run_id,
+                "recovered": True,
+            }
+        )
+
 
 def node_fetch(state):
     state["iters"] += 1
@@ -404,7 +484,8 @@ def node_log(state):
     with open(TRADE_LOG_PATH, "a") as f:
         f.write(json.dumps(record) + "\n")
     try:
-        EvaluationLedger(EVALUATION_DB_PATH).record_decision(record)
+        receipt = EvaluationLedger(EVALUATION_DB_PATH).record_decision(record)
+        state["decision_id"] = receipt.decision_id
     except Exception:
         # JSONL remains the durable fallback and can be imported later. Evaluation
         # telemetry must not turn an otherwise completed scan into a failed scan.
@@ -461,6 +542,7 @@ def run(
         "sentiment_verdict": None,
         "status": None,
         "proposal": None,
+        "decision_id": None,
     }
     node = "fetch"
 
@@ -487,6 +569,7 @@ if __name__ == "__main__":
         else:
             symbols = [os.environ.get("NSE_SYMBOL", "RELIANCE")]
 
+    symbols = list(dict.fromkeys(symbols))
     principal = float(os.environ.get("NSE_PRINCIPAL", "100000"))
     max_allocation_pct = float(
         os.environ.get(
@@ -498,19 +581,140 @@ if __name__ == "__main__":
     atr_stop_multiple = float(os.environ.get("NSE_ATR_STOP_MULTIPLE", "2"))
     reward_risk_ratio = float(os.environ.get("NSE_REWARD_RISK_RATIO", "2"))
     scan_delay_seconds = float(os.environ.get("NSE_SCAN_DELAY_SECONDS", "1"))
+    _recover_stale_scan_events()
+    scan_started_at_value = now_ist()
+    scan_started_at = scan_started_at_value.isoformat()
+    scan_journal_id = f"{NSE_SCAN_LABEL}:{scan_started_at}"
+    evaluation_ledger = None
+    scan_run = None
+    try:
+        evaluation_ledger = EvaluationLedger(EVALUATION_DB_PATH)
+        evaluation_ledger.finalize_stale_scan_runs(
+            (
+                scan_started_at_value
+                - timedelta(seconds=SCAN_RUN_STALE_AFTER_SECONDS)
+            ).isoformat()
+        )
+        scan_run = evaluation_ledger.start_scan_run(
+            NSE_SCAN_LABEL,
+            symbols,
+            NSE_POLICY_VERSION,
+            started_at=scan_started_at,
+        )
+    except Exception:
+        log.warning(
+            "scan accounting unavailable; decisions retain the JSONL fallback",
+            exc_info=True,
+        )
+    _record_scan_event(
+        {
+            "event": "scan_started",
+            "run_id": scan_journal_id,
+            "ledger_run_id": scan_run.run_id if scan_run is not None else None,
+            "scan_label": NSE_SCAN_LABEL,
+            "policy_version": NSE_POLICY_VERSION,
+            "requested_symbols": symbols,
+        }
+    )
+    pending_symbols = set(symbols)
 
-    for i, symbol in enumerate(symbols):
-        if i > 0:
-            time.sleep(scan_delay_seconds)
-        try:
-            final_state = run(
-                symbol,
-                principal,
-                max_allocation_pct,
-                max_loss_pct,
-                atr_stop_multiple,
-                reward_risk_ratio,
+    try:
+        for i, symbol in enumerate(symbols):
+            if i > 0:
+                time.sleep(scan_delay_seconds)
+            try:
+                final_state = run(
+                    symbol,
+                    principal,
+                    max_allocation_pct,
+                    max_loss_pct,
+                    atr_stop_multiple,
+                    reward_risk_ratio,
+                )
+                log.info("final[%s]: %s", symbol, final_state["proposal"])
+            except Exception as error:
+                if evaluation_ledger is not None and scan_run is not None:
+                    try:
+                        evaluation_ledger.record_scan_symbol(
+                            scan_run.run_id,
+                            symbol,
+                            error=error,
+                        )
+                    except Exception:
+                        log.warning(
+                            "failed to record scan failure for %s",
+                            symbol,
+                            exc_info=True,
+                        )
+                log.warning(
+                    "run failed for %s, continuing batch",
+                    symbol,
+                    exc_info=True,
+                )
+                _record_scan_event(
+                    {
+                        "event": "symbol_failed",
+                        "run_id": scan_journal_id,
+                        "ledger_run_id": (
+                            scan_run.run_id if scan_run is not None else None
+                        ),
+                        "symbol": symbol,
+                        "error_type": type(error).__name__,
+                        "reason": str(error)[:500],
+                    }
+                )
+                pending_symbols.discard(symbol)
+                continue
+            if evaluation_ledger is not None and scan_run is not None:
+                try:
+                    evaluation_ledger.record_scan_symbol(
+                        scan_run.run_id,
+                        symbol,
+                        decision_id=final_state.get("decision_id"),
+                    )
+                except Exception:
+                    log.warning(
+                        "failed to record scan completion for %s",
+                        symbol,
+                        exc_info=True,
+                    )
+            _record_scan_event(
+                {
+                    "event": "symbol_completed",
+                    "run_id": scan_journal_id,
+                    "ledger_run_id": (
+                        scan_run.run_id if scan_run is not None else None
+                    ),
+                    "symbol": symbol,
+                    "decision_id": final_state.get("decision_id"),
+                }
             )
-            log.info("final[%s]: %s", symbol, final_state["proposal"])
-        except Exception:
-            log.warning("run failed for %s, continuing batch", symbol, exc_info=True)
+            pending_symbols.discard(symbol)
+    finally:
+        for symbol in sorted(pending_symbols):
+            _record_scan_event(
+                {
+                    "event": "symbol_failed",
+                    "run_id": scan_journal_id,
+                    "ledger_run_id": (
+                        scan_run.run_id if scan_run is not None else None
+                    ),
+                    "symbol": symbol,
+                    "error_type": "IncompleteScan",
+                    "reason": "Scan ended before this symbol completed",
+                }
+            )
+        if evaluation_ledger is not None and scan_run is not None:
+            try:
+                evaluation_ledger.finalize_scan_run(scan_run.run_id)
+            except Exception:
+                log.warning("failed to finalize scan accounting", exc_info=True)
+        _record_scan_event(
+            {
+                "event": "scan_finished",
+                "run_id": scan_journal_id,
+                "ledger_run_id": (
+                    scan_run.run_id if scan_run is not None else None
+                ),
+            }
+        )

@@ -14,6 +14,7 @@ wheels/
 
 # Trade run log
 trade_log.jsonl
+scan_runs.jsonl
 evaluation.db
 evaluation.db-*
 .intraday_alert_state.json*

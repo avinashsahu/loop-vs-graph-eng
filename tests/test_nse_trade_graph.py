@@ -1,6 +1,7 @@
+import json
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -11,6 +12,55 @@ import nse_trade_graph
 from evaluation import EvaluationLedger
 from llm import FundamentalAssessment
 from shareholding import ShareholdingHistory, ShareholdingPeriod
+
+
+class ScanJournalTests(unittest.TestCase):
+    def test_stale_run_recovery_fails_only_symbols_without_terminal_events(self):
+        current_time = datetime(2026, 7, 29, 18, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+        started_at = current_time - timedelta(hours=7)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            journal_path = f"{temp_dir}/scan_runs.jsonl"
+            events = [
+                {
+                    "recorded_at": started_at.isoformat(),
+                    "event": "scan_started",
+                    "run_id": "run-1",
+                    "requested_symbols": ["TECHM", "TITAN"],
+                },
+                {
+                    "recorded_at": started_at.isoformat(),
+                    "event": "symbol_completed",
+                    "run_id": "run-1",
+                    "symbol": "TECHM",
+                },
+            ]
+            with open(journal_path, "w") as journal:
+                journal.writelines(
+                    json.dumps(event) + "\n" for event in events
+                )
+
+            with (
+                patch.object(nse_trade_graph, "SCAN_RUN_LOG_PATH", journal_path),
+                patch.object(
+                    nse_trade_graph,
+                    "SCAN_RUN_STALE_AFTER_SECONDS",
+                    21600,
+                ),
+                patch.object(nse_trade_graph, "now_ist", return_value=current_time),
+            ):
+                nse_trade_graph._recover_stale_scan_events()
+
+            with open(journal_path) as journal:
+                recovered = [json.loads(line) for line in journal]
+
+            self.assertEqual(recovered[-2]["event"], "symbol_failed")
+            self.assertEqual(recovered[-2]["symbol"], "TITAN")
+            self.assertEqual(
+                recovered[-2]["error_type"],
+                "RecoveredIncompleteScan",
+            )
+            self.assertEqual(recovered[-1]["event"], "scan_finished")
+            self.assertTrue(recovered[-1]["recovered"])
 
 
 class FundamentalPromptTests(unittest.TestCase):

@@ -11,12 +11,11 @@ import os
 import sqlite3
 import statistics
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-
 
 load_dotenv()
 log = logging.getLogger(__name__)
@@ -27,6 +26,12 @@ PRICE_BASIS = "raw_unadjusted_bhavcopy"
 @dataclass(frozen=True)
 class DecisionReceipt:
     decision_id: str
+    created: bool
+
+
+@dataclass(frozen=True)
+class ScanRunReceipt:
+    run_id: str
     created: bool
 
 
@@ -79,6 +84,7 @@ class EvaluationLedger:
                     model_backend TEXT,
                     model_name TEXT,
                     llm_max_tokens INTEGER,
+                    fundamental_llm_max_tokens INTEGER,
                     policy_version TEXT,
                     risk_plan_valid INTEGER NOT NULL DEFAULT 0,
                     raw_record_json TEXT NOT NULL,
@@ -99,6 +105,13 @@ class EvaluationLedger:
             if "llm_max_tokens" not in decision_columns:
                 connection.execute(
                     "ALTER TABLE decisions ADD COLUMN llm_max_tokens INTEGER"
+                )
+            if "fundamental_llm_max_tokens" not in decision_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE decisions
+                    ADD COLUMN fundamental_llm_max_tokens INTEGER
+                    """
                 )
             if "risk_plan_valid" not in decision_columns:
                 connection.execute(
@@ -132,6 +145,33 @@ class EvaluationLedger:
                 connection.execute(
                     "ALTER TABLE decisions ADD COLUMN target_price REAL"
                 )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scan_runs (
+                    run_id TEXT PRIMARY KEY,
+                    scan_label TEXT NOT NULL,
+                    policy_version TEXT,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scan_run_symbols (
+                    run_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    status TEXT NOT NULL
+                        CHECK (status IN ('requested', 'completed', 'failed')),
+                    decision_id TEXT,
+                    error_type TEXT,
+                    error_message TEXT,
+                    completed_at TEXT,
+                    PRIMARY KEY (run_id, symbol)
+                )
+                """
+            )
             self._initialize_outcomes(connection)
 
     def _initialize_outcomes(self, connection: sqlite3.Connection) -> None:
@@ -269,7 +309,7 @@ class EvaluationLedger:
         timestamp = str(record["timestamp"])
         scan_label = str(record.get("scan_label") or "")
         symbol = str(record["symbol"]).upper()
-        identity = "\x1f".join((timestamp, scan_label, symbol))
+        identity = f"{timestamp}\x1f{scan_label}\x1f{symbol}"
         decision_id = hashlib.sha256(identity.encode()).hexdigest()
         risk_plan = record.get("risk_plan") or {}
         assessment = record.get("technical_assessment") or {}
@@ -285,10 +325,10 @@ class EvaluationLedger:
                     symbol, status, entry_price, stop_price, target_price, shares,
                     technical_score, technical_verdict, fundamental_verdict,
                     risk_verdict, sentiment_verdict, model_backend, model_name,
-                    llm_max_tokens, policy_version,
+                    llm_max_tokens, fundamental_llm_max_tokens, policy_version,
                     risk_plan_valid, raw_record_json, created_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -310,13 +350,233 @@ class EvaluationLedger:
                     model_config.get("backend"),
                     model_config.get("name"),
                     model_config.get("max_tokens"),
+                    model_config.get(
+                        "fundamental_max_tokens",
+                        model_config.get("max_tokens"),
+                    ),
                     record.get("policy_version"),
                     int(risk_plan_valid),
                     json.dumps(record, sort_keys=True, separators=(",", ":")),
-                    datetime.now(timezone.utc).isoformat(),
+                    datetime.now(UTC).isoformat(),
                 ),
             )
         return DecisionReceipt(decision_id=decision_id, created=cursor.rowcount == 1)
+
+    def start_scan_run(
+        self,
+        scan_label: str,
+        symbols: list[str],
+        policy_version: str | None,
+        *,
+        started_at: str | None = None,
+    ) -> ScanRunReceipt:
+        normalized_symbols = list(
+            dict.fromkeys(
+                str(symbol).strip().upper()
+                for symbol in symbols
+                if str(symbol).strip()
+            )
+        )
+        if not normalized_symbols:
+            raise ValueError("symbols must contain at least one symbol")
+        timestamp = started_at or datetime.now(UTC).isoformat()
+        datetime.fromisoformat(timestamp)
+        label = scan_label.strip()
+        identity = "\x1f".join(
+            (timestamp, label, policy_version or "", *normalized_symbols)
+        )
+        run_id = hashlib.sha256(identity.encode()).hexdigest()
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO scan_runs (
+                    run_id, scan_label, policy_version, started_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (run_id, label, policy_version, timestamp),
+            )
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO scan_run_symbols (
+                    run_id, symbol, ordinal, status
+                ) VALUES (?, ?, ?, 'requested')
+                """,
+                [
+                    (run_id, symbol, ordinal)
+                    for ordinal, symbol in enumerate(normalized_symbols)
+                ],
+            )
+        return ScanRunReceipt(run_id=run_id, created=cursor.rowcount == 1)
+
+    def finalize_scan_run(
+        self,
+        run_id: str,
+        *,
+        reason: str = "Scan ended before this symbol completed",
+    ) -> None:
+        completed_at = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE scan_run_symbols
+                SET status = 'failed',
+                    error_type = 'IncompleteScan',
+                    error_message = ?,
+                    completed_at = ?
+                WHERE run_id = ? AND status = 'requested'
+                """,
+                (reason[:500], completed_at, run_id),
+            )
+            cursor = connection.execute(
+                """
+                UPDATE scan_runs
+                SET completed_at = COALESCE(completed_at, ?)
+                WHERE run_id = ?
+                """,
+                (completed_at, run_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"unknown scan run: {run_id}")
+
+    def finalize_stale_scan_runs(
+        self,
+        stale_before: str,
+        *,
+        reason: str = "No terminal event before the stale-run timeout",
+    ) -> int:
+        datetime.fromisoformat(stale_before)
+        completed_at = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            stale_runs = connection.execute(
+                """
+                SELECT run_id
+                FROM scan_runs
+                WHERE completed_at IS NULL
+                  AND julianday(started_at) <= julianday(?)
+                """,
+                (stale_before,),
+            ).fetchall()
+            run_ids = [row["run_id"] for row in stale_runs]
+            connection.executemany(
+                """
+                UPDATE scan_run_symbols
+                SET status = 'failed',
+                    error_type = 'RecoveredIncompleteScan',
+                    error_message = ?,
+                    completed_at = ?
+                WHERE run_id = ? AND status = 'requested'
+                """,
+                [
+                    (reason[:500], completed_at, run_id)
+                    for run_id in run_ids
+                ],
+            )
+            connection.executemany(
+                """
+                UPDATE scan_runs
+                SET completed_at = COALESCE(completed_at, ?)
+                WHERE run_id = ?
+                """,
+                [(completed_at, run_id) for run_id in run_ids],
+            )
+        return len(run_ids)
+
+    def record_scan_symbol(
+        self,
+        run_id: str,
+        symbol: str,
+        *,
+        decision_id: str | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        normalized_symbol = symbol.strip().upper()
+        completed_at = datetime.now(UTC).isoformat()
+        status = "failed" if error is not None else "completed"
+        error_type = type(error).__name__ if error is not None else None
+        error_message = str(error)[:500] if error is not None else None
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE scan_run_symbols
+                SET status = ?, decision_id = ?, error_type = ?,
+                    error_message = ?, completed_at = ?
+                WHERE run_id = ? AND symbol = ? AND status = 'requested'
+                """,
+                (
+                    status,
+                    decision_id,
+                    error_type,
+                    error_message,
+                    completed_at,
+                    run_id,
+                    normalized_symbol,
+                ),
+            )
+            if cursor.rowcount != 1:
+                existing = connection.execute(
+                    """
+                    SELECT status FROM scan_run_symbols
+                    WHERE run_id = ? AND symbol = ?
+                    """,
+                    (run_id, normalized_symbol),
+                ).fetchone()
+                if existing is None:
+                    raise KeyError(
+                        f"unknown scan run symbol: {run_id}/{normalized_symbol}"
+                    )
+                if existing["status"] != status:
+                    raise ValueError(
+                        f"scan run symbol already recorded as {existing['status']}"
+                    )
+            pending = connection.execute(
+                """
+                SELECT 1 FROM scan_run_symbols
+                WHERE run_id = ? AND status = 'requested'
+                LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            if pending is None:
+                connection.execute(
+                    """
+                    UPDATE scan_runs
+                    SET completed_at = COALESCE(completed_at, ?)
+                    WHERE run_id = ?
+                    """,
+                    (completed_at, run_id),
+                )
+
+    def scan_run_summary(self, run_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            run = connection.execute(
+                "SELECT * FROM scan_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"unknown scan run: {run_id}")
+            symbols = connection.execute(
+                """
+                SELECT symbol, status, decision_id, error_type, error_message
+                FROM scan_run_symbols
+                WHERE run_id = ?
+                ORDER BY ordinal
+                """,
+                (run_id,),
+            ).fetchall()
+        counts: dict[str, int] = {}
+        for row in symbols:
+            counts[row["status"]] = counts.get(row["status"], 0) + 1
+        return {
+            "run_id": run["run_id"],
+            "scan_label": run["scan_label"],
+            "policy_version": run["policy_version"],
+            "started_at": run["started_at"],
+            "completed_at": run["completed_at"],
+            "counts": counts,
+            "symbols": [dict(row) for row in symbols],
+        }
 
     def status_counts(self) -> dict[str, int]:
         with self._connect() as connection:
@@ -380,25 +640,55 @@ class EvaluationLedger:
         with self._connect() as connection:
             decisions = connection.execute(
                 """
+                WITH actionable AS (
+                    SELECT
+                        decision_id, decision_date, symbol, entry_price,
+                        stop_price, target_price, shares, risk_plan_valid,
+                        decision_timestamp,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY
+                                decision_date,
+                                symbol,
+                                COALESCE(policy_version, '')
+                            ORDER BY decision_timestamp, decision_id
+                        ) AS signal_rank
+                    FROM decisions
+                    WHERE status IN ('proposed', 'flagged_for_review')
+                      AND risk_plan_valid = 1
+                )
                 SELECT decision_id, decision_date, symbol, entry_price, stop_price,
                        target_price, shares, risk_plan_valid
-                FROM decisions
-                WHERE status IN ('proposed', 'flagged_for_review')
+                FROM actionable
+                WHERE signal_rank = 1
                 ORDER BY decision_timestamp, decision_id
                 """
             ).fetchall()
+            unevaluable = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM (
+                        SELECT decision_date, symbol, policy_version
+                        FROM decisions
+                        WHERE status IN ('proposed', 'flagged_for_review')
+                        GROUP BY
+                            decision_date,
+                            symbol,
+                            COALESCE(policy_version, '')
+                        HAVING MAX(risk_plan_valid) = 0
+                    )
+                    """
+                ).fetchone()[0]
+            )
 
         completed = 0
         skipped_incomplete = 0
-        skipped_unevaluable = 0
+        skipped_unevaluable = unevaluable * len(normalized_horizons)
         outcome_rows: list[tuple[Any, ...]] = []
         with sqlite3.connect(bhavcopy_database_path) as prices:
             prices.row_factory = sqlite3.Row
             for decision in decisions:
                 entry_price = decision["entry_price"]
-                if not decision["risk_plan_valid"]:
-                    skipped_unevaluable += len(normalized_horizons)
-                    continue
                 max_horizon = normalized_horizons[-1]
                 benchmark_bars = prices.execute(
                     """
@@ -546,7 +836,7 @@ class EvaluationLedger:
                             exit_reason,
                             round_trip_cost_bps,
                             PRICE_BASIS,
-                            datetime.now(timezone.utc).isoformat(),
+                            datetime.now(UTC).isoformat(),
                         )
                     )
                     completed += 1
@@ -619,6 +909,28 @@ class EvaluationLedger:
                 connection.execute(
                     """
                     SELECT COUNT(*)
+                    FROM (
+                        SELECT
+                            risk_plan_valid,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY
+                                    decision_date,
+                                    symbol,
+                                    COALESCE(policy_version, '')
+                                ORDER BY decision_timestamp, decision_id
+                            ) AS signal_rank
+                        FROM decisions
+                        WHERE status IN ('proposed', 'flagged_for_review')
+                          AND risk_plan_valid = 1
+                    )
+                    WHERE signal_rank = 1
+                    """
+                ).fetchone()[0]
+            )
+            raw_evaluable = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
                     FROM decisions
                     WHERE status IN ('proposed', 'flagged_for_review')
                       AND risk_plan_valid = 1
@@ -627,21 +939,99 @@ class EvaluationLedger:
             )
             outcomes = connection.execute(
                 """
+                WITH canonical AS (
+                    SELECT
+                        decision_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY
+                                decision_date,
+                                symbol,
+                                COALESCE(policy_version, '')
+                            ORDER BY decision_timestamp, decision_id
+                        ) AS signal_rank
+                    FROM decisions
+                    WHERE status IN ('proposed', 'flagged_for_review')
+                      AND risk_plan_valid = 1
+                )
                 SELECT outcomes.*, decisions.technical_score,
-                       decisions.model_name, decisions.llm_max_tokens,
+                       decisions.model_name,
+                       COALESCE(
+                           decisions.fundamental_llm_max_tokens,
+                           CASE
+                               WHEN json_valid(decisions.raw_record_json)
+                               THEN CAST(
+                                   json_extract(
+                                       decisions.raw_record_json,
+                                       '$.model_config.fundamental_max_tokens'
+                                   ) AS INTEGER
+                               )
+                           END,
+                           decisions.llm_max_tokens
+                       ) AS llm_max_tokens,
                        decisions.model_backend, decisions.policy_version,
                        decisions.target_price
                 FROM outcomes
                 JOIN decisions USING (decision_id)
+                JOIN canonical USING (decision_id)
+                WHERE canonical.signal_rank = 1
                 ORDER BY horizon_sessions, decision_id
+                """
+            ).fetchall()
+            canonical_decisions = connection.execute(
+                """
+                WITH canonical AS (
+                    SELECT
+                        decision_id,
+                        decision_date,
+                        symbol,
+                        policy_version,
+                        status,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY
+                                decision_date,
+                                symbol,
+                                COALESCE(policy_version, '')
+                            ORDER BY decision_timestamp, decision_id
+                        ) AS signal_rank
+                    FROM decisions
+                    WHERE status IN ('proposed', 'flagged_for_review')
+                      AND risk_plan_valid = 1
+                )
+                SELECT
+                    decision_id, decision_date, symbol, policy_version, status
+                FROM canonical
+                WHERE signal_rank = 1
+                ORDER BY decision_date, symbol, policy_version
                 """
             ).fetchall()
             model_configs = connection.execute(
                 """
-                SELECT model_backend, model_name, llm_max_tokens, COUNT(*) AS count
-                FROM decisions
-                GROUP BY model_backend, model_name, llm_max_tokens
-                ORDER BY model_backend, model_name, llm_max_tokens
+                SELECT
+                    model_backend,
+                    model_name,
+                    effective_max_tokens AS llm_max_tokens,
+                    COUNT(*) AS count
+                FROM (
+                    SELECT
+                        model_backend,
+                        model_name,
+                        COALESCE(
+                            fundamental_llm_max_tokens,
+                            CASE
+                                WHEN json_valid(raw_record_json)
+                                THEN CAST(
+                                    json_extract(
+                                        raw_record_json,
+                                        '$.model_config.fundamental_max_tokens'
+                                    ) AS INTEGER
+                                )
+                            END,
+                            llm_max_tokens
+                        ) AS effective_max_tokens
+                    FROM decisions
+                )
+                GROUP BY model_backend, model_name, effective_max_tokens
+                ORDER BY model_backend, model_name, effective_max_tokens
                 """
             ).fetchall()
             policy_versions = connection.execute(
@@ -710,6 +1100,9 @@ class EvaluationLedger:
                 "total": decision_total,
                 "status_counts": self.status_counts(),
                 "evaluable": evaluable,
+                "raw_evaluable": raw_evaluable,
+                "repeated_evaluable": raw_evaluable - evaluable,
+                "canonical": [dict(row) for row in canonical_decisions],
                 "model_configs": [
                     {
                         "backend": row["model_backend"],
@@ -773,6 +1166,10 @@ class EvaluationLedger:
             ],
             "methodology": {
                 "scope": "selected_candidate_evaluation",
+                "canonical_signal": (
+                    "first proposed/review decision with a validated risk plan "
+                    "per symbol, decision_date, and policy_version"
+                ),
                 "decision_cutoff": "bhavcopy sessions strictly after decision_date",
                 "session_calendar": (
                     "benchmark dates; a missing stock bar makes the horizon incomplete"

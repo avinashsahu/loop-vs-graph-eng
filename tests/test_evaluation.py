@@ -25,6 +25,7 @@ def _decision_record():
             "backend": "openai_compatible_local",
             "name": "finance-model",
             "max_tokens": 640,
+            "fundamental_max_tokens": 384,
         },
         "risk_plan": {
             "entry_price": 1540.0,
@@ -38,7 +39,8 @@ def _decision_record():
 class EvaluationLedgerTests(unittest.TestCase):
     def test_recording_a_decision_is_immutable_and_idempotent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            ledger = EvaluationLedger(f"{temp_dir}/evaluation.db")
+            database_path = f"{temp_dir}/evaluation.db"
+            ledger = EvaluationLedger(database_path)
             record = _decision_record()
 
             first = ledger.record_decision(record)
@@ -52,6 +54,121 @@ class EvaluationLedgerTests(unittest.TestCase):
                 ledger.status_counts(),
                 {"proposed": 1},
             )
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    """
+                    UPDATE decisions
+                    SET llm_max_tokens = 640,
+                        fundamental_llm_max_tokens = NULL
+                    """
+                )
+            ledger = EvaluationLedger(database_path)
+            [model_config] = ledger.calibration_report()["decisions"][
+                "model_configs"
+            ]
+            self.assertEqual(model_config["max_tokens"], 384)
+
+    def test_scan_accounting_and_canonical_daily_signal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = EvaluationLedger(f"{temp_dir}/evaluation.db")
+            first_record = _decision_record()
+            first_record["risk_plan"]["stop_price"] = None
+            ledger.record_decision(first_record)
+            canonical_record = _decision_record()
+            canonical_record["timestamp"] = "2026-07-29T11:15:00+05:30"
+            canonical = ledger.record_decision(canonical_record)
+            repeat_record = _decision_record()
+            repeat_record["timestamp"] = "2026-07-29T14:15:00+05:30"
+            repeat_record["scan_label"] = "intraday-recheck"
+            ledger.record_decision(repeat_record)
+
+            scan = ledger.start_scan_run(
+                "nifty-next-50",
+                ["TECHM", "TITAN", "HAL"],
+                first_record["policy_version"],
+                started_at="2026-07-29T10:00:00+05:30",
+            )
+            ledger.record_scan_symbol(
+                scan.run_id,
+                "TECHM",
+                decision_id=canonical.decision_id,
+            )
+            ledger.record_scan_symbol(
+                scan.run_id,
+                "TITAN",
+                error=RuntimeError("quote fetch failed"),
+            )
+            ledger.finalize_scan_run(scan.run_id)
+            stale_scan = ledger.start_scan_run(
+                "stale-run",
+                ["SBICARD"],
+                first_record["policy_version"],
+                started_at="2026-07-28T10:00:00+05:30",
+            )
+            recovered_count = ledger.finalize_stale_scan_runs(
+                "2026-07-29T10:00:00+05:30"
+            )
+            bhavcopy_path = f"{temp_dir}/bhavcopy.db"
+            with sqlite3.connect(bhavcopy_path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE bhavcopy (
+                        symbol TEXT NOT NULL,
+                        date TEXT NOT NULL,
+                        open REAL,
+                        high REAL,
+                        low REAL,
+                        close REAL,
+                        PRIMARY KEY (symbol, date)
+                    )
+                    """
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO bhavcopy (
+                        symbol, date, open, high, low, close
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        ("TECHM", "2026-07-30", 1545, 1600, 1520, 1580),
+                        ("JUNIORBEES", "2026-07-30", 100, 102, 99, 101),
+                    ],
+                )
+
+            run_summary = ledger.scan_run_summary(scan.run_id)
+            stale_summary = ledger.scan_run_summary(stale_scan.run_id)
+            outcome_summary = ledger.update_outcomes(
+                bhavcopy_path,
+                horizons=(1,),
+            )
+            decision_summary = ledger.calibration_report()["decisions"]
+            self.assertEqual(
+                run_summary["counts"],
+                {"completed": 1, "failed": 2},
+            )
+            self.assertIsNotNone(run_summary["completed_at"])
+            self.assertEqual(
+                run_summary["symbols"][1]["error_type"],
+                "RuntimeError",
+            )
+            self.assertEqual(
+                run_summary["symbols"][2]["error_type"],
+                "IncompleteScan",
+            )
+            self.assertEqual(recovered_count, 1)
+            self.assertEqual(
+                stale_summary["symbols"][0]["error_type"],
+                "RecoveredIncompleteScan",
+            )
+            self.assertEqual(decision_summary["raw_evaluable"], 2)
+            self.assertEqual(decision_summary["evaluable"], 1)
+            self.assertEqual(decision_summary["repeated_evaluable"], 1)
+            self.assertEqual(
+                decision_summary["canonical"][0]["decision_id"],
+                canonical.decision_id,
+            )
+            self.assertEqual(outcome_summary.completed, 1)
+            self.assertEqual(outcome_summary.skipped_unevaluable, 0)
 
     def test_outcome_uses_only_future_sessions_and_applies_a_gap_aware_stop(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -338,7 +455,7 @@ class EvaluationLedgerTests(unittest.TestCase):
                     {
                         "backend": "openai_compatible_local",
                         "name": "finance-model",
-                        "max_tokens": 640,
+                        "max_tokens": 384,
                         "count": 2,
                     }
                 ],
@@ -368,7 +485,7 @@ class EvaluationLedgerTests(unittest.TestCase):
                 report["model_performance"][0]["name"],
                 "finance-model",
             )
-            self.assertEqual(report["model_performance"][0]["max_tokens"], 640)
+            self.assertEqual(report["model_performance"][0]["max_tokens"], 384)
             self.assertEqual(
                 report["model_performance"][0]["policy_version"],
                 "technical-v1+risk-v1+prompts-v1",
