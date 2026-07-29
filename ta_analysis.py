@@ -1,4 +1,91 @@
+from dataclasses import dataclass
+
+import numpy as np
 import talib
+
+_REQUIRED_TIMEFRAMES = ("D", "30", "15", "5")
+_REQUIRED_COLUMNS = ("close", "high", "low")
+_MINIMUM_BARS = 50
+
+
+@dataclass(frozen=True)
+class TechnicalAssessment:
+    status: str
+    verdict: str
+    reason_codes: tuple[str, ...]
+    indicators: dict
+    evidence: dict
+
+    def to_dict(self):
+        # Indicators are persisted separately as `technical_indicators`; do not double
+        # the trade-log payload by embedding the same nested values here.
+        return {
+            "status": self.status,
+            "verdict": self.verdict,
+            "reason_codes": list(self.reason_codes),
+            "evidence": self.evidence,
+        }
+
+
+def evaluate_technical(histories):
+    """Validate multi-timeframe bars, calculate indicators, and score one candidate."""
+    reasons = []
+    for timeframe in _REQUIRED_TIMEFRAMES:
+        history = histories.get(timeframe)
+        if history is None:
+            reasons.append(f"MISSING_TIMEFRAME:{timeframe}")
+            continue
+        missing_columns = [
+            column for column in _REQUIRED_COLUMNS if column not in history.columns
+        ]
+        if missing_columns:
+            reasons.append(
+                f"MISSING_COLUMNS:{timeframe}:{','.join(missing_columns)}"
+            )
+        if len(history) < _MINIMUM_BARS:
+            reasons.append(f"INSUFFICIENT_BARS:{timeframe}")
+        elif not missing_columns:
+            recent_prices = history.loc[:, _REQUIRED_COLUMNS].tail(_MINIMUM_BARS)
+            if not np.isfinite(recent_prices.to_numpy(dtype=float)).all():
+                reasons.append(f"NON_FINITE_BARS:{timeframe}")
+
+    if reasons:
+        return TechnicalAssessment(
+            status="invalid_data",
+            verdict="BAD",
+            reason_codes=tuple(reasons),
+            indicators={},
+            evidence={},
+        )
+
+    indicators = {
+        timeframe: compute_indicators(histories[timeframe])
+        for timeframe in _REQUIRED_TIMEFRAMES
+    }
+    indicator_reasons = []
+    for timeframe, values in indicators.items():
+        if not all(np.isfinite(value) for value in values.values()):
+            indicator_reasons.append(f"NON_FINITE_INDICATORS:{timeframe}")
+        elif values["atr14"] <= 0:
+            indicator_reasons.append(f"NON_POSITIVE_ATR:{timeframe}")
+
+    if indicator_reasons:
+        return TechnicalAssessment(
+            status="invalid_data",
+            verdict="BAD",
+            reason_codes=tuple(indicator_reasons),
+            indicators={},
+            evidence={},
+        )
+
+    evidence = score_technical(indicators)
+    return TechnicalAssessment(
+        status="ready",
+        verdict=evidence["verdict"],
+        reason_codes=(),
+        indicators=indicators,
+        evidence=evidence,
+    )
 
 
 def compute_indicators(hist):
@@ -8,21 +95,27 @@ def compute_indicators(hist):
     sma20 = talib.SMA(close, timeperiod=20)
     sma50 = talib.SMA(close, timeperiod=50)
     rsi14 = talib.RSI(close, timeperiod=14)
-    macd, macd_signal, macd_hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
+    macd, macd_signal, macd_hist = talib.MACD(
+        close,
+        fastperiod=12,
+        slowperiod=26,
+        signalperiod=9,
+    )
     atr14 = talib.ATR(high, low, close, timeperiod=14)
-    last_close = close[-1]
+    last_close = float(close[-1])
+    latest_atr = float(atr14[-1])
     return {
-        "close": round(last_close, 2),
-        "sma20": round(sma20[-1], 2),
-        "sma50": round(sma50[-1], 2),
-        "rsi14": round(rsi14[-1], 2),
-        "macd": round(macd[-1], 2),
-        "macd_signal": round(macd_signal[-1], 2),
-        "macd_hist": round(macd_hist[-1], 2),
-        "atr14": round(atr14[-1], 2),
+        "close": last_close,
+        "sma20": float(sma20[-1]),
+        "sma50": float(sma50[-1]),
+        "rsi14": float(rsi14[-1]),
+        "macd": float(macd[-1]),
+        "macd_signal": float(macd_signal[-1]),
+        "macd_hist": float(macd_hist[-1]),
+        "atr14": latest_atr,
         # ATR as a % of price -- volatility measure independent of the stock's price
         # level, used below to widen/narrow the RSI overbought/oversold bands.
-        "atr_pct": round(atr14[-1] / last_close * 100, 2),
+        "atr_pct": latest_atr / last_close * 100,
     }
 
 
@@ -102,16 +195,18 @@ def score_technical(indicators):
     1. Graduated scores. SMA trend and MACD momentum are scored by how far apart the
        values are (as a fraction of a scale, clipped to +/-1), not just which side of
        zero they land on -- a 0.1% SMA gap and a 3% SMA gap used to count the same.
-    2. Confluence across independent signal *families*, not across timeframes. Trend
+    2. Confluence across signal roles, not across timeframes. Trend
        (SMA) and momentum (MACD) are each computed at 4 timeframes to weight daily
        heaviest and use intraday for timing -- but those 4 readings are correlated (same
        price series), not 4 independent opinions. Treating them as separate "votes"
        double- and quadruple-counts the same underlying trend. So each family is first
        collapsed to one weighted-average family score across its 4 timeframes, and
-       confluence is measured across the resulting 3 genuinely-distinct families (trend,
-       momentum, RSI): verdict is GOOD only if the total is positive AND at least 2 of
-       the (up to 3) "engaged" families -- those with |score| above a small deadzone,
-       so near-zero noise doesn't get a vote -- actually agree on direction. A first
+       confluence is measured across trend, momentum, and an RSI extreme penalty. These
+       all derive from price and are not statistically independent. Verdict is GOOD only
+       if the total is positive AND at least 2 of the "engaged" roles -- those with
+       |score| above a small deadzone, so near-zero noise doesn't get a vote -- agree on
+       direction. In practice RSI is neutral or negative, so bullish confirmation
+       requires both engaged trend and momentum to be positive. A first
        attempt defined "agreement" relative to the total score's own sign, which is a
        circular definition: if total_score > 0 then agreeing weight necessarily exceeds
        disagreeing weight by simple algebra, so that check could never fail. Requiring
@@ -148,9 +243,7 @@ def score_technical(indicators):
     daily_rsi = float(indicators["D"]["rsi14"])
     rsi_family = _rsi_penalty(daily_rsi, rsi_lower, rsi_upper)
 
-    if rsi_family > 0:
-        rsi_note = "neutral"
-    elif daily_rsi > rsi_upper:
+    if daily_rsi > rsi_upper:
         rsi_note = f"overbought vs adaptive band >{rsi_upper:.0f} (caution -- momentum may be exhausted)"
     elif daily_rsi < rsi_lower:
         rsi_note = f"oversold vs adaptive band <{rsi_lower:.0f} (conflicts with a genuine uptrend claim)"

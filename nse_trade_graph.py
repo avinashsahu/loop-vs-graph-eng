@@ -16,6 +16,7 @@ from nsemine.live import get_stock_live_quotes
 import bhavcopy
 import fundamentals
 import nse_data
+import position_risk
 import ta_analysis
 from llm import call_llm
 from logging_config import setup_logging
@@ -49,7 +50,6 @@ def node_fetch(state):
 
     state["hist_multi"] = nse_data.get_multi_timeframe_history(state["symbol"])
     state["hist"] = state["hist_multi"]["D"]
-    state["fundamental_snapshot"] = fundamentals.get_fundamental_snapshot(state["symbol"])
 
     try:
         state["delivery_trend"] = bhavcopy.get_delivery_trend(state["symbol"])
@@ -63,14 +63,32 @@ def node_fetch(state):
 
 
 def node_technical(state):
-    indicators = {tf: ta_analysis.compute_indicators(hist) for tf, hist in state["hist_multi"].items()}
-    state["technical_indicators"] = indicators
-    log.info("iter=%d indicators=%s", state["iters"], indicators)
-
-    # Deterministic, not an LLM call -- see ta_analysis.score_technical's docstring for
+    # Deterministic, not an LLM call -- see ta_analysis.evaluate_technical and
+    # score_technical for
     # why: live testing showed this exact threshold/comparison task isn't something an
     # LLM (gemma4 or Fin-R1) applies reliably, regardless of model quality.
-    result = ta_analysis.score_technical(indicators)
+    assessment = ta_analysis.evaluate_technical(state["hist_multi"])
+    state["technical_indicators"] = assessment.indicators
+    state["technical_assessment"] = assessment.to_dict()
+    log.info(
+        "iter=%d technical_status=%s indicators=%s",
+        state["iters"],
+        assessment.status,
+        assessment.indicators,
+    )
+
+    if assessment.status != "ready":
+        state["technical_verdict"] = (
+            f"BAD invalid_data: {', '.join(assessment.reason_codes)}"
+        )
+        log.warning(
+            "iter=%d technical_verdict=%r",
+            state["iters"],
+            state["technical_verdict"],
+        )
+        return "abort", state
+
+    result = assessment.evidence
     state["technical_verdict"] = (
         f"{result['verdict']} (score={result['score']}, confluence={result['confluence_ratio']} "
         f"of {result['engaged_families']} engaged families): families={result['families']}; "
@@ -85,6 +103,10 @@ def node_technical(state):
 
 
 def node_fundamental(state):
+    if state["fundamental_snapshot"] is None:
+        state["fundamental_snapshot"] = fundamentals.get_fundamental_snapshot(
+            state["symbol"]
+        )
     snap = state["fundamental_snapshot"] or {}
     eps, pat = snap.get("eps"), snap.get("pat")
 
@@ -132,11 +154,6 @@ def node_risk(state):
     lower_circuit = quote["upper_circuit"]
     upper_circuit = quote["lower_circuit"]
 
-    if not (0 < state["risk_pct"] <= 25):
-        state["risk_verdict"] = f"BAD: risk_pct={state['risk_pct']} outside sane 0-25% bound"
-        log.warning(state["risk_verdict"])
-        return "abort", state
-
     # Compute today's low/high from the 5-minute bars (5 min TTL, refreshes through the
     # day) rather than the daily bar's row (cached until IST midnight -- its low/high
     # freeze at whatever they were when first fetched today). Otherwise a stock crashing
@@ -167,12 +184,37 @@ def node_risk(state):
         log.warning(state["risk_verdict"])
         return "abort", state
 
-    position_size = state["principal"] * (state["risk_pct"] / 100)
-    state["position_size"] = position_size
-    state["max_shares"] = int(position_size // price)
+    plan = position_risk.size_position(
+        principal=state["principal"],
+        entry_price=price,
+        atr=state["technical_indicators"]["D"]["atr14"],
+        max_loss_pct=state["max_loss_pct"],
+        max_allocation_pct=state["max_allocation_pct"],
+        atr_stop_multiple=state["atr_stop_multiple"],
+    )
+    state["risk_plan"] = plan.to_dict()
+    if isinstance(plan, position_risk.RiskRejection):
+        state["risk_verdict"] = f"BAD: {plan.reason_code}: {plan.message}"
+        log.warning(state["risk_verdict"])
+        return "abort", state
+
+    if plan.stop_price <= lower_circuit:
+        state["risk_verdict"] = (
+            f"BAD: ATR stop {plan.stop_price:.2f} is at/below lower circuit "
+            f"{lower_circuit:.2f}"
+        )
+        log.warning(state["risk_verdict"])
+        return "abort", state
+
+    state["position_size"] = plan.capital_required
+    state["max_shares"] = plan.shares
     state["risk_verdict"] = (
-        f"GOOD: {state['risk_pct']}% of principal={state['principal']}, "
-        f"lower_circuit={lower_circuit}, upper_circuit={upper_circuit}"
+        f"GOOD: {plan.shares} shares at ~{plan.entry_price:.2f}, "
+        f"ATR stop={plan.stop_price:.2f}, max loss at stop="
+        f"{plan.max_loss_at_stop:.2f}/{plan.risk_budget:.2f} budget, "
+        f"capital={plan.capital_required:.2f}/{plan.allocation_cap:.2f} cap, "
+        f"binding={plan.binding_constraint}, lower_circuit={lower_circuit}, "
+        f"upper_circuit={upper_circuit}"
     )
     log.info(state["risk_verdict"])
     return "sentiment", state
@@ -197,9 +239,13 @@ def node_sentiment(state):
 
 def node_propose(state):
     state["status"] = "proposed"
+    plan = state["risk_plan"]
     state["proposal"] = (
-        f"PROPOSAL (not executed): BUY {state['symbol']} — up to {state['max_shares']} shares "
-        f"(~₹{state['position_size']:.0f}, {state['risk_pct']}% of ₹{state['principal']:.0f} principal). "
+        f"PROPOSAL (not executed): BUY {state['symbol']} — up to "
+        f"{state['max_shares']} shares, entry ~₹{plan['entry_price']:.2f}, "
+        f"stop ₹{plan['stop_price']:.2f}, capital ~₹{state['position_size']:.0f}, "
+        f"max loss ~₹{plan['max_loss_at_stop']:.0f} "
+        f"({state['max_loss_pct']}% of ₹{state['principal']:.0f} principal). "
         "Confirm manually before placing any order."
     )
     return "log", state
@@ -237,14 +283,18 @@ def build_record(state):
         "symbol": state["symbol"],
         "company_name": (state.get("quote") or {}).get("name"),
         "principal": state["principal"],
-        "risk_pct": state["risk_pct"],
+        "max_loss_pct": state["max_loss_pct"],
+        "max_allocation_pct": state["max_allocation_pct"],
+        "atr_stop_multiple": state["atr_stop_multiple"],
         "iters": state["iters"],
         "technical_indicators": state.get("technical_indicators"),
+        "technical_assessment": state.get("technical_assessment"),
         "technical_verdict": state.get("technical_verdict"),
         "fundamental_verdict": state.get("fundamental_verdict"),
         "eps": (state.get("fundamental_snapshot") or {}).get("eps"),
         "pat": (state.get("fundamental_snapshot") or {}).get("pat"),
         "delivery_trend": state.get("delivery_trend"),
+        "risk_plan": state.get("risk_plan"),
         "risk_verdict": state.get("risk_verdict"),
         "sentiment_verdict": state.get("sentiment_verdict"),
         "status": state["status"],
@@ -273,11 +323,19 @@ GRAPH = {
 }
 
 
-def run(symbol, principal, risk_pct=10.0):
+def run(
+    symbol,
+    principal,
+    max_allocation_pct=10.0,
+    max_loss_pct=1.0,
+    atr_stop_multiple=2.0,
+):
     state = {
         "symbol": symbol,
         "principal": principal,
-        "risk_pct": risk_pct,
+        "max_loss_pct": max_loss_pct,
+        "max_allocation_pct": max_allocation_pct,
+        "atr_stop_multiple": atr_stop_multiple,
         "iters": 0,
         "quote": None,
         "hist": None,
@@ -285,8 +343,10 @@ def run(symbol, principal, risk_pct=10.0):
         "fundamental_snapshot": None,
         "delivery_trend": None,
         "technical_indicators": None,
+        "technical_assessment": None,
         "technical_verdict": None,
         "fundamental_verdict": None,
+        "risk_plan": None,
         "risk_verdict": None,
         "sentiment_verdict": None,
         "status": None,
@@ -318,14 +378,27 @@ if __name__ == "__main__":
             symbols = [os.environ.get("NSE_SYMBOL", "RELIANCE")]
 
     principal = float(os.environ.get("NSE_PRINCIPAL", "100000"))
-    risk_pct = float(os.environ.get("NSE_RISK_PCT", "10"))
+    max_allocation_pct = float(
+        os.environ.get(
+            "NSE_MAX_ALLOCATION_PCT",
+            os.environ.get("NSE_RISK_PCT", "10"),
+        )
+    )
+    max_loss_pct = float(os.environ.get("NSE_MAX_LOSS_PCT", "1"))
+    atr_stop_multiple = float(os.environ.get("NSE_ATR_STOP_MULTIPLE", "2"))
     scan_delay_seconds = float(os.environ.get("NSE_SCAN_DELAY_SECONDS", "1"))
 
     for i, symbol in enumerate(symbols):
         if i > 0:
             time.sleep(scan_delay_seconds)
         try:
-            final_state = run(symbol, principal, risk_pct)
+            final_state = run(
+                symbol,
+                principal,
+                max_allocation_pct,
+                max_loss_pct,
+                atr_stop_multiple,
+            )
             log.info("final[%s]: %s", symbol, final_state["proposal"])
         except Exception:
             log.warning("run failed for %s, continuing batch", symbol, exc_info=True)

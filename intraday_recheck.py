@@ -64,11 +64,24 @@ if __name__ == "__main__":
     import nse_trade_graph
 
     principal = float(os.environ.get("NSE_PRINCIPAL", "100000"))
-    risk_pct = float(os.environ.get("NSE_RISK_PCT", "10"))
+    max_allocation_pct = float(
+        os.environ.get(
+            "NSE_MAX_ALLOCATION_PCT",
+            os.environ.get("NSE_RISK_PCT", "10"),
+        )
+    )
+    max_loss_pct = float(os.environ.get("NSE_MAX_LOSS_PCT", "1"))
+    atr_stop_multiple = float(os.environ.get("NSE_ATR_STOP_MULTIPLE", "2"))
 
     for symbol in symbols:
         try:
-            final_state = nse_trade_graph.run(symbol, principal, risk_pct)
+            final_state = nse_trade_graph.run(
+                symbol,
+                principal,
+                max_allocation_pct,
+                max_loss_pct,
+                atr_stop_multiple,
+            )
         except Exception:
             # nsemine can return None (not raise) for illiquid/no-data symbols, which
             # crashes deeper in the fetch chain -- one bad symbol shouldn't cost every
