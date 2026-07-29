@@ -13,13 +13,8 @@ See `NOTES.md` for the tradeoffs between the loop and graph styles.
 
 ## Setup
 
-Requires [`uv`](https://github.com/astral-sh/uv) and, for the `nse_trade_graph.py` technical indicators, the TA-Lib C library (macOS via Homebrew):
-
-```bash
-brew install ta-lib
-```
-
-Then:
+Requires Python 3.14 and [`uv`](https://github.com/astral-sh/uv). The locked `ta-lib`
+package includes a compatible Linux wheel on this machine, so setup is:
 
 ```bash
 uv sync
@@ -27,9 +22,10 @@ uv sync
 
 This creates `.venv` and installs the pinned dependencies (`anthropic`, `openai`, `nsemine`, `pandas`, `python-dotenv`, `ta-lib`).
 
-If `uv add ta-lib` / `uv sync` ever fails to find the C library's headers, point it explicitly:
+On macOS, install the TA-Lib C library first if `uv sync` cannot find it:
 
 ```bash
+brew install ta-lib
 TA_LIBRARY_PATH="$(brew --prefix ta-lib)/lib" TA_INCLUDE_PATH="$(brew --prefix ta-lib)/include" uv sync
 ```
 
@@ -47,23 +43,42 @@ cp .env.example .env
 |---|---|---|
 | Stub (default) | nothing set | Hardcoded fake answers, no network calls. Good for testing control flow only. |
 | Anthropic (Claude) | `USE_REAL_LLM=1` | Requires `ANTHROPIC_API_KEY`. Uses `claude-haiku-4-5`. |
-| Local (any `mlx_lm.server` model) | `USE_LOCAL_LLM=1` | Talks to a local `mlx_lm.server` over its OpenAI-compatible API. |
+| Local (Ollama or compatible) | `USE_LOCAL_LLM=1` | Uses an OpenAI-compatible local endpoint; this machine profile targets Ollama. |
 
 If both `USE_REAL_LLM` and `USE_LOCAL_LLM` are set, local wins.
 
 ### Running the local backend
 
-Start the model server once (leave it running in the background) with whatever model `LOCAL_LLM_MODEL` in `.env` points at:
+This Linux host already has Ollama and an RTX 3060 with 12 GB VRAM. Pull the configured
+5.03 GB Q4_K_M model once:
 
 ```bash
-mlx_lm.server --model Wwayu/Fin-R1-mlx-8Bit --port 8080
+ollama pull hf.co/alexsabaka/ODA-Fin-RL-8B-GGUF:Q4_K_M
 ```
 
-Config (`.env`): `LOCAL_LLM_URL` (default `http://localhost:8080/v1`), `LOCAL_LLM_MODEL` (default `Wwayu/Fin-R1-mlx-8Bit` — see below for why), `LOCAL_LLM_MAX_TOKENS` (default `400`).
+Ollama serves its API at `http://localhost:11434` when its service is running. The
+OpenAI-compatible URL used here is `http://localhost:11434/v1`.
 
-**Why Fin-R1 instead of gemma4**: only `node_fundamental`/`node_sentiment` still make an LLM call (`node_technical` is deterministic code — see below), and head-to-head testing (same prompts, both models) showed Fin-R1 (7B, RL fine-tuned on financial reasoning chain-of-thought data) synthesizes free-text fundamental data — corp actions, peer P/E comparisons — noticeably more thoroughly than gemma4. Not a clean win across the board: in one test Fin-R1 caught 2 of 3 deliberately-planted red flags where gemma4 caught all 3, and showed an internal inconsistency (praised the same shareholding-concentration fact as positive in one case, suspicious in another). Worth the swap on balance, not worth trusting blindly.
+Config (`.env`): `LOCAL_LLM_URL` (default `http://localhost:11434/v1`),
+`LOCAL_LLM_MODEL` (default `hf.co/alexsabaka/ODA-Fin-RL-8B-GGUF:Q4_K_M`),
+`LOCAL_LLM_MAX_TOKENS` (default `400`), and `LOCAL_LLM_REASONING_EFFORT`
+(default `none`).
 
-Many reasoning-tuned local models (gemma4 included) burn tokens on an internal "thinking" channel before answering, which can leave `content` empty if `max_tokens` is too low. If you switch back to gemma4, `llm.py` already disables this per-request via `chat_template_kwargs: {"enable_thinking": false}`, and falls back to the raw reasoning text if `content` ever comes back `None` anyway, so `call_llm` never returns `None` regardless of which model is loaded.
+**Why ODA-Fin-RL-8B instead of Fin-R1:** only `node_fundamental` and
+`node_sentiment` still use an LLM.
+[ODA-Fin-RL-8B](https://huggingface.co/OpenDataArena/ODA-Fin-RL-8B) is a March
+2026 Qwen3-8B finance fine-tune trained with SFT and GRPO. Its
+[paper](https://arxiv.org/abs/2603.07223) reports a 74.6% average across nine financial
+understanding, sentiment, and numerical-reasoning benchmarks versus 61.4% for Fin-R1,
+including 83.4% on Financial PhraseBank and 80.4% on ConvFinQA. Those are
+publisher-reported benchmark results, not evidence that model-generated trade verdicts
+are safe; the deterministic technical and risk gates remain intentionally outside the
+LLM.
+
+Ollama enables Qwen3 thinking by default. This application only needs a short verdict,
+so `LOCAL_LLM_REASONING_EFFORT=none` prevents the reasoning channel from consuming the
+small output budget. Set it empty for an OpenAI-compatible server that does not support
+that request field.
 
 ## Logging
 
