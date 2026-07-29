@@ -19,7 +19,7 @@ import nse_data
 import position_risk
 import ta_analysis
 from evaluation import EvaluationLedger
-from llm import active_model_config, call_llm
+from llm import active_model_config, assess_fundamentals, call_llm
 from logging_config import setup_logging
 from market_time import now_ist
 
@@ -28,7 +28,7 @@ EVALUATION_DB_PATH = os.environ.get("EVALUATION_DB_PATH", "evaluation.db")
 NSE_SCAN_LABEL = os.environ.get("NSE_SCAN_LABEL", "manual")
 NSE_POLICY_VERSION = os.environ.get(
     "NSE_POLICY_VERSION",
-    "technical-confluence-v1+risk-atr-v1+llm-prompts-v1",
+    "technical-confluence-v1+risk-atr-target-v2+llm-prompts-v2",
 )
 
 log = setup_logging("nse")
@@ -120,6 +120,12 @@ def node_fundamental(state):
 
     if (isinstance(eps, (int, float)) and eps < 0) or (isinstance(pat, (int, float)) and pat < 0):
         state["fundamental_verdict"] = f"BAD: negative EPS/PAT (eps={eps}, pat={pat})"
+        state["fundamental_assessment"] = {
+            "verdict": "BAD",
+            "reason_code": "PEER_OR_EARNINGS_WEAKNESS",
+            "reason": f"Negative EPS/PAT (eps={eps}, pat={pat}).",
+            "evidence": ["PEER_COMPARISON"],
+        }
         log.warning(state["fundamental_verdict"])
         return "abort", state
 
@@ -129,29 +135,33 @@ def node_fundamental(state):
         # GOOD would present an unvetted symbol as fully checked. Surface it for a human
         # to look at instead of guessing.
         state["fundamental_verdict"] = "BAD: fundamental data fetch was incomplete, not evaluated"
+        state["fundamental_assessment"] = {
+            "verdict": "BAD",
+            "reason_code": "INSUFFICIENT_EVIDENCE",
+            "reason": "Fundamental data fetch was incomplete.",
+            "evidence": [],
+        }
         log.warning(state["fundamental_verdict"])
         return "flag_review", state
 
-    verdict = call_llm(
-        _verdict_prompt(
-            f"Fundamental snapshot for {state['symbol']} ({snap.get('company_name')}): "
-            f"corp actions={snap.get('corp_actions')}, "
-            f"corp announcements={snap.get('corp_announcements')}, "
-            f"shareholding pattern (recent periods)={snap.get('shareholding_pattern')}, "
-            f"yearwise returns={snap.get('yearwise_returns')}, "
-            f"peer comparison (quarter {snap.get('peer_comparison_quarter')})={snap.get('peer_comparison')}, "
-            f"delivery participation (from NSE bhavcopy)={state.get('delivery_trend')}.\n"
-            "Delivery data is supporting market-participation context only: it does not reveal buyer "
-            "or seller direction and cannot establish accumulation or distribution by itself. "
-            "Does the company look fundamentally sound -- no red flags in recent corporate actions, "
-            "announcements, or shareholding trend, and reasonable standing versus peers?"
-        ),
-        mode="check",
+    assessment = assess_fundamentals(
+        f"Fundamental snapshot for {state['symbol']} ({snap.get('company_name')}): "
+        f"corp actions={snap.get('corp_actions')}, "
+        f"corp announcements={snap.get('corp_announcements')}, "
+        f"shareholding pattern (recent periods)={snap.get('shareholding_pattern')}, "
+        f"yearwise returns={snap.get('yearwise_returns')}, "
+        f"peer comparison (quarter {snap.get('peer_comparison_quarter')})={snap.get('peer_comparison')}, "
+        f"delivery participation (from NSE bhavcopy)={state.get('delivery_trend')}.\n"
+        "Delivery data is supporting market-participation context only: it does not reveal buyer "
+        "or seller direction and cannot establish accumulation or distribution by itself. "
+        "Does the company look fundamentally sound -- no red flags in recent corporate actions, "
+        "announcements, or shareholding trend, and reasonable standing versus peers?"
     )
-    state["fundamental_verdict"] = verdict
-    log.info("fundamental_verdict=%r", verdict)
+    state["fundamental_assessment"] = assessment.to_dict()
+    state["fundamental_verdict"] = assessment.summary
+    log.info("fundamental_assessment=%r", state["fundamental_assessment"])
 
-    if verdict.startswith("GOOD"):
+    if assessment.verdict == "GOOD":
         return "risk", state
     return "flag_review", state
 
@@ -199,6 +209,7 @@ def node_risk(state):
         max_loss_pct=state["max_loss_pct"],
         max_allocation_pct=state["max_allocation_pct"],
         atr_stop_multiple=state["atr_stop_multiple"],
+        reward_risk_ratio=state["reward_risk_ratio"],
     )
     state["risk_plan"] = plan.to_dict()
     if isinstance(plan, position_risk.RiskRejection):
@@ -218,7 +229,8 @@ def node_risk(state):
     state["max_shares"] = plan.shares
     state["risk_verdict"] = (
         f"GOOD: {plan.shares} shares at ~{plan.entry_price:.2f}, "
-        f"ATR stop={plan.stop_price:.2f}, max loss at stop="
+        f"ATR stop={plan.stop_price:.2f}, target={plan.target_price:.2f} "
+        f"({plan.reward_risk_ratio:.2f}R), max loss at stop="
         f"{plan.max_loss_at_stop:.2f}/{plan.risk_budget:.2f} budget, "
         f"capital={plan.capital_required:.2f}/{plan.allocation_cap:.2f} cap, "
         f"binding={plan.binding_constraint}, lower_circuit={lower_circuit}, "
@@ -252,8 +264,11 @@ def node_propose(state):
     state["proposal"] = (
         f"PROPOSAL (not executed): BUY {state['symbol']} — up to "
         f"{state['max_shares']} shares, entry ~₹{plan['entry_price']:.2f}, "
-        f"stop ₹{plan['stop_price']:.2f}, capital ~₹{state['position_size']:.0f}, "
+        f"stop ₹{plan['stop_price']:.2f}, target ₹{plan['target_price']:.2f} "
+        f"({plan['reward_risk_ratio']:.2f}R), "
+        f"capital ~₹{state['position_size']:.0f}, "
         f"max loss ~₹{plan['max_loss_at_stop']:.0f} "
+        f"and planned profit ~₹{plan['planned_profit_at_target']:.0f} "
         f"({actual_loss_pct:.2f}% actual; {state['max_loss_pct']}% policy cap "
         f"of ₹{state['principal']:.0f} principal). "
         "Confirm manually before placing any order."
@@ -296,12 +311,14 @@ def build_record(state):
         "max_loss_pct": state["max_loss_pct"],
         "max_allocation_pct": state["max_allocation_pct"],
         "atr_stop_multiple": state["atr_stop_multiple"],
+        "reward_risk_ratio": state["reward_risk_ratio"],
         "iters": state["iters"],
         "technical_indicators": state.get("technical_indicators"),
         "technical_assessment": state.get("technical_assessment"),
         "market_snapshot": state.get("market_snapshot"),
         "technical_verdict": state.get("technical_verdict"),
         "fundamental_verdict": state.get("fundamental_verdict"),
+        "fundamental_assessment": state.get("fundamental_assessment"),
         "eps": (state.get("fundamental_snapshot") or {}).get("eps"),
         "pat": (state.get("fundamental_snapshot") or {}).get("pat"),
         "delivery_trend": state.get("delivery_trend"),
@@ -348,6 +365,7 @@ def run(
     max_allocation_pct=10.0,
     max_loss_pct=1.0,
     atr_stop_multiple=2.0,
+    reward_risk_ratio=2.0,
 ):
     state = {
         "symbol": symbol,
@@ -355,6 +373,7 @@ def run(
         "max_loss_pct": max_loss_pct,
         "max_allocation_pct": max_allocation_pct,
         "atr_stop_multiple": atr_stop_multiple,
+        "reward_risk_ratio": reward_risk_ratio,
         "iters": 0,
         "quote": None,
         "hist": None,
@@ -366,6 +385,7 @@ def run(
         "technical_assessment": None,
         "technical_verdict": None,
         "fundamental_verdict": None,
+        "fundamental_assessment": None,
         "risk_plan": None,
         "risk_verdict": None,
         "sentiment_verdict": None,
@@ -406,6 +426,7 @@ if __name__ == "__main__":
     )
     max_loss_pct = float(os.environ.get("NSE_MAX_LOSS_PCT", "1"))
     atr_stop_multiple = float(os.environ.get("NSE_ATR_STOP_MULTIPLE", "2"))
+    reward_risk_ratio = float(os.environ.get("NSE_REWARD_RISK_RATIO", "2"))
     scan_delay_seconds = float(os.environ.get("NSE_SCAN_DELAY_SECONDS", "1"))
 
     for i, symbol in enumerate(symbols):
@@ -418,6 +439,7 @@ if __name__ == "__main__":
                 max_allocation_pct,
                 max_loss_pct,
                 atr_stop_multiple,
+                reward_risk_ratio,
             )
             log.info("final[%s]: %s", symbol, final_state["proposal"])
         except Exception:

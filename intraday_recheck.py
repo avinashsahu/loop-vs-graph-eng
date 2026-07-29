@@ -78,6 +78,7 @@ if __name__ == "__main__":
     )
     max_loss_pct = float(os.environ.get("NSE_MAX_LOSS_PCT", "1"))
     atr_stop_multiple = float(os.environ.get("NSE_ATR_STOP_MULTIPLE", "2"))
+    reward_risk_ratio = float(os.environ.get("NSE_REWARD_RISK_RATIO", "2"))
     alert_ledger = AlertLedger(INTRADAY_ALERT_STATE_PATH)
 
     for symbol in symbols:
@@ -88,6 +89,7 @@ if __name__ == "__main__":
                 max_allocation_pct,
                 max_loss_pct,
                 atr_stop_multiple,
+                reward_risk_ratio,
             )
         except Exception:
             # nsemine can return None (not raise) for illiquid/no-data symbols, which

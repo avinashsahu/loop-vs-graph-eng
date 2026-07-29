@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 log = logging.getLogger(__name__)
-EVALUATOR_VERSION = "daily-reference-v1"
+EVALUATOR_VERSION = "daily-reference-v2-target-aware"
 PRICE_BASIS = "raw_unadjusted_bhavcopy"
 
 
@@ -69,6 +69,7 @@ class EvaluationLedger:
                     status TEXT NOT NULL,
                     entry_price REAL,
                     stop_price REAL,
+                    target_price REAL,
                     shares INTEGER,
                     technical_score REAL,
                     technical_verdict TEXT,
@@ -127,6 +128,10 @@ class EvaluationLedger:
                 connection.execute(
                     "ALTER TABLE decisions ADD COLUMN policy_version TEXT"
                 )
+            if "target_price" not in decision_columns:
+                connection.execute(
+                    "ALTER TABLE decisions ADD COLUMN target_price REAL"
+                )
             self._initialize_outcomes(connection)
 
     def _initialize_outcomes(self, connection: sqlite3.Connection) -> None:
@@ -163,9 +168,10 @@ class EvaluationLedger:
                             net_return_pct, benchmark_symbol,
                             benchmark_return_pct, excess_return_pct, mfe_pct,
                             mae_pct, stop_hit, stop_hit_date,
+                            target_hit, target_hit_date, exit_reason,
                             round_trip_cost_bps, price_basis, evaluated_at
                         ) VALUES (
-                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                         )
                         """,
                         (
@@ -186,12 +192,40 @@ class EvaluationLedger:
                             row["mae_pct"],
                             row["stop_hit"],
                             row["stop_hit_date"],
+                            0,
+                            None,
+                            "stop" if row["stop_hit"] else "horizon",
                             row["round_trip_cost_bps"],
                             row["price_basis"],
                             row["evaluated_at"],
                         ),
                     )
                 connection.execute("DROP TABLE outcomes_v0")
+                return
+            if "target_hit" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE outcomes
+                    ADD COLUMN target_hit INTEGER NOT NULL DEFAULT 0
+                    """
+                )
+            if "target_hit_date" not in columns:
+                connection.execute(
+                    "ALTER TABLE outcomes ADD COLUMN target_hit_date TEXT"
+                )
+            if "exit_reason" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE outcomes
+                    ADD COLUMN exit_reason TEXT NOT NULL DEFAULT 'horizon'
+                    """
+                )
+                connection.execute(
+                    """
+                    UPDATE outcomes SET exit_reason = 'stop'
+                    WHERE stop_hit = 1
+                    """
+                )
             return
         self._create_outcomes_table(connection)
 
@@ -217,6 +251,9 @@ class EvaluationLedger:
                 mae_pct REAL NOT NULL,
                 stop_hit INTEGER NOT NULL,
                 stop_hit_date TEXT,
+                target_hit INTEGER NOT NULL,
+                target_hit_date TEXT,
+                exit_reason TEXT NOT NULL,
                 round_trip_cost_bps REAL NOT NULL,
                 price_basis TEXT NOT NULL,
                 evaluated_at TEXT NOT NULL,
@@ -245,13 +282,13 @@ class EvaluationLedger:
                 """
                 INSERT OR IGNORE INTO decisions (
                     decision_id, decision_timestamp, decision_date, scan_label,
-                    symbol, status, entry_price, stop_price, shares,
+                    symbol, status, entry_price, stop_price, target_price, shares,
                     technical_score, technical_verdict, fundamental_verdict,
                     risk_verdict, sentiment_verdict, model_backend, model_name,
                     llm_max_tokens, policy_version,
                     risk_plan_valid, raw_record_json, created_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -263,6 +300,7 @@ class EvaluationLedger:
                     str(record["status"]),
                     risk_plan.get("entry_price"),
                     risk_plan.get("stop_price"),
+                    risk_plan.get("target_price"),
                     risk_plan.get("shares"),
                     evidence.get("score"),
                     record.get("technical_verdict"),
@@ -343,7 +381,7 @@ class EvaluationLedger:
             decisions = connection.execute(
                 """
                 SELECT decision_id, decision_date, symbol, entry_price, stop_price,
-                       shares, risk_plan_valid
+                       target_price, shares, risk_plan_valid
                 FROM decisions
                 WHERE status IN ('proposed', 'flagged_for_review')
                 ORDER BY decision_timestamp, decision_id
@@ -420,17 +458,56 @@ class EvaluationLedger:
 
                     entry = float(entry_price)
                     stop_price = decision["stop_price"]
+                    target_price = decision["target_price"]
                     stop_hit_date = None
+                    target_hit_date = None
+                    exit_reason = "horizon"
                     held_window = window
                     exit_price = float(window[-1]["close"])
                     for index, bar in enumerate(window):
+                        open_price = float(bar["open"])
                         if (
+                            stop_price is not None
+                            and open_price <= float(stop_price)
+                        ):
+                            stop_hit_date = str(bar["date"])
+                            exit_reason = "stop"
+                            exit_price = open_price
+                            held_window = window[: index + 1]
+                            break
+                        if (
+                            target_price is not None
+                            and open_price >= float(target_price)
+                        ):
+                            target_hit_date = str(bar["date"])
+                            exit_reason = "target"
+                            exit_price = open_price
+                            held_window = window[: index + 1]
+                            break
+                        stop_touched = (
                             stop_price is not None
                             and bar["low"] is not None
                             and float(bar["low"]) <= float(stop_price)
-                        ):
+                        )
+                        target_touched = (
+                            target_price is not None
+                            and bar["high"] is not None
+                            and float(bar["high"]) >= float(target_price)
+                        )
+                        if stop_touched:
                             stop_hit_date = str(bar["date"])
-                            exit_price = min(float(bar["open"]), float(stop_price))
+                            if target_touched:
+                                target_hit_date = str(bar["date"])
+                                exit_reason = "both_hit_stop_first"
+                            else:
+                                exit_reason = "stop"
+                            exit_price = float(stop_price)
+                            held_window = window[: index + 1]
+                            break
+                        if target_touched:
+                            target_hit_date = str(bar["date"])
+                            exit_reason = "target"
+                            exit_price = float(target_price)
                             held_window = window[: index + 1]
                             break
 
@@ -464,6 +541,9 @@ class EvaluationLedger:
                             * 100,
                             int(stop_hit_date is not None),
                             stop_hit_date,
+                            int(target_hit_date is not None),
+                            target_hit_date,
+                            exit_reason,
                             round_trip_cost_bps,
                             PRICE_BASIS,
                             datetime.now(timezone.utc).isoformat(),
@@ -480,9 +560,10 @@ class EvaluationLedger:
                     close_return_pct, gross_return_pct, net_return_pct,
                     benchmark_symbol, benchmark_return_pct, excess_return_pct,
                     mfe_pct, mae_pct, stop_hit, stop_hit_date,
+                    target_hit, target_hit_date, exit_reason,
                     round_trip_cost_bps, price_basis, evaluated_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 ON CONFLICT (
                     decision_id, horizon_sessions, methodology_key
@@ -501,6 +582,9 @@ class EvaluationLedger:
                     mae_pct = excluded.mae_pct,
                     stop_hit = excluded.stop_hit,
                     stop_hit_date = excluded.stop_hit_date,
+                    target_hit = excluded.target_hit,
+                    target_hit_date = excluded.target_hit_date,
+                    exit_reason = excluded.exit_reason,
                     round_trip_cost_bps = excluded.round_trip_cost_bps,
                     price_basis = excluded.price_basis,
                     evaluated_at = excluded.evaluated_at
@@ -545,7 +629,8 @@ class EvaluationLedger:
                 """
                 SELECT outcomes.*, decisions.technical_score,
                        decisions.model_name, decisions.llm_max_tokens,
-                       decisions.model_backend, decisions.policy_version
+                       decisions.model_backend, decisions.policy_version,
+                       decisions.target_price
                 FROM outcomes
                 JOIN decisions USING (decision_id)
                 ORDER BY horizon_sessions, decision_id
@@ -694,6 +779,12 @@ class EvaluationLedger:
                 ),
                 "entry_basis": "recorded risk_plan.entry_price reference, not a fill",
                 "stop_fill": "session open when below stop, otherwise stop price",
+                "target_fill": (
+                    "session open when above target, otherwise target price"
+                ),
+                "same_bar_order": (
+                    "both stop and target touched after open is treated as stop first"
+                ),
                 "stop_bar_excursion": (
                     "full daily stop bar included; intraday high/low order unknown"
                 ),
@@ -709,10 +800,19 @@ class EvaluationLedger:
         }
 
     @staticmethod
-    def _summarize_outcomes(rows: list[sqlite3.Row]) -> dict[str, float | int]:
+    def _summarize_outcomes(
+        rows: list[sqlite3.Row],
+    ) -> dict[str, float | int | None]:
         net_returns = [float(row["net_return_pct"]) for row in rows]
         gross_returns = [float(row["gross_return_pct"]) for row in rows]
         close_returns = [float(row["close_return_pct"]) for row in rows]
+        target_eligible = [
+            row
+            for row in rows
+            if row["target_price"] is not None
+            and math.isfinite(float(row["target_price"]))
+            and float(row["target_price"]) > 0
+        ]
         return {
             "count": len(rows),
             "mean_gross_return_pct": statistics.fmean(gross_returns),
@@ -726,6 +826,31 @@ class EvaluationLedger:
             "stop_rate_pct": sum(int(row["stop_hit"]) for row in rows)
             / len(rows)
             * 100,
+            "target_eligible_count": len(target_eligible),
+            "target_rate_pct": (
+                sum(row["exit_reason"] == "target" for row in target_eligible)
+                / len(target_eligible)
+                * 100
+                if target_eligible
+                else None
+            ),
+            "target_touch_rate_pct": (
+                sum(int(row["target_hit"]) for row in target_eligible)
+                / len(target_eligible)
+                * 100
+                if target_eligible
+                else None
+            ),
+            "same_bar_ambiguity_rate_pct": (
+                sum(
+                    row["exit_reason"] == "both_hit_stop_first"
+                    for row in target_eligible
+                )
+                / len(target_eligible)
+                * 100
+                if target_eligible
+                else None
+            ),
             "mean_excess_return_pct": statistics.fmean(
                 float(row["excess_return_pct"]) for row in rows
             ),
@@ -812,6 +937,12 @@ class EvaluationLedger:
             entry = float(risk_plan["entry_price"])
             stop = float(risk_plan["stop_price"])
             shares = float(risk_plan["shares"])
+            target_value = risk_plan.get("target_price")
+            target = (
+                float(target_value)
+                if target_value is not None
+                else None
+            )
         except (KeyError, TypeError, ValueError):
             return False
         return (
@@ -822,6 +953,10 @@ class EvaluationLedger:
             and 0 < stop < entry
             and shares > 0
             and shares.is_integer()
+            and (
+                target is None
+                or (math.isfinite(target) and target > entry)
+            )
         )
 
     @staticmethod

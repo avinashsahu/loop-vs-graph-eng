@@ -8,9 +8,13 @@ class PositionPlan:
     entry_price: float
     stop_price: float
     stop_distance: float
+    target_price: float
+    target_distance: float
+    reward_risk_ratio: float
     capital_required: float
     risk_budget: float
     max_loss_at_stop: float
+    planned_profit_at_target: float
     allocation_cap: float
     binding_constraint: str
 
@@ -35,8 +39,9 @@ def size_position(
     max_loss_pct,
     max_allocation_pct,
     atr_stop_multiple,
+    reward_risk_ratio=2.0,
 ):
-    """Size shares under both loss-at-stop and capital-allocation constraints."""
+    """Build an entry/stop/target plan under loss and allocation constraints."""
     values = {
         "principal": principal,
         "entry_price": entry_price,
@@ -44,6 +49,7 @@ def size_position(
         "max_loss_pct": max_loss_pct,
         "max_allocation_pct": max_allocation_pct,
         "atr_stop_multiple": atr_stop_multiple,
+        "reward_risk_ratio": reward_risk_ratio,
     }
     invalid = [
         name
@@ -67,6 +73,11 @@ def size_position(
             reason_code="MAX_ALLOCATION_PCT_TOO_HIGH",
             message="max_allocation_pct must not exceed 100%",
         )
+    if reward_risk_ratio > 10:
+        return RiskRejection(
+            reason_code="REWARD_RISK_RATIO_TOO_HIGH",
+            message="reward_risk_ratio must not exceed 10",
+        )
 
     stop_distance = atr * atr_stop_multiple
     stop_price = entry_price - stop_distance
@@ -75,11 +86,33 @@ def size_position(
             reason_code="NON_POSITIVE_STOP",
             message="ATR-based stop is not above zero",
         )
+    target_distance = stop_distance * reward_risk_ratio
+    target_price = entry_price + target_distance
+    if not math.isfinite(target_distance) or not math.isfinite(target_price):
+        return RiskRejection(
+            reason_code="INVALID_TARGET",
+            message="derived target must be finite",
+        )
 
-    risk_budget = principal * max_loss_pct / 100
-    allocation_cap = principal * max_allocation_pct / 100
-    shares_by_risk = int(risk_budget // stop_distance)
-    shares_by_allocation = int(allocation_cap // entry_price)
+    risk_budget = principal * (max_loss_pct / 100)
+    allocation_cap = principal * (max_allocation_pct / 100)
+    shares_by_risk_raw = risk_budget / stop_distance
+    shares_by_allocation_raw = allocation_cap / entry_price
+    if not all(
+        math.isfinite(value)
+        for value in (
+            risk_budget,
+            allocation_cap,
+            shares_by_risk_raw,
+            shares_by_allocation_raw,
+        )
+    ):
+        return RiskRejection(
+            reason_code="INVALID_DERIVED_PLAN",
+            message="derived position values must be finite",
+        )
+    shares_by_risk = math.floor(shares_by_risk_raw)
+    shares_by_allocation = math.floor(shares_by_allocation_raw)
     shares = min(shares_by_risk, shares_by_allocation)
 
     if shares < 1:
@@ -96,14 +129,35 @@ def size_position(
         if shares_by_risk <= shares_by_allocation
         else "allocation_cap"
     )
+    capital_required = shares * entry_price
+    max_loss_at_stop = shares * stop_distance
+    planned_profit_at_target = shares * target_distance
+    if not all(
+        math.isfinite(value)
+        for value in (
+            capital_required,
+            risk_budget,
+            max_loss_at_stop,
+            allocation_cap,
+            planned_profit_at_target,
+        )
+    ):
+        return RiskRejection(
+            reason_code="INVALID_DERIVED_PLAN",
+            message="derived position values must be finite",
+        )
     return PositionPlan(
         shares=shares,
         entry_price=float(entry_price),
         stop_price=float(stop_price),
         stop_distance=float(stop_distance),
-        capital_required=float(shares * entry_price),
+        target_price=float(target_price),
+        target_distance=float(target_distance),
+        reward_risk_ratio=float(reward_risk_ratio),
+        capital_required=float(capital_required),
         risk_budget=float(risk_budget),
-        max_loss_at_stop=float(shares * stop_distance),
+        max_loss_at_stop=float(max_loss_at_stop),
+        planned_profit_at_target=float(planned_profit_at_target),
         allocation_cap=float(allocation_cap),
         binding_constraint=binding_constraint,
     )

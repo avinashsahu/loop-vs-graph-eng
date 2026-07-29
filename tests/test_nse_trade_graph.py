@@ -8,6 +8,7 @@ import pandas as pd
 
 import nse_trade_graph
 from evaluation import EvaluationLedger
+from llm import FundamentalAssessment
 
 
 class FundamentalPromptTests(unittest.TestCase):
@@ -30,13 +31,22 @@ class FundamentalPromptTests(unittest.TestCase):
 
         with patch.object(
             nse_trade_graph,
-            "call_llm",
-            return_value="GOOD: no fundamental red flags",
-        ) as call_llm:
-            route, _ = nse_trade_graph.node_fundamental(state)
+            "assess_fundamentals",
+            return_value=FundamentalAssessment(
+                verdict="GOOD",
+                reason_code="NO_MATERIAL_RED_FLAG",
+                reason="No fundamental red flags.",
+                evidence=("SHAREHOLDING", "ANNOUNCEMENTS"),
+            ),
+        ) as assess_fundamentals:
+            route, result_state = nse_trade_graph.node_fundamental(state)
 
-        prompt = call_llm.call_args.args[0]
+        prompt = assess_fundamentals.call_args.args[0]
         self.assertEqual(route, "risk")
+        self.assertEqual(
+            result_state["fundamental_assessment"]["reason_code"],
+            "NO_MATERIAL_RED_FLAG",
+        )
         self.assertIn("does not reveal buyer or seller direction", prompt)
         self.assertIn("supporting market-participation context", prompt)
         self.assertNotIn("rising means more genuine buying interest", prompt)
@@ -169,6 +179,7 @@ class MarketSnapshotRecordTests(unittest.TestCase):
             "max_loss_pct": 1.0,
             "max_allocation_pct": 10.0,
             "atr_stop_multiple": 2.0,
+            "reward_risk_ratio": 2.0,
             "iters": 1,
             "status": "aborted",
             "proposal": None,
@@ -178,6 +189,7 @@ class MarketSnapshotRecordTests(unittest.TestCase):
         record = nse_trade_graph.build_record(state)
 
         self.assertEqual(record["market_snapshot"], snapshot_metadata)
+        self.assertEqual(record["reward_risk_ratio"], 2.0)
         self.assertEqual(
             record["model_config"],
             nse_trade_graph.active_model_config(),
@@ -194,6 +206,7 @@ class MarketSnapshotRecordTests(unittest.TestCase):
             "max_loss_pct": 1.0,
             "max_allocation_pct": 10.0,
             "atr_stop_multiple": 2.0,
+            "reward_risk_ratio": 2.0,
             "iters": 1,
             "status": "aborted",
             "proposal": None,
@@ -222,6 +235,7 @@ class RiskNodeTests(unittest.TestCase):
             "max_loss_pct": 1.0,
             "max_allocation_pct": 25.0,
             "atr_stop_multiple": 2.0,
+            "reward_risk_ratio": 2.0,
             "quote": {
                 "previous_close": 100.0,
                 "change": 0.0,
@@ -255,8 +269,14 @@ class RiskNodeTests(unittest.TestCase):
         self.assertEqual(result_state["max_shares"], 100)
         self.assertEqual(result_state["position_size"], 10_000.0)
         self.assertEqual(result_state["risk_plan"]["stop_price"], 90.0)
+        self.assertEqual(result_state["risk_plan"]["target_price"], 120.0)
+        self.assertEqual(
+            result_state["risk_plan"]["planned_profit_at_target"],
+            2_000.0,
+        )
         self.assertEqual(result_state["risk_plan"]["max_loss_at_stop"], 1_000.0)
         self.assertIn("max loss at stop", result_state["risk_verdict"])
+        self.assertIn("target=120.00", result_state["risk_verdict"])
 
     def test_proposal_states_entry_stop_capital_and_maximum_loss(self):
         state = {
@@ -269,6 +289,9 @@ class RiskNodeTests(unittest.TestCase):
             "risk_plan": {
                 "entry_price": 100.0,
                 "stop_price": 90.0,
+                "target_price": 120.0,
+                "planned_profit_at_target": 2_000.0,
+                "reward_risk_ratio": 2.0,
                 "max_loss_at_stop": 1_000.0,
                 "risk_budget": 1_000.0,
             },
@@ -279,6 +302,8 @@ class RiskNodeTests(unittest.TestCase):
         self.assertEqual(route, "log")
         self.assertIn("entry ~₹100.00", result_state["proposal"])
         self.assertIn("stop ₹90.00", result_state["proposal"])
+        self.assertIn("target ₹120.00 (2.00R)", result_state["proposal"])
+        self.assertIn("planned profit ~₹2000", result_state["proposal"])
         self.assertIn("max loss ~₹1000", result_state["proposal"])
         self.assertNotIn("risk_pct", result_state["proposal"])
 
@@ -293,6 +318,9 @@ class RiskNodeTests(unittest.TestCase):
             "risk_plan": {
                 "entry_price": 4_850.0,
                 "stop_price": 4_750.0,
+                "target_price": 5_050.0,
+                "planned_profit_at_target": 400.0,
+                "reward_risk_ratio": 2.0,
                 "max_loss_at_stop": 200.0,
                 "risk_budget": 1_000.0,
             },

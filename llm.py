@@ -1,5 +1,6 @@
 import json
 import os
+from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
@@ -43,6 +44,77 @@ LOCAL_CHECK_RESPONSE_FORMAT = {
         },
     },
 }
+FUNDAMENTAL_REASON_CODES = (
+    "NO_MATERIAL_RED_FLAG",
+    "GOVERNANCE_OR_REGULATORY",
+    "PROMOTER_OR_DILUTION",
+    "ADVERSE_CORPORATE_EVENT",
+    "PEER_OR_EARNINGS_WEAKNESS",
+    "INSUFFICIENT_EVIDENCE",
+)
+FUNDAMENTAL_EVIDENCE_CATEGORIES = (
+    "CORPORATE_ACTIONS",
+    "ANNOUNCEMENTS",
+    "SHAREHOLDING",
+    "YEARWISE_RETURNS",
+    "PEER_COMPARISON",
+    "DELIVERY_CONTEXT",
+)
+FUNDAMENTAL_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "fundamental_assessment",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "verdict": {
+                    "type": "string",
+                    "enum": ["GOOD", "BAD"],
+                },
+                "reason_code": {
+                    "type": "string",
+                    "enum": list(FUNDAMENTAL_REASON_CODES),
+                },
+                "reason": {
+                    "type": "string",
+                    "maxLength": 160,
+                },
+                "evidence": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": list(FUNDAMENTAL_EVIDENCE_CATEGORIES),
+                    },
+                    "maxItems": 2,
+                    "uniqueItems": True,
+                },
+            },
+            "required": ["verdict", "reason_code", "reason", "evidence"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+@dataclass(frozen=True)
+class FundamentalAssessment:
+    verdict: str
+    reason_code: str
+    reason: str
+    evidence: tuple[str, ...]
+
+    @property
+    def summary(self):
+        return f"{self.verdict}: {self.reason}"
+
+    def to_dict(self):
+        return {
+            "verdict": self.verdict,
+            "reason_code": self.reason_code,
+            "reason": self.reason,
+            "evidence": list(self.evidence),
+        }
 
 
 def active_model_config():
@@ -144,6 +216,149 @@ def _call_local_llm(prompt, mode):
     )
     repaired = _normalize_local_response(repaired_text, mode)
     return repaired if repaired.startswith(("GOOD", "BAD")) else normalized
+
+
+def _call_local_structured(prompt, response_format, *, max_tokens=None):
+    global _local_client
+    if _local_client is None:
+        from openai import OpenAI
+
+        _local_client = OpenAI(base_url=LOCAL_LLM_URL, api_key="not-needed")
+
+    if LOCAL_LLM_NO_THINK_DIRECTIVE:
+        prompt = f"{LOCAL_LLM_NO_THINK_DIRECTIVE}\n{prompt}"
+    request = {
+        "model": LOCAL_LLM_MODEL,
+        "max_tokens": max_tokens or LOCAL_LLM_MAX_TOKENS,
+        "messages": [{"role": "user", "content": prompt}],
+        "response_format": response_format,
+        "temperature": 0,
+    }
+    if LOCAL_LLM_REASONING_EFFORT:
+        request["reasoning_effort"] = LOCAL_LLM_REASONING_EFFORT
+    response = _local_client.chat.completions.create(**request)
+    message = response.choices[0].message
+    return (
+        message.content
+        if message.content is not None
+        else getattr(message, "reasoning", "")
+    )
+
+
+def _parse_fundamental_assessment(text):
+    try:
+        payload = json.loads(text)
+        verdict_value = payload["verdict"]
+        reason_code_value = payload["reason_code"]
+        reason_value = payload["reason"]
+        evidence_value = payload["evidence"]
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid fundamental assessment JSON") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload)
+        != {"verdict", "reason_code", "reason", "evidence"}
+        or not isinstance(verdict_value, str)
+        or not isinstance(reason_code_value, str)
+        or not isinstance(reason_value, str)
+        or not isinstance(evidence_value, list)
+        or any(not isinstance(item, str) for item in evidence_value)
+    ):
+        raise ValueError("invalid fundamental assessment field types")
+    verdict = verdict_value.upper()
+    reason_code = reason_code_value.upper()
+    reason = reason_value.strip()
+    evidence = tuple(item.upper() for item in evidence_value)
+    if verdict not in {"GOOD", "BAD"}:
+        raise ValueError("invalid fundamental verdict")
+    if reason_code not in FUNDAMENTAL_REASON_CODES:
+        raise ValueError("invalid fundamental reason code")
+    if (verdict == "GOOD") != (reason_code == "NO_MATERIAL_RED_FLAG"):
+        raise ValueError("fundamental verdict and reason code disagree")
+    if not reason or len(reason) > 160:
+        raise ValueError("fundamental reason must contain 1-160 characters")
+    if (
+        len(evidence) > 2
+        or len(set(evidence)) != len(evidence)
+        or any(item not in FUNDAMENTAL_EVIDENCE_CATEGORIES for item in evidence)
+    ):
+        raise ValueError("invalid fundamental evidence categories")
+    return FundamentalAssessment(
+        verdict=verdict,
+        reason_code=reason_code,
+        reason=reason,
+        evidence=evidence,
+    )
+
+
+def assess_fundamentals(prompt):
+    """Return a compact typed assessment through the configured model adapter."""
+    global _call_count
+    _call_count += 1
+
+    classification_prompt = (
+        "Classify only the supplied evidence. GOOD means no material red flag was "
+        "identified and must use reason_code NO_MATERIAL_RED_FLAG. BAD means a "
+        "material concern or insufficient evidence and must use another reason code. "
+        "Do not infer missing facts.\n\n"
+        f"{prompt}"
+    )
+    if USE_LOCAL_LLM:
+        text = _call_local_structured(
+            classification_prompt,
+            FUNDAMENTAL_RESPONSE_FORMAT,
+        )
+    elif USE_REAL_LLM:
+        import anthropic
+
+        client = anthropic.Anthropic()
+        schema = FUNDAMENTAL_RESPONSE_FORMAT["json_schema"]["schema"]
+        response = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=ANTHROPIC_MAX_TOKENS,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"{classification_prompt}\nReturn only JSON matching this schema: "
+                        f"{json.dumps(schema, separators=(',', ':'))}"
+                    ),
+                }
+            ],
+        )
+        text = response.content[0].text
+    else:
+        return FundamentalAssessment(
+            verdict="GOOD",
+            reason_code="NO_MATERIAL_RED_FLAG",
+            reason="Stub found no material red flag.",
+            evidence=(),
+        )
+    try:
+        return _parse_fundamental_assessment(text)
+    except ValueError:
+        if USE_LOCAL_LLM:
+            repair_prompt = (
+                "Convert the invalid assessment below to the requested JSON schema. "
+                "Preserve its conclusion, use at most two evidence categories, and "
+                "return JSON only.\n\n"
+                f"INVALID ASSESSMENT:\n{text[:4000]}"
+            )
+            repaired = _call_local_structured(
+                repair_prompt,
+                FUNDAMENTAL_RESPONSE_FORMAT,
+                max_tokens=192,
+            )
+            try:
+                return _parse_fundamental_assessment(repaired)
+            except ValueError:
+                pass
+        return FundamentalAssessment(
+            verdict="BAD",
+            reason_code="INSUFFICIENT_EVIDENCE",
+            reason="Model did not return a valid structured assessment.",
+            evidence=(),
+        )
 
 
 def call_llm(prompt, mode):

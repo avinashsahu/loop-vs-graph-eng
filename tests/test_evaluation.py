@@ -29,6 +29,7 @@ def _decision_record():
         "risk_plan": {
             "entry_price": 1540.0,
             "stop_price": 1490.0,
+            "target_price": 1640.0,
             "shares": 10,
         },
     }
@@ -113,6 +114,168 @@ class EvaluationLedgerTests(unittest.TestCase):
             self.assertAlmostEqual(outcome["mfe_pct"], 1.298701, places=5)
             self.assertAlmostEqual(outcome["mae_pct"], -3.896104, places=5)
             self.assertEqual(outcome["price_basis"], "raw_unadjusted_bhavcopy")
+
+    def test_target_exits_at_the_planned_price_before_the_horizon_close(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = EvaluationLedger(f"{temp_dir}/evaluation.db")
+            receipt = ledger.record_decision(_decision_record())
+            targetless = _decision_record()
+            targetless["timestamp"] = "2026-07-29T10:16:00+05:30"
+            targetless["symbol"] = "TITAN"
+            targetless["risk_plan"].pop("target_price")
+            ledger.record_decision(targetless)
+            bhavcopy_path = f"{temp_dir}/bhavcopy.db"
+            with sqlite3.connect(bhavcopy_path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE bhavcopy (
+                        symbol TEXT NOT NULL,
+                        date TEXT NOT NULL,
+                        open REAL,
+                        high REAL,
+                        low REAL,
+                        close REAL,
+                        PRIMARY KEY (symbol, date)
+                    )
+                    """
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO bhavcopy (
+                        symbol, date, open, high, low, close
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        ("TECHM", "2026-07-30", 1550, 1650, 1530, 1630),
+                        ("TECHM", "2026-07-31", 1600, 1610, 1500, 1510),
+                        ("TITAN", "2026-07-30", 1540, 1580, 1520, 1570),
+                        ("TITAN", "2026-07-31", 1570, 1590, 1540, 1580),
+                        ("JUNIORBEES", "2026-07-30", 100, 102, 99, 101),
+                        ("JUNIORBEES", "2026-07-31", 101, 103, 100, 102),
+                    ],
+                )
+
+            summary = ledger.update_outcomes(
+                bhavcopy_path,
+                horizons=(2,),
+                benchmark_symbol="JUNIORBEES",
+                round_trip_cost_bps=0,
+            )
+            [outcome] = ledger.decision_outcomes(receipt.decision_id)
+
+            self.assertEqual(summary.completed, 2)
+            self.assertEqual(outcome["exit_reason"], "target")
+            self.assertEqual(outcome["target_hit"], 1)
+            self.assertEqual(outcome["target_hit_date"], "2026-07-30")
+            self.assertEqual(outcome["stop_hit"], 0)
+            self.assertEqual(outcome["exit_price"], 1640.0)
+            self.assertAlmostEqual(
+                outcome["gross_return_pct"],
+                6.493506,
+                places=5,
+            )
+            self.assertEqual(
+                ledger.calibration_report()["horizons"]["2"][
+                    "target_rate_pct"
+                ],
+                100.0,
+            )
+            self.assertEqual(
+                ledger.calibration_report()["horizons"]["2"][
+                    "target_eligible_count"
+                ],
+                1,
+            )
+
+    def test_same_daily_bar_touching_stop_and_target_uses_stop_first(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = EvaluationLedger(f"{temp_dir}/evaluation.db")
+            receipt = ledger.record_decision(_decision_record())
+            bhavcopy_path = f"{temp_dir}/bhavcopy.db"
+            with sqlite3.connect(bhavcopy_path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE bhavcopy (
+                        symbol TEXT NOT NULL,
+                        date TEXT NOT NULL,
+                        open REAL,
+                        high REAL,
+                        low REAL,
+                        close REAL,
+                        PRIMARY KEY (symbol, date)
+                    )
+                    """
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO bhavcopy (
+                        symbol, date, open, high, low, close
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        ("TECHM", "2026-07-30", 1540, 1650, 1480, 1600),
+                        ("JUNIORBEES", "2026-07-30", 100, 102, 99, 101),
+                    ],
+                )
+
+            ledger.update_outcomes(
+                bhavcopy_path,
+                horizons=(1,),
+                benchmark_symbol="JUNIORBEES",
+                round_trip_cost_bps=0,
+            )
+            [outcome] = ledger.decision_outcomes(receipt.decision_id)
+
+            self.assertEqual(outcome["exit_reason"], "both_hit_stop_first")
+            self.assertEqual(outcome["stop_hit"], 1)
+            self.assertEqual(outcome["target_hit"], 1)
+            self.assertEqual(outcome["stop_hit_date"], "2026-07-30")
+            self.assertEqual(outcome["target_hit_date"], "2026-07-30")
+            self.assertEqual(outcome["exit_price"], 1490.0)
+
+    def test_opening_above_target_precedes_a_later_intraday_stop_touch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = EvaluationLedger(f"{temp_dir}/evaluation.db")
+            receipt = ledger.record_decision(_decision_record())
+            bhavcopy_path = f"{temp_dir}/bhavcopy.db"
+            with sqlite3.connect(bhavcopy_path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE bhavcopy (
+                        symbol TEXT NOT NULL,
+                        date TEXT NOT NULL,
+                        open REAL,
+                        high REAL,
+                        low REAL,
+                        close REAL,
+                        PRIMARY KEY (symbol, date)
+                    )
+                    """
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO bhavcopy (
+                        symbol, date, open, high, low, close
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        ("TECHM", "2026-07-30", 1660, 1680, 1480, 1550),
+                        ("JUNIORBEES", "2026-07-30", 100, 102, 99, 101),
+                    ],
+                )
+
+            ledger.update_outcomes(
+                bhavcopy_path,
+                horizons=(1,),
+                benchmark_symbol="JUNIORBEES",
+                round_trip_cost_bps=0,
+            )
+            [outcome] = ledger.decision_outcomes(receipt.decision_id)
+
+            self.assertEqual(outcome["exit_reason"], "target")
+            self.assertEqual(outcome["target_hit"], 1)
+            self.assertEqual(outcome["stop_hit"], 0)
+            self.assertEqual(outcome["exit_price"], 1660.0)
 
     def test_report_summarizes_completed_outcomes_without_hiding_aborts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -218,6 +381,14 @@ class EvaluationLedgerTests(unittest.TestCase):
                 report["methodology"]["scope"],
                 "selected_candidate_evaluation",
             )
+            self.assertEqual(
+                report["methodology"]["target_fill"],
+                "session open when above target, otherwise target price",
+            )
+            self.assertEqual(
+                report["methodology"]["same_bar_order"],
+                "both stop and target touched after open is treated as stop first",
+            )
             self.assertEqual(report["methodology"]["cost_assumptions_bps"], [0.0])
 
     def test_jsonl_import_is_resumable(self):
@@ -294,6 +465,20 @@ class EvaluationLedgerTests(unittest.TestCase):
             self.assertEqual(summary.completed, 0)
             self.assertEqual(summary.skipped_unevaluable, 1)
             self.assertEqual(ledger.calibration_report()["decisions"]["evaluable"], 0)
+
+    def test_supplied_target_must_be_finite_and_above_entry(self):
+        for invalid_target in (1540.0, float("nan"), "not-a-price"):
+            with self.subTest(target=invalid_target), tempfile.TemporaryDirectory() as temp_dir:
+                record = _decision_record()
+                record["risk_plan"]["target_price"] = invalid_target
+                ledger = EvaluationLedger(f"{temp_dir}/evaluation.db")
+
+                ledger.record_decision(record)
+
+                self.assertEqual(
+                    ledger.calibration_report()["decisions"]["evaluable"],
+                    0,
+                )
 
     def test_invalid_benchmark_price_skips_the_horizon_without_aborting_update(self):
         with tempfile.TemporaryDirectory() as temp_dir:

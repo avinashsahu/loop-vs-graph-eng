@@ -88,6 +88,132 @@ class LocalLlmTests(unittest.TestCase):
 
         self.assertEqual(result, "GOOD: stable fundamentals")
 
+    def test_fundamental_assessment_returns_compact_structured_evidence(self):
+        self.completions.content = (
+            '{"verdict":"GOOD","reason_code":"NO_MATERIAL_RED_FLAG",'
+            '"reason":"Stable ownership and no adverse announcements.",'
+            '"evidence":["SHAREHOLDING","ANNOUNCEMENTS"]}'
+        )
+
+        with patch.multiple(llm, USE_LOCAL_LLM=True, USE_REAL_LLM=False):
+            assessment = llm.assess_fundamentals("Judge these fundamentals")
+
+        self.assertEqual(
+            assessment.to_dict(),
+            {
+                "verdict": "GOOD",
+                "reason_code": "NO_MATERIAL_RED_FLAG",
+                "reason": "Stable ownership and no adverse announcements.",
+                "evidence": ["SHAREHOLDING", "ANNOUNCEMENTS"],
+            },
+        )
+        schema = self.completions.request["response_format"]["json_schema"][
+            "schema"
+        ]
+        self.assertEqual(schema["properties"]["reason"]["maxLength"], 160)
+        self.assertEqual(schema["properties"]["evidence"]["maxItems"], 2)
+        self.assertEqual(self.completions.request["temperature"], 0)
+
+    def test_fundamental_assessment_repairs_one_invalid_structured_response(self):
+        completions = _SequencedCompletions(
+            [
+                "The company appears stable.",
+                (
+                    '{"verdict":"GOOD","reason_code":"NO_MATERIAL_RED_FLAG",'
+                    '"reason":"No material red flag in the supplied evidence.",'
+                    '"evidence":["ANNOUNCEMENTS"]}'
+                ),
+            ]
+        )
+        llm._local_client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=completions)
+        )
+
+        with patch.multiple(llm, USE_LOCAL_LLM=True, USE_REAL_LLM=False):
+            assessment = llm.assess_fundamentals("Judge these fundamentals")
+
+        self.assertEqual(assessment.verdict, "GOOD")
+        self.assertEqual(len(completions.requests), 2)
+        self.assertEqual(completions.requests[1]["max_tokens"], 192)
+        self.assertIn(
+            "The company appears stable.",
+            completions.requests[1]["messages"][0]["content"],
+        )
+
+    def test_fundamental_assessment_repairs_a_contradictory_verdict_code_pair(self):
+        completions = _SequencedCompletions(
+            [
+                (
+                    '{"verdict":"BAD","reason_code":"NO_MATERIAL_RED_FLAG",'
+                    '"reason":"No material red flag was identified.",'
+                    '"evidence":["ANNOUNCEMENTS"]}'
+                ),
+                (
+                    '{"verdict":"GOOD","reason_code":"NO_MATERIAL_RED_FLAG",'
+                    '"reason":"No material red flag was identified.",'
+                    '"evidence":["ANNOUNCEMENTS"]}'
+                ),
+            ]
+        )
+        llm._local_client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=completions)
+        )
+
+        with patch.multiple(llm, USE_LOCAL_LLM=True, USE_REAL_LLM=False):
+            assessment = llm.assess_fundamentals("Judge these fundamentals")
+
+        self.assertEqual(assessment.verdict, "GOOD")
+        self.assertEqual(len(completions.requests), 2)
+
+    def test_fundamental_assessment_repairs_wrong_json_field_types(self):
+        completions = _SequencedCompletions(
+            [
+                (
+                    '{"verdict":"GOOD","reason_code":"NO_MATERIAL_RED_FLAG",'
+                    '"reason":42,"evidence":""}'
+                ),
+                (
+                    '{"verdict":"GOOD","reason_code":"NO_MATERIAL_RED_FLAG",'
+                    '"reason":"No material red flag was identified.",'
+                    '"evidence":[]}'
+                ),
+            ]
+        )
+        llm._local_client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=completions)
+        )
+
+        with patch.multiple(llm, USE_LOCAL_LLM=True, USE_REAL_LLM=False):
+            assessment = llm.assess_fundamentals("Judge these fundamentals")
+
+        self.assertEqual(assessment.reason, "No material red flag was identified.")
+        self.assertEqual(len(completions.requests), 2)
+
+    def test_fundamental_assessment_rejects_extra_model_generated_fields(self):
+        completions = _SequencedCompletions(
+            [
+                (
+                    '{"verdict":"GOOD","reason_code":"NO_MATERIAL_RED_FLAG",'
+                    '"reason":"No material red flag was identified.",'
+                    '"evidence":["YEARWISE_RETURNS"],"confidence":0.9}'
+                ),
+                (
+                    '{"verdict":"GOOD","reason_code":"NO_MATERIAL_RED_FLAG",'
+                    '"reason":"No material red flag was identified.",'
+                    '"evidence":["YEARWISE_RETURNS"]}'
+                ),
+            ]
+        )
+        llm._local_client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=completions)
+        )
+
+        with patch.multiple(llm, USE_LOCAL_LLM=True, USE_REAL_LLM=False):
+            assessment = llm.assess_fundamentals("Judge these fundamentals")
+
+        self.assertEqual(assessment.evidence, ("YEARWISE_RETURNS",))
+        self.assertEqual(len(completions.requests), 2)
+
     def test_active_model_config_describes_the_backend_that_will_run(self):
         with patch.multiple(llm, USE_LOCAL_LLM=True, USE_REAL_LLM=False):
             self.assertEqual(
