@@ -12,16 +12,40 @@ LOCAL_LLM_MODEL = os.environ.get(
 )
 LOCAL_LLM_MAX_TOKENS = int(os.environ.get("LOCAL_LLM_MAX_TOKENS", "400"))
 LOCAL_LLM_REASONING_EFFORT = os.environ.get("LOCAL_LLM_REASONING_EFFORT", "none")
+LOCAL_LLM_NO_THINK_DIRECTIVE = os.environ.get(
+    "LOCAL_LLM_NO_THINK_DIRECTIVE", "/no_think"
+)
 
 _call_count = 0
 _local_client = None
 
 
-def _call_local_llm(prompt):
+def _normalize_local_response(text, mode):
+    text = text or ""
+    if "</think>" in text:
+        text = text.split("</think>", 1)[1]
+    if "<answer>" in text:
+        text = text.split("<answer>", 1)[1]
+    if "</answer>" in text:
+        text = text.split("</answer>", 1)[0]
+    text = text.strip()
+
+    if mode == "check":
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith(("GOOD", "BAD")):
+                return line
+    return text
+
+
+def _call_local_llm(prompt, mode):
     global _local_client
     if _local_client is None:
         from openai import OpenAI
         _local_client = OpenAI(base_url=LOCAL_LLM_URL, api_key="not-needed")
+
+    if LOCAL_LLM_NO_THINK_DIRECTIVE:
+        prompt = f"{LOCAL_LLM_NO_THINK_DIRECTIVE}\n{prompt}"
 
     request = dict(
         model=LOCAL_LLM_MODEL,
@@ -34,7 +58,8 @@ def _call_local_llm(prompt):
     resp = _local_client.chat.completions.create(**request)
     message = resp.choices[0].message
     # Fall back in case a compatible server returns only a reasoning channel.
-    return message.content if message.content is not None else getattr(message, "reasoning", "")
+    text = message.content if message.content is not None else getattr(message, "reasoning", "")
+    return _normalize_local_response(text, mode)
 
 
 def call_llm(prompt, mode):
@@ -43,7 +68,7 @@ def call_llm(prompt, mode):
     _call_count += 1
 
     if USE_LOCAL_LLM:
-        return _call_local_llm(prompt)
+        return _call_local_llm(prompt, mode)
 
     if USE_REAL_LLM:
         import anthropic

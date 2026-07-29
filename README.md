@@ -62,23 +62,25 @@ OpenAI-compatible URL used here is `http://localhost:11434/v1`.
 Config (`.env`): `LOCAL_LLM_URL` (default `http://localhost:11434/v1`),
 `LOCAL_LLM_MODEL` (default `hf.co/alexsabaka/ODA-Fin-RL-8B-GGUF:Q4_K_M`),
 `LOCAL_LLM_MAX_TOKENS` (default `400`), and `LOCAL_LLM_REASONING_EFFORT`
-(default `none`).
+(default `none`). `LOCAL_LLM_NO_THINK_DIRECTIVE` defaults to `/no_think` for the
+configured Qwen3 model; set it empty for models that do not support that control token.
 
 **Why ODA-Fin-RL-8B instead of Fin-R1:** only `node_fundamental` and
 `node_sentiment` still use an LLM.
 [ODA-Fin-RL-8B](https://huggingface.co/OpenDataArena/ODA-Fin-RL-8B) is a March
-2026 Qwen3-8B finance fine-tune trained with SFT and GRPO. Its
-[paper](https://arxiv.org/abs/2603.07223) reports a 74.6% average across nine financial
-understanding, sentiment, and numerical-reasoning benchmarks versus 61.4% for Fin-R1,
+2026 Qwen3-8B finance fine-tune trained with SFT and GRPO. In the same nine-benchmark
+comparison, its [paper](https://arxiv.org/abs/2603.07223) reports a 74.6% average versus
+61.4% for Fin-R1 across financial understanding, sentiment, and numerical reasoning,
 including 83.4% on Financial PhraseBank and 80.4% on ConvFinQA. Those are
 publisher-reported benchmark results, not evidence that model-generated trade verdicts
 are safe; the deterministic technical and risk gates remain intentionally outside the
 LLM.
 
 Ollama enables Qwen3 thinking by default. This application only needs a short verdict,
-so `LOCAL_LLM_REASONING_EFFORT=none` prevents the reasoning channel from consuming the
-small output budget. Set it empty for an OpenAI-compatible server that does not support
-that request field.
+so the local profile sets both `LOCAL_LLM_REASONING_EFFORT=none` and the Qwen3
+`/no_think` prompt directive. `llm.py` also strips Qwen's `<think>`/`<answer>` wrappers
+and extracts the first `GOOD`/`BAD` line for check calls. Set either control empty for
+an OpenAI-compatible server or model that does not support it.
 
 ## Logging
 
