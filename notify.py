@@ -59,10 +59,10 @@ def send_email(subject: str, body: str, recipients: list[str] = None) -> None:
     log.info("sent email subject=%r to=%s", subject, recipients)
 
 
-def _slack_chunks(body: str) -> list[str]:
-    """Split on the blank-line boundaries format_symbol_section already puts between
-    records, so a chunk break never lands mid-record."""
-    sections = body.split("\n\n")
+def _slack_chunks(text: str) -> list[str]:
+    """Split on blank-line boundaries (callers put one between records/sections), so a
+    chunk break never lands mid-record."""
+    sections = text.split("\n\n")
     chunks = []
     current = ""
     for section in sections:
@@ -77,32 +77,32 @@ def _slack_chunks(body: str) -> list[str]:
     return chunks
 
 
-def send_slack(subject: str, body: str) -> None:
-    """Post a digest to Slack via an incoming webhook. Stub by default -- set
+def send_slack(text: str) -> None:
+    """Post a message to Slack via an incoming webhook. Stub by default -- set
     SLACK_ENABLED=1 and SLACK_WEBHOOK_URL to actually send.
 
-    Long bodies are split into multiple messages on record boundaries -- same
-    "stub by default, testable without real credentials" pattern as send_email.
+    `text` is posted as-is (Slack mrkdwn) -- callers build their own header/formatting,
+    since a webhook post has no separate subject line the way email does. Long text is
+    split into multiple messages on record boundaries, each one valid mrkdwn on its own
+    (a chunk break never lands inside a *bold* or ```code``` span).
     """
     if not SLACK_ENABLED:
-        log.info("SLACK_ENABLED=0, not sending. subject=%r\n%s", subject, body)
+        log.info("SLACK_ENABLED=0, not sending.\n%s", text)
         return
 
     if not SLACK_WEBHOOK_URL:
-        log.warning("send_slack called with no SLACK_WEBHOOK_URL, skipping. subject=%r", subject)
+        log.warning("send_slack called with no SLACK_WEBHOOK_URL, skipping.")
         return
 
-    chunks = _slack_chunks(body)
+    chunks = _slack_chunks(text)
     for i, chunk in enumerate(chunks):
-        header = f"*{subject}*" if i == 0 else f"*{subject}* (cont. {i + 1}/{len(chunks)})"
-        # Code-block wrapping keeps the fixed-width verdict/indicator lines aligned --
-        # Slack's mrkdwn doesn't otherwise preserve the log-style formatting.
-        text = f"{header}\n```{chunk}```"
-        payload = json.dumps({"text": text}).encode("utf-8")
+        if i > 0:
+            chunk = f"_(cont. {i + 1}/{len(chunks)})_\n{chunk}"
+        payload = json.dumps({"text": chunk}).encode("utf-8")
         req = urllib.request.Request(
             SLACK_WEBHOOK_URL, data=payload, headers={"Content-Type": "application/json"}
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             resp.read()
 
-    log.info("sent slack message subject=%r in %d chunk(s)", subject, len(chunks))
+    log.info("sent slack message in %d chunk(s)", len(chunks))

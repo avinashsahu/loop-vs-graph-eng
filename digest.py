@@ -73,16 +73,46 @@ def format_symbol_section(record):
     )
 
 
-def build_digest(run_id):
-    records = _load_records(run_id)
+_SLACK_STATUS_EMOJI = {"proposed": ":large_green_circle:", "flagged_for_review": ":warning:"}
+
+
+def _slack_technical_summary(verdict):
+    """The full technical_verdict string includes a per-timeframe breakdown dict --
+    useful in the full-detail email, too dense for a Slack line. Keep the verdict,
+    score, confluence, family breakdown, and RSI note; drop the per-timeframe tail."""
+    if not verdict:
+        return verdict
+    return verdict.split("; per-timeframe")[0]
+
+
+def format_symbol_section_slack(record):
+    emoji = _SLACK_STATUS_EMOJI.get(record["status"], "")
+    return "\n".join(
+        [
+            f"{emoji} *{record['symbol']}* ({record.get('company_name') or 'unknown'}) — _{record['status']}_",
+            f"*Technical:* {_slack_technical_summary(record.get('technical_verdict'))}",
+            f"*Fundamental:* {record.get('fundamental_verdict')}",
+            f"*Risk:* {record.get('risk_verdict')}",
+            f"*Sentiment:* {record.get('sentiment_verdict')}",
+            f">{record.get('proposal')}",
+        ]
+    )
+
+
+def _summarize(records):
     by_status = defaultdict(list)
     for record in records:
         by_status[record["status"]].append(record)
+    return (
+        by_status.get("proposed", []),
+        by_status.get("flagged_for_review", []),
+        len(by_status.get("aborted", [])),
+        len(records),
+    )
 
-    proposed = by_status.get("proposed", [])
-    flagged = by_status.get("flagged_for_review", [])
-    aborted_count = len(by_status.get("aborted", []))
-    total = len(records)
+
+def build_digest(run_id):
+    proposed, flagged, aborted_count, total = _summarize(_load_records(run_id))
 
     subject = (
         f"NSE Overnight Scan Digest -- {now_ist():%Y-%m-%d} -- "
@@ -101,11 +131,27 @@ def build_digest(run_id):
     return subject, body
 
 
+def build_slack_digest(run_id):
+    proposed, flagged, aborted_count, total = _summarize(_load_records(run_id))
+
+    header = (
+        f":bar_chart: *NSE Overnight Scan Digest* — {now_ist():%Y-%m-%d}\n"
+        f"Scanned *{total}* symbols: *{len(proposed)}* proposed, *{len(flagged)}* flagged, {aborted_count} aborted."
+    )
+
+    if not proposed and not flagged:
+        return header
+
+    sections = [format_symbol_section_slack(r) for r in proposed + flagged]
+    return header + "\n\n" + "\n\n".join(sections)
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("usage: uv run digest.py <run_id>")
         sys.exit(1)
 
-    subject, body = build_digest(sys.argv[1])
+    run_id = sys.argv[1]
+    subject, body = build_digest(run_id)
     send_email(subject, body)
-    send_slack(subject, body)
+    send_slack(build_slack_digest(run_id))
