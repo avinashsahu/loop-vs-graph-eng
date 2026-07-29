@@ -4,6 +4,7 @@ import time
 from nsemine.bin.scraper import get_request
 
 import cache
+from financial_results import get_financial_history
 from logging_config import setup_logging
 from market_time import now_ist_naive
 
@@ -124,7 +125,7 @@ def _extract_eps_pat(symbol, peer_data):
 
 
 def get_fundamental_snapshot(symbol: str) -> dict:
-    key = f"fundamentals_{symbol}_{now_ist_naive():%Y%m%d}"
+    key = f"fundamentals_v2_{symbol}_{now_ist_naive():%Y%m%d}"
     ttl_seconds = FUNDAMENTALS_CACHE_TTL_HOURS * 3600
 
     hit = cache.read(key, ttl_seconds)
@@ -140,6 +141,7 @@ def get_fundamental_snapshot(symbol: str) -> dict:
         "yearwise_returns": None,
         "peer_comparison_quarter": None,
         "peer_comparison": None,
+        "financial_history": None,
         "eps": None,
         "pat": None,
         "complete": True,
@@ -152,6 +154,7 @@ def get_fundamental_snapshot(symbol: str) -> dict:
         ("corp_actions", lambda: _get_corp_actions(symbol)),
         ("shareholding_pattern", lambda: _get_shareholding_pattern(symbol)),
         ("yearwise_returns", lambda: _get_yearwise_returns(symbol)),
+        ("financial_history", lambda: get_financial_history(symbol)),
     ):
         try:
             snapshot[field] = fetch()

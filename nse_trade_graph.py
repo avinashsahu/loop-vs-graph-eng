@@ -28,6 +28,10 @@ from fundamental_evidence import (
     PROMPT_VERSION,
     build_fundamental_evidence,
 )
+from fundamental_research import (
+    FUNDAMENTAL_POLICY_VERSION,
+    evaluate_fundamental_research,
+)
 from llm import (
     FUNDAMENTAL_SCHEMA_VERSION,
     active_model_config,
@@ -52,7 +56,7 @@ TECHNICAL_POLICY = ta_analysis.select_technical_policy(NSE_TECHNICAL_POLICY_ID)
 NSE_POLICY_VERSION = os.environ.get(
     "NSE_POLICY_VERSION",
     f"{NSE_TECHNICAL_POLICY_ID}+risk-atr-target-v3"
-    "+sentiment-volatility-v1+llm-prompts-v4",
+    "+sentiment-volatility-v1+fundamental-sector-v1+llm-prompts-v5",
 )
 
 log = setup_logging("nse")
@@ -245,25 +249,6 @@ def node_fundamental(state):
             state["symbol"]
         )
     snap = state["fundamental_snapshot"] or {}
-    eps, pat = snap.get("eps"), snap.get("pat")
-
-    if (isinstance(eps, (int, float)) and eps < 0) or (isinstance(pat, (int, float)) and pat < 0):
-        state["fundamental_verdict"] = f"REJECT: negative EPS/PAT (eps={eps}, pat={pat})"
-        state["fundamental_assessment"] = {
-            "verdict": "REJECT",
-            "reason_code": "PEER_OR_EARNINGS_WEAKNESS",
-            "summary": f"Negative EPS/PAT (eps={eps}, pat={pat}).",
-            "evidence_ids": ["EARNINGS_HARD_CHECK"],
-            "missing": [],
-        }
-        _set_decision_reason(
-            state,
-            "fundamental",
-            "PEER_OR_EARNINGS_WEAKNESS",
-        )
-        log.warning(state["fundamental_verdict"])
-        return "abort", state
-
     if not snap.get("complete", True):
         # One or more fetches failed (NSE rate-limit/block, transient error) -- judging a
         # prompt full of Nones isn't a real fundamental read, and silently defaulting to
@@ -332,27 +317,32 @@ def node_fundamental(state):
         _set_decision_reason(state, "fundamental", "INSUFFICIENT_EVIDENCE")
         return "flag_review", state
 
-    prompt = evidence.prompt()
     state["fundamental_prompt"] = {
         "prompt_version": PROMPT_VERSION,
         "evidence_version": EVIDENCE_VERSION,
         "schema_version": FUNDAMENTAL_SCHEMA_VERSION,
+        "policy_version": FUNDAMENTAL_POLICY_VERSION,
         "prompt_hash": evidence.prompt_hash,
         "evidence_hash": evidence.evidence_hash,
     }
-    assessment = assess_fundamentals(prompt, evidence.ids)
-    state["fundamental_assessment"] = assessment.to_dict()
-    state["fundamental_verdict"] = assessment.summary
+    decision = evaluate_fundamental_research(
+        evidence,
+        lambda qualitative_prompt, evidence_ids: assess_fundamentals(
+            qualitative_prompt, evidence_ids
+        ),
+    )
+    state["fundamental_assessment"] = decision.to_dict()
+    state["fundamental_verdict"] = decision.summary
     log.info("fundamental_assessment=%r", state["fundamental_assessment"])
 
-    if assessment.verdict == "PASS":
+    if decision.verdict == "PASS":
         return "risk", state
     _set_decision_reason(
         state,
         "fundamental",
-        assessment.reason_code,
+        decision.reason_code,
     )
-    if assessment.verdict == "REJECT":
+    if decision.verdict == "REJECT":
         return "abort", state
     return "flag_review", state
 

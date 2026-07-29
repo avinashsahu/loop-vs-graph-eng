@@ -11,6 +11,7 @@ import pandas as pd
 
 import nse_trade_graph
 from evaluation import EvaluationLedger
+from fundamental_research import FundamentalDecision
 from llm import FundamentalAssessment
 from shareholding import ShareholdingHistory, ShareholdingPeriod
 
@@ -65,7 +66,7 @@ class ScanJournalTests(unittest.TestCase):
 
 
 class FundamentalPromptTests(unittest.TestCase):
-    def test_prompt_excludes_delivery_and_uses_grounded_shareholding_ids(self):
+    def test_prompt_contains_only_grounded_qualitative_evidence(self):
         state = {
             "symbol": "ACE",
             "fundamental_snapshot": {
@@ -74,11 +75,42 @@ class FundamentalPromptTests(unittest.TestCase):
                 "eps": 10.0,
                 "pat": 100.0,
                 "corp_actions": [],
-                "corp_announcements": [],
+                "corp_announcements": [
+                    {
+                        "an_dt": "20-Jul-2026",
+                        "desc": "Outcome of board meeting",
+                        "attchmntText": "Routine quarterly results approved.",
+                    }
+                ],
                 "peer_comparison_quarter": "2026-06",
                 "peer_comparison": [
                     {"symbol": "ACE", "eps": 10.0, "pat": 100.0, "pe": 20.0}
                 ],
+                "financial_history": {
+                    "status": "ready",
+                    "profile": "banking_nbfc",
+                    "subtype": "bank",
+                    "periods": [
+                        {
+                            "period_end": f"{year}-{month_day}",
+                            "net_interest_income": 220.0 - index,
+                            "operating_profit": 150.0 - index,
+                            "provisions": 24.0 + index,
+                            "pat": 92.0 - index,
+                            "gross_npa_pct": 2.1 + index / 10,
+                            "net_npa_pct": 0.6 + index / 10,
+                            "return_on_assets_pct": 1.3 - index / 10,
+                        }
+                        for index, (year, month_day) in enumerate(
+                            (
+                                ("2026", "06-30"),
+                                ("2026", "03-31"),
+                                ("2025", "12-31"),
+                                ("2025", "09-30"),
+                            )
+                        )
+                    ],
+                },
             },
             "delivery_trend": {
                 "status": "ready",
@@ -147,8 +179,8 @@ class FundamentalPromptTests(unittest.TestCase):
                 return_value=FundamentalAssessment(
                     verdict="PASS",
                     reason_code="NO_MATERIAL_RED_FLAG",
-                    reason="No fundamental red flags.",
-                    evidence_ids=("SHAREHOLDING_2026-06-30",),
+                    reason="No qualitative red flags.",
+                    evidence_ids=("ANNOUNCEMENT_8D5543E864",),
                     missing=(),
                 ),
             ) as assess_fundamentals,
@@ -161,11 +193,11 @@ class FundamentalPromptTests(unittest.TestCase):
             result_state["fundamental_assessment"]["reason_code"],
             "NO_MATERIAL_RED_FLAG",
         )
-        self.assertIn("SHAREHOLDING_2026-06-30", prompt)
-        self.assertIn("government_qoq", prompt)
-        self.assertIn("other_public_4q", prompt)
-        self.assertIn('"peer_stale":false', prompt)
-        self.assertIn('"shareholding_stale":false', prompt)
+        self.assertIn("ANNOUNCEMENT_", prompt)
+        self.assertIn("Outcome of board meeting", prompt)
+        self.assertNotIn("SHAREHOLDING_", prompt)
+        self.assertNotIn("government_qoq", prompt)
+        self.assertNotIn("gross_npa_pct", prompt)
         self.assertNotIn("delivery", prompt.lower())
         self.assertNotIn("delivery_pct_rise_unconfirmed_by_volume", prompt)
 
@@ -208,7 +240,7 @@ class FundamentalPromptTests(unittest.TestCase):
                         "pat": 100.0,
                     },
                 }
-                assessment = FundamentalAssessment(
+                decision = FundamentalDecision(
                     verdict=verdict,
                     reason_code=reason_code,
                     reason=f"{verdict} reason.",
@@ -228,8 +260,8 @@ class FundamentalPromptTests(unittest.TestCase):
                     ),
                     patch.object(
                         nse_trade_graph,
-                        "assess_fundamentals",
-                        return_value=assessment,
+                        "evaluate_fundamental_research",
+                        return_value=decision,
                     ),
                 ):
                     route, result_state = nse_trade_graph.node_fundamental(state)

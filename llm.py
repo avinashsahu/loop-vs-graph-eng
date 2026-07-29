@@ -323,13 +323,14 @@ def _parse_fundamental_assessment(text, available_evidence_ids=()):
 
 
 def assess_fundamentals(prompt, available_evidence_ids=()):
-    """Return a compact typed assessment through the configured model adapter."""
+    """Classify bounded qualitative disclosures through the configured model adapter."""
     global _call_count
     _call_count += 1
 
     classification_prompt = (
-        "Follow the supplied PASS/REVIEW/REJECT policy. Cite only supplied evidence IDs "
-        "and do not infer missing facts.\n\n"
+        "Interpret only the supplied qualitative disclosures under the stated "
+        "PASS/REVIEW/REJECT policy. Numeric checks and final policy are outside your "
+        "role. Cite only supplied evidence IDs and do not infer missing facts.\n\n"
         f"{prompt}"
     )
     if USE_LOCAL_LLM:
