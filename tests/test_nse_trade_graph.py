@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -168,6 +169,80 @@ class FundamentalPromptTests(unittest.TestCase):
         self.assertNotIn("delivery", prompt.lower())
         self.assertNotIn("delivery_pct_rise_unconfirmed_by_volume", prompt)
 
+    def test_model_reject_aborts_while_review_remains_visible(self):
+        history = ShareholdingHistory(
+            symbol="ACE",
+            periods=(),
+            complete=True,
+        )
+        evidence = SimpleNamespace(
+            payload={"coverage": {"complete": True}},
+            ids=("EVIDENCE_1",),
+            prompt=lambda: "{}",
+            prompt_hash="prompt-hash",
+            evidence_hash="evidence-hash",
+        )
+        cases = (
+            (
+                "REJECT",
+                "PEER_OR_EARNINGS_WEAKNESS",
+                "abort",
+                nse_trade_graph.node_abort,
+                "aborted",
+            ),
+            (
+                "REVIEW",
+                "INSUFFICIENT_EVIDENCE",
+                "flag_review",
+                nse_trade_graph.node_flag_review,
+                "flagged_for_review",
+            ),
+        )
+        for verdict, reason_code, expected_route, terminal_node, status in cases:
+            with self.subTest(verdict=verdict):
+                state = {
+                    "symbol": "ACE",
+                    "fundamental_snapshot": {
+                        "complete": True,
+                        "eps": 10.0,
+                        "pat": 100.0,
+                    },
+                }
+                assessment = FundamentalAssessment(
+                    verdict=verdict,
+                    reason_code=reason_code,
+                    reason=f"{verdict} reason.",
+                    evidence_ids=("EVIDENCE_1",),
+                    missing=(),
+                )
+                with (
+                    patch.object(
+                        nse_trade_graph,
+                        "get_shareholding_history",
+                        return_value=history,
+                    ),
+                    patch.object(
+                        nse_trade_graph,
+                        "build_fundamental_evidence",
+                        return_value=evidence,
+                    ),
+                    patch.object(
+                        nse_trade_graph,
+                        "assess_fundamentals",
+                        return_value=assessment,
+                    ),
+                ):
+                    route, result_state = nse_trade_graph.node_fundamental(state)
+
+                self.assertEqual(route, expected_route)
+                _, result_state = terminal_node(result_state)
+                self.assertEqual(result_state["disposition"], verdict)
+                self.assertEqual(result_state["status"], status)
+                self.assertEqual(
+                    result_state["decision_reason"],
+                    {"stage": "fundamental", "code": reason_code},
+                )
+
     def test_fetch_stage_does_not_download_fundamentals_before_technical_passes(self):
         state = {
             "symbol": "ACE",
@@ -299,6 +374,11 @@ class MarketSnapshotRecordTests(unittest.TestCase):
             "reward_risk_ratio": 2.0,
             "iters": 1,
             "status": "aborted",
+            "disposition": "REJECT",
+            "decision_reason": {
+                "stage": "technical",
+                "code": "INVALID_MARKET_DATA",
+            },
             "proposal": None,
             "market_snapshot": snapshot_metadata,
         }
@@ -326,6 +406,11 @@ class MarketSnapshotRecordTests(unittest.TestCase):
             "reward_risk_ratio": 2.0,
             "iters": 1,
             "status": "aborted",
+            "disposition": "REJECT",
+            "decision_reason": {
+                "stage": "technical",
+                "code": "INVALID_MARKET_DATA",
+            },
             "proposal": None,
         }
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -343,6 +428,16 @@ class MarketSnapshotRecordTests(unittest.TestCase):
 
             ledger = EvaluationLedger(evaluation_path)
             self.assertEqual(ledger.status_counts(), {"aborted": 1})
+            self.assertEqual(
+                ledger.calibration_report()["decisions"]["reason_codes"],
+                [
+                    {
+                        "stage": "technical",
+                        "code": "INVALID_MARKET_DATA",
+                        "count": 1,
+                    }
+                ],
+            )
 
 
 class RiskNodeTests(unittest.TestCase):
@@ -365,7 +460,7 @@ class RiskNodeTests(unittest.TestCase):
                 "5": pd.DataFrame(
                     {
                         "datetime": [pd.Timestamp("2026-07-29 12:00:00")],
-                        "low": [99.0],
+                        "low": [80.5],
                         "high": [101.0],
                     }
                 )
@@ -396,6 +491,63 @@ class RiskNodeTests(unittest.TestCase):
         self.assertEqual(result_state["risk_plan"]["max_loss_at_stop"], 1_000.0)
         self.assertIn("max loss at stop", result_state["risk_verdict"])
         self.assertIn("target=120.00", result_state["risk_verdict"])
+        self.assertEqual(
+            result_state["circuit_context"]["policy"],
+            "current_entry_proximity",
+        )
+        self.assertTrue(
+            result_state["circuit_context"]["lower_band_touched_today"]
+        )
+        self.assertFalse(
+            result_state["circuit_context"]["current_near_lower_circuit"]
+        )
+
+        near_circuit_state = {
+            **state,
+            "quote": {**state["quote"], "change": -19.0},
+            "hist_multi": {
+                "5": pd.DataFrame(
+                    {
+                        "datetime": [
+                            pd.Timestamp("2026-07-28 15:25:00")
+                        ],
+                        "low": [80.5],
+                        "high": [101.0],
+                    }
+                )
+            },
+            "risk_plan": None,
+        }
+        with patch.object(
+            nse_trade_graph,
+            "now_ist",
+            return_value=datetime(
+                2026, 7, 29, 12, 30, tzinfo=ZoneInfo("Asia/Kolkata")
+            ),
+        ):
+            route, rejected_state = nse_trade_graph.node_risk(
+                near_circuit_state
+            )
+        self.assertEqual(route, "abort")
+        self.assertEqual(
+            rejected_state["decision_reason"],
+            {
+                "stage": "risk",
+                "code": "LOWER_CIRCUIT_ENTRY_PROXIMITY",
+            },
+        )
+        self.assertFalse(
+            rejected_state["circuit_context"][
+                "same_day_intraday_context_available"
+            ]
+        )
+        self.assertFalse(
+            rejected_state["circuit_context"]["lower_band_touched_today"]
+        )
+        self.assertIn(
+            "same-day intraday context unavailable",
+            rejected_state["risk_verdict"],
+        )
 
     def test_proposal_states_entry_stop_capital_and_maximum_loss(self):
         state = {

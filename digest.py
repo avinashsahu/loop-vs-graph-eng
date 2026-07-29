@@ -60,6 +60,12 @@ def format_symbol_section(record):
         [
             f"=== {record['symbol']} ({record.get('company_name') or 'unknown'}) -- {record['status']} ===",
             f"Timestamp: {record['timestamp']}",
+            (
+                "Decision: "
+                f"{record.get('disposition') or 'unknown'} "
+                f"({(record.get('decision_reason') or {}).get('stage') or 'unknown'}/"
+                f"{(record.get('decision_reason') or {}).get('code') or 'unknown'})"
+            ),
             "",
             "Technical indicators:",
             _format_indicators(record.get("technical_indicators")),
@@ -90,6 +96,11 @@ def format_symbol_section_slack(record):
     return "\n".join(
         [
             f"{emoji} *{record['symbol']}* ({record.get('company_name') or 'unknown'}) — _{record['status']}_",
+            (
+                f"*Decision:* {record.get('disposition') or 'unknown'} "
+                f"(`{(record.get('decision_reason') or {}).get('stage') or 'unknown'}/"
+                f"{(record.get('decision_reason') or {}).get('code') or 'unknown'}`)"
+            ),
             f"*Technical:* {_slack_technical_summary(record.get('technical_verdict'))}",
             f"*Fundamental:* {record.get('fundamental_verdict')}",
             f"*Risk:* {record.get('risk_verdict')}",

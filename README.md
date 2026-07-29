@@ -120,19 +120,19 @@ Each run prints the answer/verdict per iteration and the final result.
 A real branching use case for the graph style: propose (never execute) an NSE stock trade, gated behind four independent checks that each fail differently.
 
 ```
-fetch -> technical -> [BAD] -> abort (no retry -- see below)
+fetch -> technical -> [REJECT] -> abort (no retry -- see below)
               |
             [GOOD]
               v
-          fundamental -> [hard BAD: negative EPS/PAT] -> abort (no retry, deterministic)
-              |          -> [soft BAD: LLM read] -> flag_review
-            [GOOD]
+          fundamental -> [REJECT] -> abort (model or deterministic)
+              |          -> [REVIEW] -> flag_review
+            [PASS]
               v
-            risk -> [BAD] -> abort (no retry — bad risk config or price near circuit limit)
+            risk -> [REJECT] -> abort (no retry — bad risk config or current price near circuit)
               |
             [GOOD]
               v
-          sentiment -> [BAD] -> flag_review (manual review, no proposal)
+          sentiment -> [REVIEW] -> flag_review (manual review, no proposal)
               |
             [GOOD]
               v
@@ -150,11 +150,13 @@ fetch -> technical -> [BAD] -> abort (no retry -- see below)
   - **Volatility-adaptive RSI bands.** The overbought/oversold cutoff isn't Wilder's fixed 70/30 (a 1978 convention, never empirically validated) — it widens or narrows with the daily ATR-as-%-of-price: 35/65 in low volatility, 30/70 in the classic range, 20/80 in high volatility. These specific cutoffs are a reasonable starting heuristic, not yet validated against enough of this app's own decisions; `evaluation.py` now measures them, but useful calibration needs a materially larger sample.
   - **Confluence across signal roles, not across timeframes.** Trend and momentum are each computed at four timeframes, but those readings are correlated because they derive from price. Each role is collapsed to one daily-heavy weighted score. A `GOOD` result requires both engaged trend and momentum to be positive; RSI is a neutral-or-negative extreme penalty, not a third bullish vote. This is rule-level confirmation, not statistical independence.
 
-  `nse_data.get_market_snapshot` is the completed-candle seam. During market hours it excludes today's unfinished daily candle and the provider's latest intraday tail; for 15 minutes after 15:30 it keeps the same conservative policy while NSE's historical endpoint settles. The subsequent closed-session request uses a distinct key, fetches again, and then caches the completed session for 24 hours. Each trade-log record retains per-timeframe source, fetch timestamp, cache hit/miss, TTL, completion drops, and latest completed bar. A `BAD` verdict aborts immediately, no retry — a retry inside the same cache phase would just re-score identical numbers. Deliberately not split into one node per timeframe — this project only splits nodes when the retry/remediation path genuinely differs, and all four timeframes feed one score either way.
+  `nse_data.get_market_snapshot` is the completed-candle seam. During market hours it excludes today's unfinished daily candle and the provider's latest intraday tail; for 15 minutes after 15:30 it keeps the same conservative policy while NSE's historical endpoint settles. The subsequent closed-session request uses a distinct key, fetches again, and then caches the completed session for 24 hours. Each trade-log record retains per-timeframe source, fetch timestamp, cache hit/miss, TTL, completion drops, and latest completed bar. A `REJECT` verdict aborts immediately, no retry — a retry inside the same cache phase would just re-score identical numbers. Deliberately not split into one node per timeframe — this project only splits nodes when the retry/remediation path genuinely differs, and all four timeframes feed one score either way.
 - **fundamental** — fetched only for symbols that pass the technical gate, avoiding unnecessary NSE calls for every technical rejection. `fundamentals.get_fundamental_snapshot` pulls corporate announcements, corporate actions, yearwise returns, and peer comparison data via NSE's `NextApi`. NSE's shallow quote shareholding response is supplemented by Regulation 31 XBRL history warmed into Aerospike: FII, DII, government, promoter, and other-public percentages are derived from reconciled share counts across five consecutive quarters. QoQ and four-quarter changes plus trend labels are deterministic for all five categories. The compact prompt contains only typed facts with stable evidence IDs; delivery and raw table dumps are excluded. Source ages are calculated as of the scan date; peer data older than 200 days or shareholding data older than 160 days forces `REVIEW`. Model output uses `PASS` / `REVIEW` / `REJECT`, and cited IDs are checked against the supplied input before a result can proceed. A missing or expired live manifest is explicitly pending and enqueued; scans do not make an NSE manifest or XBRL request.
-- **risk** — deterministic code, not an LLM call. `position_risk.size_position` places an initial stop at `ATR14 * NSE_ATR_STOP_MULTIPLE` below the estimated entry and a profit target at `NSE_REWARD_RISK_RATIO` times that stop distance above entry (default 2R), then caps shares by both `NSE_MAX_LOSS_PCT` of principal and `NSE_MAX_ALLOCATION_PCT` of principal. Zero-share plans, invalid ATR/input, non-positive stops, stops below the lower circuit, and prices near either circuit abort explicitly. Proposal text includes entry, stop, target, capital, planned maximum loss, and planned target profit.
+- **risk** — deterministic code, not an LLM call. `position_risk.size_position` places an initial stop at `ATR14 * NSE_ATR_STOP_MULTIPLE` below the estimated entry and a profit target at `NSE_REWARD_RISK_RATIO` times that stop distance above entry (default 2R), then caps shares by both `NSE_MAX_LOSS_PCT` of principal and `NSE_MAX_ALLOCATION_PCT` of principal. Zero-share plans, invalid ATR/input, non-positive stops, stops below the lower circuit, and a **current reconstructed entry price** within 2% of either circuit abort explicitly. An earlier same-day intraday circuit-band touch is retained as `circuit_context` but does not reject a price that has recovered; when no same-day bars are available the context is explicitly unavailable rather than borrowing the prior daily candle. Proposal text includes entry, stop, target, capital, planned maximum loss, and planned target profit.
 - **sentiment** — deterministic volatility-aware entry gate, not an LLM call. It compares the absolute daily move with twice daily ATR as a percentage of entry, bounded to a 3%-10% review threshold. The old prompt supplied a sector name but no sector return, which invited unsupported claims such as “within sector range.”
 - **propose** — never calls a broker. Only ever produces a proposal string for a human to review and act on manually.
+
+Every terminal record carries a typed `disposition` (`PROPOSE`, `REVIEW`, or `REJECT`) plus `decision_reason.stage` and `decision_reason.code`. `REJECT` always maps to the non-actionable `aborted` status; `REVIEW` remains `flagged_for_review`. Digests render these fields directly, and the evaluation ledger groups reason codes without parsing verdict prose.
 
 Known data quirks:
 - `nsemine`'s `get_stock_live_quotes` returns `upper_circuit` and `lower_circuit` swapped (confirmed against the raw NSE `priceInfo.priceBand` field, which is always `"lower-upper"`). `node_risk` in `nse_trade_graph.py` corrects for this on read — don't trust those two field names at face value if you use `nsemine` elsewhere.

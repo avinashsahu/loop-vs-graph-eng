@@ -46,10 +46,14 @@ EVALUATION_DB_PATH = os.environ.get("EVALUATION_DB_PATH", "evaluation.db")
 NSE_SCAN_LABEL = os.environ.get("NSE_SCAN_LABEL", "manual")
 NSE_POLICY_VERSION = os.environ.get(
     "NSE_POLICY_VERSION",
-    "technical-confluence-v1+risk-atr-target-v2+sentiment-volatility-v1+llm-prompts-v4",
+    "technical-confluence-v1+risk-atr-target-v3+sentiment-volatility-v1+llm-prompts-v4",
 )
 
 log = setup_logging("nse")
+
+
+def _set_decision_reason(state, stage, code):
+    state["decision_reason"] = {"stage": stage, "code": code}
 
 
 def _record_scan_event(event):
@@ -137,7 +141,10 @@ def node_fetch(state):
         "name", "sector", "changepct", "previous_close", "change", "upper_circuit", "lower_circuit",
     )
     if not state["quote"] or not all(k in state["quote"] for k in required_quote_keys):
-        state["risk_verdict"] = f"BAD: quote fetch failed or malformed for {state['symbol']}"
+        state["risk_verdict"] = (
+            f"REJECT: quote fetch failed or malformed for {state['symbol']}"
+        )
+        _set_decision_reason(state, "market_data", "QUOTE_FETCH_FAILED")
         log.warning(state["risk_verdict"])
         return "abort", state
 
@@ -174,8 +181,9 @@ def node_technical(state):
 
     if assessment.status != "ready":
         state["technical_verdict"] = (
-            f"BAD invalid_data: {', '.join(assessment.reason_codes)}"
+            f"REJECT invalid_data: {', '.join(assessment.reason_codes)}"
         )
+        _set_decision_reason(state, "technical", "INVALID_MARKET_DATA")
         log.warning(
             "iter=%d technical_verdict=%r",
             state["iters"],
@@ -184,8 +192,9 @@ def node_technical(state):
         return "abort", state
 
     result = assessment.evidence
+    verdict_label = "GOOD" if result["verdict"] == "GOOD" else "REJECT"
     state["technical_verdict"] = (
-        f"{result['verdict']} (score={result['score']}, confluence={result['confluence_ratio']} "
+        f"{verdict_label} (score={result['score']}, confluence={result['confluence_ratio']} "
         f"of {result['engaged_families']} engaged families): families={result['families']}; "
         f"daily RSI14={result['daily_rsi']} {result['rsi_note']} (adaptive band={result['rsi_band']}); "
         f"per-timeframe {result['breakdown']}"
@@ -194,6 +203,7 @@ def node_technical(state):
 
     if result["verdict"] == "GOOD":
         return "fundamental", state
+    _set_decision_reason(state, "technical", "TECHNICAL_CONFLUENCE_FAILED")
     return "abort", state
 
 
@@ -214,6 +224,11 @@ def node_fundamental(state):
             "evidence_ids": ["EARNINGS_HARD_CHECK"],
             "missing": [],
         }
+        _set_decision_reason(
+            state,
+            "fundamental",
+            "PEER_OR_EARNINGS_WEAKNESS",
+        )
         log.warning(state["fundamental_verdict"])
         return "abort", state
 
@@ -230,6 +245,7 @@ def node_fundamental(state):
             "evidence_ids": [],
             "missing": ["fundamental_snapshot"],
         }
+        _set_decision_reason(state, "fundamental", "INSUFFICIENT_EVIDENCE")
         log.warning(state["fundamental_verdict"])
         return "flag_review", state
 
@@ -249,6 +265,7 @@ def node_fundamental(state):
             "evidence_ids": [],
             "missing": ["shareholding_history"],
         }
+        _set_decision_reason(state, "fundamental", "INSUFFICIENT_EVIDENCE")
         return "flag_review", state
 
     state["shareholding_history"] = asdict(history)
@@ -263,6 +280,7 @@ def node_fundamental(state):
             "evidence_ids": [],
             "missing": ["shareholding_history"],
         }
+        _set_decision_reason(state, "fundamental", "INSUFFICIENT_EVIDENCE")
         return "flag_review", state
 
     evidence = build_fundamental_evidence(state["symbol"], snap, history)
@@ -279,6 +297,7 @@ def node_fundamental(state):
             "evidence_ids": [],
             "missing": missing,
         }
+        _set_decision_reason(state, "fundamental", "INSUFFICIENT_EVIDENCE")
         return "flag_review", state
 
     prompt = evidence.prompt()
@@ -296,6 +315,13 @@ def node_fundamental(state):
 
     if assessment.verdict == "PASS":
         return "risk", state
+    _set_decision_reason(
+        state,
+        "fundamental",
+        assessment.reason_code,
+    )
+    if assessment.verdict == "REJECT":
+        return "abort", state
     return "flag_review", state
 
 
@@ -304,6 +330,7 @@ def node_risk(state):
     # nsemine's upper_circuit/lower_circuit fields are swapped — correct on read.
     lower_circuit = quote["upper_circuit"]
     upper_circuit = quote["lower_circuit"]
+    price = quote["previous_close"] + quote["change"]
 
     # Compute today's low/high from the 5-minute bars (5 min TTL, refreshes through the
     # day) rather than the daily bar's row (cached until IST midnight -- its low/high
@@ -312,26 +339,61 @@ def node_risk(state):
     today = now_ist().date()
     intraday_5m = state["hist_multi"]["5"]
     today_bars = intraday_5m[intraday_5m["datetime"].dt.date == today]
-    day_low = today_bars["low"].min() if not today_bars.empty else state["hist"].iloc[-1]["low"]
-    day_high = today_bars["high"].max() if not today_bars.empty else state["hist"].iloc[-1]["high"]
+    intraday_context_available = not today_bars.empty
+    day_low = today_bars["low"].min() if intraday_context_available else None
+    day_high = today_bars["high"].max() if intraday_context_available else None
+    lower_band = lower_circuit * 1.02
+    upper_band = upper_circuit * 0.98
+    intraday_note = (
+        f"same-day low={day_low}, high={day_high}"
+        if intraday_context_available
+        else "same-day intraday context unavailable"
+    )
+    state["circuit_context"] = {
+        "policy": "current_entry_proximity",
+        "current_price": price,
+        "lower_circuit": lower_circuit,
+        "upper_circuit": upper_circuit,
+        "same_day_intraday_context_available": intraday_context_available,
+        "current_near_lower_circuit": bool(price and price <= lower_band),
+        "current_near_upper_circuit": bool(price and price >= upper_band),
+        "lower_band_touched_today": bool(
+            intraday_context_available and day_low <= lower_band
+        ),
+        "upper_band_touched_today": bool(
+            intraday_context_available and day_high >= upper_band
+        ),
+    }
 
-    if day_low <= lower_circuit * 1.02:
-        state["risk_verdict"] = f"BAD: price near lower circuit ({day_low} vs {lower_circuit})"
-        log.warning(state["risk_verdict"])
-        return "abort", state
-
-    if day_high >= upper_circuit * 0.98:
-        state["risk_verdict"] = f"BAD: price near upper circuit ({day_high} vs {upper_circuit}) -- likely unfillable"
-        log.warning(state["risk_verdict"])
-        return "abort", state
-
-    # quote["open"] is the session's opening print, fixed all day -- not what you'd
-    # actually pay. get_stock_live_quotes exposes no live/last-price field at all, so
-    # reconstruct it: previous_close + change (verified against real data: matches the
-    # actual last-traded price seen elsewhere in the same quote response).
-    price = quote["previous_close"] + quote["change"]
     if not price or price <= 0:
-        state["risk_verdict"] = f"BAD: no usable price for sizing (price={price})"
+        state["risk_verdict"] = f"REJECT: no usable price for sizing (price={price})"
+        _set_decision_reason(state, "risk", "INVALID_ENTRY_PRICE")
+        log.warning(state["risk_verdict"])
+        return "abort", state
+
+    if price <= lower_band:
+        state["risk_verdict"] = (
+            "REJECT: current entry price is near the lower circuit "
+            f"({price} vs {lower_circuit}); {intraday_note}"
+        )
+        _set_decision_reason(
+            state,
+            "risk",
+            "LOWER_CIRCUIT_ENTRY_PROXIMITY",
+        )
+        log.warning(state["risk_verdict"])
+        return "abort", state
+
+    if price >= upper_band:
+        state["risk_verdict"] = (
+            "REJECT: current entry price is near the upper circuit "
+            f"({price} vs {upper_circuit}); {intraday_note}"
+        )
+        _set_decision_reason(
+            state,
+            "risk",
+            "UPPER_CIRCUIT_ENTRY_PROXIMITY",
+        )
         log.warning(state["risk_verdict"])
         return "abort", state
 
@@ -346,14 +408,20 @@ def node_risk(state):
     )
     state["risk_plan"] = plan.to_dict()
     if isinstance(plan, position_risk.RiskRejection):
-        state["risk_verdict"] = f"BAD: {plan.reason_code}: {plan.message}"
+        state["risk_verdict"] = f"REJECT: {plan.reason_code}: {plan.message}"
+        _set_decision_reason(state, "risk", plan.reason_code)
         log.warning(state["risk_verdict"])
         return "abort", state
 
     if plan.stop_price <= lower_circuit:
         state["risk_verdict"] = (
-            f"BAD: ATR stop {plan.stop_price:.2f} is at/below lower circuit "
+            f"REJECT: ATR stop {plan.stop_price:.2f} is at/below lower circuit "
             f"{lower_circuit:.2f}"
+        )
+        _set_decision_reason(
+            state,
+            "risk",
+            "STOP_AT_OR_BELOW_LOWER_CIRCUIT",
         )
         log.warning(state["risk_verdict"])
         return "abort", state
@@ -367,7 +435,10 @@ def node_risk(state):
         f"{plan.max_loss_at_stop:.2f}/{plan.risk_budget:.2f} budget, "
         f"capital={plan.capital_required:.2f}/{plan.allocation_cap:.2f} cap, "
         f"binding={plan.binding_constraint}, lower_circuit={lower_circuit}, "
-        f"upper_circuit={upper_circuit}"
+        f"upper_circuit={upper_circuit}, circuit_policy=current_entry_proximity, "
+        f"intraday_context_available={intraday_context_available}, "
+        f"earlier_lower_touch={state['circuit_context']['lower_band_touched_today']}, "
+        f"earlier_upper_touch={state['circuit_context']['upper_band_touched_today']}"
     )
     log.info(state["risk_verdict"])
     return "sentiment", state
@@ -382,27 +453,33 @@ def node_sentiment(state):
     )
     threshold_pct = min(10.0, max(3.0, 2.0 * atr_pct))
     if not all(math.isfinite(value) for value in (change_pct, atr_pct, threshold_pct)):
-        verdict = "BAD: invalid daily-move or ATR context"
+        verdict = "REVIEW: invalid daily-move or ATR context"
+        reason_code = "INVALID_VOLATILITY_CONTEXT"
     elif abs(change_pct) > threshold_pct:
         verdict = (
-            f"BAD: daily move {change_pct:+.2f}% exceeds volatility-aware "
+            f"REVIEW: daily move {change_pct:+.2f}% exceeds volatility-aware "
             f"{threshold_pct:.2f}% review threshold"
         )
+        reason_code = "EXCESSIVE_DAILY_MOVE"
     else:
         verdict = (
             f"GOOD: daily move {change_pct:+.2f}% is within volatility-aware "
             f"{threshold_pct:.2f}% review threshold"
         )
+        reason_code = None
     state["sentiment_verdict"] = verdict
     log.info("sentiment_verdict=%r", verdict)
 
     if verdict.startswith("GOOD"):
         return "propose", state
+    _set_decision_reason(state, "sentiment", reason_code)
     return "flag_review", state
 
 
 def node_propose(state):
     state["status"] = "proposed"
+    state["disposition"] = "PROPOSE"
+    _set_decision_reason(state, "decision", "ALL_GATES_PASSED")
     plan = state["risk_plan"]
     actual_loss_pct = plan["max_loss_at_stop"] / state["principal"] * 100
     state["proposal"] = (
@@ -422,18 +499,27 @@ def node_propose(state):
 
 def node_flag_review(state):
     state["status"] = "flagged_for_review"
-    # fundamental and sentiment are the only two checks that route here; whichever one
-    # actually ran and came back BAD is the one worth surfacing.
+    state["disposition"] = "REVIEW"
+    if not state.get("decision_reason"):
+        _set_decision_reason(state, "decision", "MANUAL_REVIEW_REQUIRED")
+    # Fundamental and sentiment are the only two checks that route here; surface the
+    # one that explicitly requested human inspection.
     if state.get("sentiment_verdict"):
         check, verdict = "sentiment", state["sentiment_verdict"]
     else:
         check, verdict = "fundamental", state["fundamental_verdict"]
-    state["proposal"] = f"FLAGGED FOR MANUAL REVIEW: {check} check failed for {state['symbol']} — {verdict!r}"
+    state["proposal"] = (
+        f"FLAGGED FOR MANUAL REVIEW: {check} check requires inspection for "
+        f"{state['symbol']} — {verdict!r}"
+    )
     return "log", state
 
 
 def node_abort(state):
     state["status"] = "aborted"
+    state["disposition"] = "REJECT"
+    if not state.get("decision_reason"):
+        _set_decision_reason(state, "decision", "UNCLASSIFIED_REJECTION")
     state["proposal"] = None
     return "log", state
 
@@ -469,12 +555,15 @@ def build_record(state):
         "eps": (state.get("fundamental_snapshot") or {}).get("eps"),
         "pat": (state.get("fundamental_snapshot") or {}).get("pat"),
         "delivery_trend": state.get("delivery_trend"),
+        "circuit_context": state.get("circuit_context"),
         "model_config": active_model_config(),
         "policy_version": NSE_POLICY_VERSION,
         "risk_plan": state.get("risk_plan"),
         "risk_verdict": state.get("risk_verdict"),
         "sentiment_verdict": state.get("sentiment_verdict"),
         "status": state["status"],
+        "disposition": state.get("disposition"),
+        "decision_reason": state.get("decision_reason"),
         "proposal": state["proposal"],
     }
 
@@ -529,6 +618,7 @@ def run(
         "market_snapshot": None,
         "fundamental_snapshot": None,
         "delivery_trend": None,
+        "circuit_context": None,
         "technical_indicators": None,
         "technical_assessment": None,
         "technical_verdict": None,
@@ -541,6 +631,8 @@ def run(
         "risk_verdict": None,
         "sentiment_verdict": None,
         "status": None,
+        "disposition": None,
+        "decision_reason": None,
         "proposal": None,
         "decision_id": None,
     }

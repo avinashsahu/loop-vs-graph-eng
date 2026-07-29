@@ -72,6 +72,9 @@ class EvaluationLedger:
                     scan_label TEXT NOT NULL,
                     symbol TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    disposition TEXT,
+                    reason_stage TEXT,
+                    reason_code TEXT,
                     entry_price REAL,
                     stop_price REAL,
                     target_price REAL,
@@ -98,6 +101,18 @@ class EvaluationLedger:
             }
             if "model_name" not in decision_columns:
                 connection.execute("ALTER TABLE decisions ADD COLUMN model_name TEXT")
+            if "disposition" not in decision_columns:
+                connection.execute(
+                    "ALTER TABLE decisions ADD COLUMN disposition TEXT"
+                )
+            if "reason_stage" not in decision_columns:
+                connection.execute(
+                    "ALTER TABLE decisions ADD COLUMN reason_stage TEXT"
+                )
+            if "reason_code" not in decision_columns:
+                connection.execute(
+                    "ALTER TABLE decisions ADD COLUMN reason_code TEXT"
+                )
             if "model_backend" not in decision_columns:
                 connection.execute(
                     "ALTER TABLE decisions ADD COLUMN model_backend TEXT"
@@ -322,13 +337,14 @@ class EvaluationLedger:
                 """
                 INSERT OR IGNORE INTO decisions (
                     decision_id, decision_timestamp, decision_date, scan_label,
-                    symbol, status, entry_price, stop_price, target_price, shares,
-                    technical_score, technical_verdict, fundamental_verdict,
-                    risk_verdict, sentiment_verdict, model_backend, model_name,
-                    llm_max_tokens, fundamental_llm_max_tokens, policy_version,
-                    risk_plan_valid, raw_record_json, created_at
+                    symbol, status, disposition, reason_stage, reason_code,
+                    entry_price, stop_price, target_price, shares, technical_score,
+                    technical_verdict, fundamental_verdict, risk_verdict,
+                    sentiment_verdict, model_backend, model_name, llm_max_tokens,
+                    fundamental_llm_max_tokens, policy_version, risk_plan_valid,
+                    raw_record_json, created_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -338,6 +354,9 @@ class EvaluationLedger:
                     scan_label,
                     symbol,
                     str(record["status"]),
+                    record.get("disposition"),
+                    (record.get("decision_reason") or {}).get("stage"),
+                    (record.get("decision_reason") or {}).get("code"),
                     risk_plan.get("entry_price"),
                     risk_plan.get("stop_price"),
                     risk_plan.get("target_price"),
@@ -1042,6 +1061,15 @@ class EvaluationLedger:
                 ORDER BY policy_version
                 """
             ).fetchall()
+            reason_codes = connection.execute(
+                """
+                SELECT reason_stage, reason_code, COUNT(*) AS count
+                FROM decisions
+                WHERE reason_code IS NOT NULL
+                GROUP BY reason_stage, reason_code
+                ORDER BY reason_stage, reason_code
+                """
+            ).fetchall()
 
         by_horizon: dict[int, list[sqlite3.Row]] = {}
         score_bands: dict[
@@ -1103,6 +1131,14 @@ class EvaluationLedger:
                 "raw_evaluable": raw_evaluable,
                 "repeated_evaluable": raw_evaluable - evaluable,
                 "canonical": [dict(row) for row in canonical_decisions],
+                "reason_codes": [
+                    {
+                        "stage": row["reason_stage"],
+                        "code": row["reason_code"],
+                        "count": int(row["count"]),
+                    }
+                    for row in reason_codes
+                ],
                 "model_configs": [
                     {
                         "backend": row["model_backend"],
