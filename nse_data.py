@@ -23,6 +23,7 @@ _TIMEFRAME_LOOKBACK_DAYS = {
     15: 7,
     5: 3,
 }
+MARKET_COMPLETION_POLICY_ID = "nse-completed-bars-v1"
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class MarketSnapshot:
         return {
             "symbol": self.symbol,
             "observed_at": self.observed_at,
+            "completion_policy_id": MARKET_COMPLETION_POLICY_ID,
             "timeframes": self.provenance,
         }
 

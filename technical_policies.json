@@ -12,6 +12,11 @@
       "momentum",
       "rsi"
     ],
+    "required_positive_families": [
+      "trend",
+      "momentum"
+    ],
+    "benchmark_symbol": "JUNIORBEES",
     "sma_gap_scale_pct": 3.0,
     "macd_atr_scale": 0.5,
     "family_engagement_threshold": 0.1,
@@ -54,6 +59,11 @@
       "relative_strength",
       "participation"
     ],
+    "required_positive_families": [
+      "trend",
+      "momentum"
+    ],
+    "benchmark_symbol": "JUNIORBEES",
     "sma_gap_scale_pct": 3.0,
     "macd_atr_scale": 0.5,
     "family_engagement_threshold": 0.1,

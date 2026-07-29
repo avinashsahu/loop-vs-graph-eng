@@ -28,6 +28,8 @@ class TechnicalPolicy:
     description: str
     timeframe_weights: tuple[tuple[str, float], ...]
     families: tuple[str, ...]
+    required_positive_families: tuple[str, ...]
+    benchmark_symbol: str
     sma_gap_scale_pct: float
     macd_atr_scale: float
     family_engagement_threshold: float
@@ -54,7 +56,10 @@ class TechnicalObservations:
 
     histories: dict
     benchmark_daily: object | None = None
+    benchmark_symbol: str | None = None
     delivery_trend: dict | None = None
+    completed_at: datetime | None = None
+    completion_policy_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +94,10 @@ def _load_technical_policies():
                 for timeframe in _REQUIRED_TIMEFRAMES
             ),
             families=tuple(raw["families"]),
+            required_positive_families=tuple(
+                raw["required_positive_families"]
+            ),
+            benchmark_symbol=str(raw["benchmark_symbol"]).upper(),
             sma_gap_scale_pct=float(raw["sma_gap_scale_pct"]),
             macd_atr_scale=float(raw["macd_atr_scale"]),
             family_engagement_threshold=float(
@@ -115,6 +124,10 @@ def _load_technical_policies():
             raise ValueError(
                 f"{policy_id} has unknown indicator families: "
                 f"{sorted(unknown_families)}"
+            )
+        if not set(policy.required_positive_families) <= set(policy.families):
+            raise ValueError(
+                f"{policy_id} requires families it does not enable"
             )
         if (
             policy.enforce_daily_anchor
@@ -207,6 +220,12 @@ def evaluate_technical(observations, policy=None):
         required_benchmark_bars = policy.relative_strength_lookback + 1
         if benchmark is None:
             reasons.append("MISSING_BENCHMARK")
+        elif observations.benchmark_symbol != policy.benchmark_symbol:
+            reasons.append(
+                "BENCHMARK_POLICY_MISMATCH:"
+                f"{observations.benchmark_symbol or 'missing'}:"
+                f"{policy.benchmark_symbol}"
+            )
         elif "close" not in benchmark.columns:
             reasons.append("MISSING_BENCHMARK_CLOSE")
         elif len(benchmark) < required_benchmark_bars:
@@ -429,12 +448,10 @@ def score_technical(indicators, observations=None, policy=None):
        price series), not 4 independent opinions. Treating them as separate "votes"
        double- and quadruple-counts the same underlying trend. So each family is first
        collapsed to one weighted-average family score across its 4 timeframes, and
-       confluence is measured across trend, momentum, and an RSI extreme penalty. These
-       all derive from price and are not statistically independent. Verdict is GOOD only
-       if the total is positive AND at least 2 of the "engaged" roles -- those with
-       |score| above a small deadzone, so near-zero noise doesn't get a vote -- agree on
-       direction. In practice RSI is neutral or negative, so bullish confirmation
-       requires both engaged trend and momentum to be positive. A first
+       confluence is measured across the families enabled by the selected policy.
+       Verdict is GOOD only if the total is positive, a majority of "engaged" roles
+       agree, and the policy's required confirmation families are positive. In both
+       persisted policies, trend and momentum are required. A first
        attempt defined "agreement" relative to the total score's own sign, which is a
        circular definition: if total_score > 0 then agreeing weight necessarily exceeds
        disagreeing weight by simple algebra, so that check could never fail. Requiring
@@ -510,7 +527,7 @@ def score_technical(indicators, observations=None, policy=None):
     }
     total_score = sum(families.values())
 
-    # Confluence: at least 2 of the (up to 3) "engaged" families -- magnitude above the
+    # Confluence: at least 2 "engaged" families -- magnitude above the
     # deadzone, so a near-zero reading can't vote either way -- must independently agree
     # on direction. Independent of total_score's own sign, unlike an earlier version
     # that compared each family against the sum they produced (circular -- see
@@ -524,13 +541,30 @@ def score_technical(indicators, observations=None, policy=None):
     agree_count = sum(1 for v in engaged.values() if v > 0)
     disagree_count = len(engaged) - agree_count
     confluence_ratio = agree_count / len(engaged) if engaged else 0.0
-    verdict = "GOOD" if (total_score > 0 and len(engaged) >= 2 and agree_count > disagree_count) else "BAD"
+    required_confirmation = all(
+        engaged.get(family, 0.0) > 0
+        for family in policy.required_positive_families
+    )
+    verdict = (
+        "GOOD"
+        if (
+            total_score > 0
+            and len(engaged) >= 2
+            and agree_count > disagree_count
+            and required_confirmation
+        )
+        else "BAD"
+    )
 
     return {
         "policy_id": policy.policy_id,
         "policy_fingerprint": policy.fingerprint,
         "timeframe_weights": dict(policy.timeframe_weights),
         "indicator_families": list(policy.families),
+        "required_positive_families": list(
+            policy.required_positive_families
+        ),
+        "benchmark_symbol": policy.benchmark_symbol,
         "score": round(total_score, 3),
         "verdict": verdict,
         "confluence_ratio": round(confluence_ratio, 2),
@@ -561,6 +595,7 @@ def replay_technical_policies(
 
     canonical_samples = {}
     for sample in sorted(samples, key=lambda item: item.observed_at):
+        _validate_replay_observation(sample)
         key = (sample.symbol.upper(), sample.observed_at.date())
         canonical_samples.setdefault(key, sample)
 
@@ -593,3 +628,36 @@ def replay_technical_policies(
             ),
         )
     return results
+
+
+def _validate_replay_observation(sample):
+    # Import locally so ordinary indicator evaluation stays independent of the live
+    # NSE adapter. Replay accepts only observations attested by that adapter's exact
+    # completion policy, rather than trusting an arbitrary non-empty provenance label.
+    from nse_data import MARKET_COMPLETION_POLICY_ID
+
+    observations = sample.observations
+    if (
+        observations.completed_at is None
+        or observations.completion_policy_id != MARKET_COMPLETION_POLICY_ID
+    ):
+        raise ValueError(
+            "Replay observations require current completed-bar provenance"
+        )
+    if observations.completed_at > sample.observed_at:
+        raise ValueError("Replay observation was completed after it was observed")
+
+    frames = list(observations.histories.values())
+    if observations.benchmark_daily is not None:
+        frames.append(observations.benchmark_daily)
+    completed_at = np.datetime64(
+        observations.completed_at.replace(tzinfo=None)
+    )
+    for frame in frames:
+        if "datetime" not in frame.columns:
+            raise ValueError("Replay frames require completed bar timestamps")
+        timestamps = np.asarray(frame["datetime"], dtype="datetime64[ns]")
+        if np.isnat(timestamps).any() or (timestamps > completed_at).any():
+            raise ValueError(
+                "Replay frame contains invalid or future bars"
+            )

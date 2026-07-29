@@ -48,10 +48,6 @@ NSE_TECHNICAL_POLICY_ID = os.environ.get(
     "NSE_TECHNICAL_POLICY_ID",
     ta_analysis.REVISED_TECHNICAL_POLICY_ID,
 )
-NSE_TECHNICAL_BENCHMARK_SYMBOL = os.environ.get(
-    "NSE_TECHNICAL_BENCHMARK_SYMBOL",
-    os.environ.get("EVALUATION_BENCHMARK_SYMBOL", "JUNIORBEES"),
-)
 TECHNICAL_POLICY = ta_analysis.select_technical_policy(NSE_TECHNICAL_POLICY_ID)
 NSE_POLICY_VERSION = os.environ.get(
     "NSE_POLICY_VERSION",
@@ -172,7 +168,7 @@ def node_fetch(state):
         state["delivery_trend"] = None
 
     benchmark_snapshot = nse_data.get_market_snapshot(
-        NSE_TECHNICAL_BENCHMARK_SYMBOL,
+        TECHNICAL_POLICY.benchmark_symbol,
         timeframes=("D",),
     )
     state["benchmark_daily"] = benchmark_snapshot.histories["D"]
@@ -186,11 +182,23 @@ def node_technical(state):
     # score_technical for
     # why: live testing showed this exact threshold/comparison task isn't something an
     # LLM (gemma4 or Fin-R1) applies reliably, regardless of model quality.
+    snapshot_metadata = state.get("market_snapshot") or {}
+    benchmark_metadata = snapshot_metadata.get("benchmark") or {}
+    completed_at = benchmark_metadata.get("observed_at")
     assessment = ta_analysis.evaluate_technical(
         ta_analysis.TechnicalObservations(
             histories=state["hist_multi"],
             benchmark_daily=state.get("benchmark_daily"),
+            benchmark_symbol=benchmark_metadata.get("symbol"),
             delivery_trend=state.get("delivery_trend"),
+            completed_at=(
+                datetime.fromisoformat(completed_at)
+                if completed_at
+                else None
+            ),
+            completion_policy_id=snapshot_metadata.get(
+                "completion_policy_id"
+            ),
         ),
         TECHNICAL_POLICY,
     )

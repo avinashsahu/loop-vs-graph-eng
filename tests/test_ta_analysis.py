@@ -12,6 +12,7 @@ def _history(rows=60):
     close = np.linspace(100.0, 130.0, rows)
     return pd.DataFrame(
         {
+            "datetime": pd.date_range("2026-01-01", periods=rows, freq="D"),
             "close": close,
             "high": close + 1.0,
             "low": close - 1.0,
@@ -29,6 +30,11 @@ def _bullish_history():
     )
     return pd.DataFrame(
         {
+            "datetime": pd.date_range(
+                "2026-01-01",
+                periods=len(close),
+                freq="D",
+            ),
             "close": close,
             "high": close + 1.0,
             "low": close - 1.0,
@@ -62,6 +68,7 @@ class TechnicalAssessmentTests(unittest.TestCase):
         observations = ta_analysis.TechnicalObservations(
             histories=histories,
             benchmark_daily=benchmark,
+            benchmark_symbol="JUNIORBEES",
             delivery_trend={
                 "status": "ready",
                 "delivery_pct_trend": "rising",
@@ -71,6 +78,8 @@ class TechnicalAssessmentTests(unittest.TestCase):
                 "latest_vwap": 110.0,
                 "interpretation": "possible_accumulation",
             },
+            completed_at=datetime(2026, 7, 29, 9, 55),
+            completion_policy_id="nse-completed-bars-v1",
         )
         samples = [
             ta_analysis.TechnicalReplaySample(
@@ -125,6 +134,11 @@ class TechnicalAssessmentTests(unittest.TestCase):
         benchmark_close = np.linspace(100.0, 160.0, 60)
         benchmark = pd.DataFrame(
             {
+                "datetime": pd.date_range(
+                    "2026-01-01",
+                    periods=len(benchmark_close),
+                    freq="D",
+                ),
                 "close": benchmark_close,
                 "high": benchmark_close + 1.0,
                 "low": benchmark_close - 1.0,
@@ -137,6 +151,7 @@ class TechnicalAssessmentTests(unittest.TestCase):
             ta_analysis.TechnicalObservations(
                 histories=histories,
                 benchmark_daily=benchmark,
+                benchmark_symbol="JUNIORBEES",
                 delivery_trend={
                     "status": "ready",
                     "delivery_pct_trend": "rising",
@@ -153,6 +168,7 @@ class TechnicalAssessmentTests(unittest.TestCase):
             ta_analysis.TechnicalObservations(
                 histories=histories,
                 benchmark_daily=benchmark,
+                benchmark_symbol="JUNIORBEES",
                 delivery_trend={
                     "status": "ready",
                     "delivery_pct_trend": "rising",
