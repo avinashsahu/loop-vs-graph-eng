@@ -110,10 +110,11 @@ def node_fundamental(state):
             f"shareholding pattern (recent periods)={snap.get('shareholding_pattern')}, "
             f"yearwise returns={snap.get('yearwise_returns')}, "
             f"peer comparison (quarter {snap.get('peer_comparison_quarter')})={snap.get('peer_comparison')}, "
-            f"delivery-volume trend (from NSE bhavcopy, recent vs prior average, rising means "
-            f"more genuine buying interest not just intraday churn)={state.get('delivery_trend')}.\n"
+            f"delivery participation (from NSE bhavcopy)={state.get('delivery_trend')}.\n"
+            "Delivery data is supporting market-participation context only: it does not reveal buyer "
+            "or seller direction and cannot establish accumulation or distribution by itself. "
             "Does the company look fundamentally sound -- no red flags in recent corporate actions, "
-            "announcements, shareholding trend, or delivery trend, and reasonable standing versus peers?"
+            "announcements, or shareholding trend, and reasonable standing versus peers?"
         ),
         mode="check",
     )
