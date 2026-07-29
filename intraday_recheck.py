@@ -8,7 +8,7 @@ load_dotenv()
 import os
 import sys
 
-from digest import format_symbol_section, read_jsonl_records
+from digest import format_symbol_section, format_symbol_section_slack, read_jsonl_records
 from logging_config import setup_logging
 from market_time import is_market_hours, now_ist
 from notify import send_email, send_slack
@@ -85,6 +85,6 @@ if __name__ == "__main__":
         # hand-maintained near-copy that can silently drift from it.
         record = nse_trade_graph.build_record(final_state)
         subject = f"NSE Intraday Alert -- {symbol} -- {final_state['status']}"
-        body = format_symbol_section(record)
-        send_email(subject, body)
-        send_slack(subject, body)
+        send_email(subject, format_symbol_section(record))
+        slack_header = f":rotating_light: *NSE Intraday Alert*\n"
+        send_slack(slack_header + format_symbol_section_slack(record))
