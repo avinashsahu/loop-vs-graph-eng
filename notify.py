@@ -14,6 +14,7 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USERNAME = os.environ.get("SMTP_USERNAME", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "1") == "1"
+SMTP_TIMEOUT_SECONDS = float(os.environ.get("SMTP_TIMEOUT_SECONDS", "10"))
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "")
 
 SLACK_ENABLED = os.environ.get("SLACK_ENABLED") == "1"
@@ -49,7 +50,7 @@ def send_email(subject: str, body: str, recipients: list[str] = None) -> None:
     msg["To"] = ", ".join(recipients)
     msg.set_content(body)
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as smtp:
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as smtp:
         if SMTP_USE_TLS:
             smtp.starttls()
         if SMTP_USERNAME:

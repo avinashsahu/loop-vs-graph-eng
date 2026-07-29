@@ -7,11 +7,13 @@ load_dotenv()
 
 import os
 import sys
+from functools import partial
 
+import notify
+from alert_ledger import AlertLedger, AlertLedgerStateError
 from digest import format_symbol_section, format_symbol_section_slack, read_jsonl_records
 from logging_config import setup_logging
 from market_time import is_market_hours, now_ist
-from notify import send_email, send_slack
 
 log = setup_logging("intraday_recheck")
 
@@ -20,6 +22,10 @@ log = setup_logging("intraday_recheck")
 # script sets its own label below, and sys.modules caching would make the later
 # `import nse_trade_graph` a no-op re-execution-wise.
 TRADE_LOG_PATH = os.environ.get("TRADE_LOG_PATH", "trade_log.jsonl")
+INTRADAY_ALERT_STATE_PATH = os.environ.get(
+    "INTRADAY_ALERT_STATE_PATH",
+    ".intraday_alert_state.json",
+)
 
 
 def _find_latest_overnight_label():
@@ -72,6 +78,7 @@ if __name__ == "__main__":
     )
     max_loss_pct = float(os.environ.get("NSE_MAX_LOSS_PCT", "1"))
     atr_stop_multiple = float(os.environ.get("NSE_ATR_STOP_MULTIPLE", "2"))
+    alert_ledger = AlertLedger(INTRADAY_ALERT_STATE_PATH)
 
     for symbol in symbols:
         try:
@@ -90,14 +97,52 @@ if __name__ == "__main__":
             log.warning("recheck failed for %s, continuing", symbol, exc_info=True)
             continue
 
-        if final_state["status"] not in ("proposed", "flagged_for_review"):
-            continue  # dropped to aborted since the overnight scan -- no longer actionable
+        status = final_state["status"]
+        channels = {}
+        if status in ("proposed", "flagged_for_review"):
+            # Same builder node_log already used internally (run() logs as part of the graph
+            # itself) -- guarantees alerts contain exactly what's in trade_log.jsonl.
+            record = nse_trade_graph.build_record(final_state)
+            subject = f"NSE Intraday Alert -- {symbol} -- {status}"
+            if notify.EMAIL_ENABLED and notify.get_recipients():
+                channels["email"] = partial(
+                    notify.send_email,
+                    subject,
+                    format_symbol_section(record),
+                )
+            if notify.SLACK_ENABLED and notify.SLACK_WEBHOOK_URL:
+                slack_header = ":rotating_light: *NSE Intraday Alert*\n"
+                channels["slack"] = partial(
+                    notify.send_slack,
+                    slack_header + format_symbol_section_slack(record),
+                )
 
-        # Same builder node_log already used internally (run() logs as part of the graph
-        # itself) -- guarantees the email has exactly what's in trade_log.jsonl, not a
-        # hand-maintained near-copy that can silently drift from it.
-        record = nse_trade_graph.build_record(final_state)
-        subject = f"NSE Intraday Alert -- {symbol} -- {final_state['status']}"
-        send_email(subject, format_symbol_section(record))
-        slack_header = f":rotating_light: *NSE Intraday Alert*\n"
-        send_slack(slack_header + format_symbol_section_slack(record))
+        try:
+            outcomes = alert_ledger.observe_and_deliver(
+                run_id=run_id,
+                symbol=symbol,
+                status=status,
+                channels=channels,
+            )
+        except AlertLedgerStateError:
+            log.error(
+                "alert ledger failed closed for %s; no notification attempted",
+                symbol,
+                exc_info=True,
+            )
+            continue
+        except Exception:
+            log.error(
+                "alert delivery state uncertain for %s; a channel may have been sent and retried",
+                symbol,
+                exc_info=True,
+            )
+            continue
+        for channel, outcome in outcomes.items():
+            if outcome.startswith("failed:"):
+                log.warning(
+                    "intraday alert failed symbol=%s channel=%s outcome=%s",
+                    symbol,
+                    channel,
+                    outcome,
+                )
