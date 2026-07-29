@@ -132,6 +132,7 @@ def get_fundamental_snapshot(symbol: str) -> dict:
         return hit
 
     snapshot = {
+        "as_of": now_ist_naive().date().isoformat(),
         "company_name": None,
         "corp_announcements": None,
         "corp_actions": None,

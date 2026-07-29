@@ -1,0 +1,14 @@
+services:
+  aerospike:
+    image: aerospike/aerospike-server@sha256:65478a14549894cb903783a973f6801c327c12de95c3dd147a92f085df4f9717
+    container_name: nse-aerospike
+    restart: unless-stopped
+    command: ["--config-file", "/opt/aerospike/etc/aerospike.conf"]
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./deploy:/opt/aerospike/etc:ro
+      - aerospike-data:/opt/aerospike/data
+
+volumes:
+  aerospike-data:

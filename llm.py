@@ -52,14 +52,10 @@ FUNDAMENTAL_REASON_CODES = (
     "PEER_OR_EARNINGS_WEAKNESS",
     "INSUFFICIENT_EVIDENCE",
 )
-FUNDAMENTAL_EVIDENCE_CATEGORIES = (
-    "CORPORATE_ACTIONS",
-    "ANNOUNCEMENTS",
-    "SHAREHOLDING",
-    "YEARWISE_RETURNS",
-    "PEER_COMPARISON",
-    "DELIVERY_CONTEXT",
+FUNDAMENTAL_LLM_MAX_TOKENS = int(
+    os.environ.get("FUNDAMENTAL_LLM_MAX_TOKENS", "384")
 )
+FUNDAMENTAL_SCHEMA_VERSION = "fundamental-assessment-schema-v3"
 FUNDAMENTAL_RESPONSE_FORMAT = {
     "type": "json_schema",
     "json_schema": {
@@ -70,27 +66,36 @@ FUNDAMENTAL_RESPONSE_FORMAT = {
             "properties": {
                 "verdict": {
                     "type": "string",
-                    "enum": ["GOOD", "BAD"],
+                    "enum": ["PASS", "REVIEW", "REJECT"],
                 },
                 "reason_code": {
                     "type": "string",
                     "enum": list(FUNDAMENTAL_REASON_CODES),
                 },
-                "reason": {
+                "summary": {
                     "type": "string",
-                    "maxLength": 160,
+                    "maxLength": 220,
                 },
-                "evidence": {
+                "evidence_ids": {
                     "type": "array",
-                    "items": {
-                        "type": "string",
-                        "enum": list(FUNDAMENTAL_EVIDENCE_CATEGORIES),
-                    },
-                    "maxItems": 2,
+                    "items": {"type": "string"},
+                    "maxItems": 3,
+                    "uniqueItems": True,
+                },
+                "missing": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": 80},
+                    "maxItems": 3,
                     "uniqueItems": True,
                 },
             },
-            "required": ["verdict", "reason_code", "reason", "evidence"],
+            "required": [
+                "verdict",
+                "reason_code",
+                "summary",
+                "evidence_ids",
+                "missing",
+            ],
             "additionalProperties": False,
         },
     },
@@ -102,7 +107,8 @@ class FundamentalAssessment:
     verdict: str
     reason_code: str
     reason: str
-    evidence: tuple[str, ...]
+    evidence_ids: tuple[str, ...]
+    missing: tuple[str, ...]
 
     @property
     def summary(self):
@@ -112,8 +118,9 @@ class FundamentalAssessment:
         return {
             "verdict": self.verdict,
             "reason_code": self.reason_code,
-            "reason": self.reason,
-            "evidence": list(self.evidence),
+            "summary": self.reason,
+            "evidence_ids": list(self.evidence_ids),
+            "missing": list(self.missing),
         }
 
 
@@ -123,17 +130,22 @@ def active_model_config():
             "backend": "openai_compatible_local",
             "name": LOCAL_LLM_MODEL,
             "max_tokens": LOCAL_LLM_MAX_TOKENS,
+            "fundamental_max_tokens": FUNDAMENTAL_LLM_MAX_TOKENS,
         }
     if USE_REAL_LLM:
         return {
             "backend": "anthropic",
             "name": ANTHROPIC_MODEL,
             "max_tokens": ANTHROPIC_MAX_TOKENS,
+            "fundamental_max_tokens": min(
+                ANTHROPIC_MAX_TOKENS, FUNDAMENTAL_LLM_MAX_TOKENS
+            ),
         }
     return {
         "backend": "stub",
         "name": "deterministic-stub",
         "max_tokens": None,
+        "fundamental_max_tokens": None,
     }
 
 
@@ -172,11 +184,11 @@ def _call_local_llm(prompt, mode):
     if LOCAL_LLM_NO_THINK_DIRECTIVE:
         prompt = f"{LOCAL_LLM_NO_THINK_DIRECTIVE}\n{prompt}"
 
-    request = dict(
-        model=LOCAL_LLM_MODEL,
-        max_tokens=LOCAL_LLM_MAX_TOKENS,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    request = {
+        "model": LOCAL_LLM_MODEL,
+        "max_tokens": LOCAL_LLM_MAX_TOKENS,
+        "messages": [{"role": "user", "content": prompt}],
+    }
     if mode == "check":
         request["response_format"] = LOCAL_CHECK_RESPONSE_FORMAT
         request["temperature"] = 0
@@ -198,11 +210,11 @@ def _call_local_llm(prompt, mode):
     )
     if LOCAL_LLM_NO_THINK_DIRECTIVE:
         repair_prompt = f"{LOCAL_LLM_NO_THINK_DIRECTIVE}\n{repair_prompt}"
-    repair_request = dict(
-        model=LOCAL_LLM_MODEL,
-        max_tokens=64,
-        messages=[{"role": "user", "content": repair_prompt}],
-    )
+    repair_request = {
+        "model": LOCAL_LLM_MODEL,
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": repair_prompt}],
+    }
     repair_request["response_format"] = LOCAL_CHECK_RESPONSE_FORMAT
     repair_request["temperature"] = 0
     if LOCAL_LLM_REASONING_EFFORT:
@@ -245,67 +257,86 @@ def _call_local_structured(prompt, response_format, *, max_tokens=None):
     )
 
 
-def _parse_fundamental_assessment(text):
+def _parse_fundamental_assessment(text, available_evidence_ids=()):
     try:
         payload = json.loads(text)
         verdict_value = payload["verdict"]
         reason_code_value = payload["reason_code"]
-        reason_value = payload["reason"]
-        evidence_value = payload["evidence"]
+        reason_value = payload["summary"]
+        evidence_value = payload["evidence_ids"]
+        missing_value = payload["missing"]
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise ValueError("invalid fundamental assessment JSON") from exc
     if (
         not isinstance(payload, dict)
         or set(payload)
-        != {"verdict", "reason_code", "reason", "evidence"}
+        != {"verdict", "reason_code", "summary", "evidence_ids", "missing"}
         or not isinstance(verdict_value, str)
         or not isinstance(reason_code_value, str)
         or not isinstance(reason_value, str)
         or not isinstance(evidence_value, list)
         or any(not isinstance(item, str) for item in evidence_value)
+        or not isinstance(missing_value, list)
+        or any(not isinstance(item, str) for item in missing_value)
     ):
         raise ValueError("invalid fundamental assessment field types")
     verdict = verdict_value.upper()
     reason_code = reason_code_value.upper()
     reason = reason_value.strip()
-    evidence = tuple(dict.fromkeys(item.upper() for item in evidence_value))
-    if verdict not in {"GOOD", "BAD"}:
+    evidence_ids = tuple(dict.fromkeys(evidence_value))
+    missing = tuple(dict.fromkeys(item.strip() for item in missing_value))
+    if verdict not in {"PASS", "REVIEW", "REJECT"}:
         raise ValueError("invalid fundamental verdict")
     if reason_code not in FUNDAMENTAL_REASON_CODES:
         raise ValueError("invalid fundamental reason code")
-    if (verdict == "GOOD") != (reason_code == "NO_MATERIAL_RED_FLAG"):
+    expected_verdict = (
+        "PASS"
+        if reason_code == "NO_MATERIAL_RED_FLAG"
+        else "REVIEW"
+        if reason_code == "INSUFFICIENT_EVIDENCE"
+        else "REJECT"
+    )
+    if verdict != expected_verdict:
         raise ValueError("fundamental verdict and reason code disagree")
-    if not reason or len(reason) > 160:
-        raise ValueError("fundamental reason must contain 1-160 characters")
+    if not reason or len(reason) > 220:
+        raise ValueError("fundamental summary must contain 1-220 characters")
     if (
-        len(evidence) > 2
-        or any(item not in FUNDAMENTAL_EVIDENCE_CATEGORIES for item in evidence)
+        len(evidence_ids) > 3
+        or any(item not in available_evidence_ids for item in evidence_ids)
+        or len(missing) > 3
+        or any(not item or len(item) > 80 for item in missing)
     ):
-        raise ValueError("invalid fundamental evidence categories")
+        raise ValueError("invalid fundamental evidence references")
+    if (
+        (verdict == "PASS" and (missing or not evidence_ids))
+        or (verdict == "REVIEW" and not missing)
+        or (verdict == "REJECT" and not evidence_ids)
+    ):
+        raise ValueError("fundamental verdict contradicts evidence completeness")
     return FundamentalAssessment(
         verdict=verdict,
         reason_code=reason_code,
         reason=reason,
-        evidence=evidence,
+        evidence_ids=evidence_ids,
+        missing=missing,
     )
 
 
-def assess_fundamentals(prompt):
+def assess_fundamentals(prompt, available_evidence_ids=()):
     """Return a compact typed assessment through the configured model adapter."""
     global _call_count
     _call_count += 1
 
     classification_prompt = (
-        "Classify only the supplied evidence. GOOD means no material red flag was "
-        "identified and must use reason_code NO_MATERIAL_RED_FLAG. BAD means a "
-        "material concern or insufficient evidence and must use another reason code. "
-        "Do not infer missing facts.\n\n"
+        "Follow the supplied PASS/REVIEW/REJECT policy. Cite only supplied evidence IDs "
+        "and do not infer missing facts.\n\n"
         f"{prompt}"
     )
     if USE_LOCAL_LLM:
         text = _call_local_structured(
             classification_prompt,
             FUNDAMENTAL_RESPONSE_FORMAT,
+            max_tokens=FUNDAMENTAL_LLM_MAX_TOKENS,
         )
     elif USE_REAL_LLM:
         import anthropic
@@ -314,7 +345,7 @@ def assess_fundamentals(prompt):
         schema = FUNDAMENTAL_RESPONSE_FORMAT["json_schema"]["schema"]
         response = client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=ANTHROPIC_MAX_TOKENS,
+            max_tokens=min(ANTHROPIC_MAX_TOKENS, FUNDAMENTAL_LLM_MAX_TOKENS),
             messages=[
                 {
                     "role": "user",
@@ -328,19 +359,21 @@ def assess_fundamentals(prompt):
         text = response.content[0].text
     else:
         return FundamentalAssessment(
-            verdict="GOOD",
-            reason_code="NO_MATERIAL_RED_FLAG",
-            reason="Stub found no material red flag.",
-            evidence=(),
+            verdict="REVIEW",
+            reason_code="INSUFFICIENT_EVIDENCE",
+            reason="No fundamental model backend is enabled.",
+            evidence_ids=(),
+            missing=("model_backend",),
         )
     try:
-        return _parse_fundamental_assessment(text)
+        return _parse_fundamental_assessment(text, available_evidence_ids)
     except ValueError:
         if USE_LOCAL_LLM:
             repair_prompt = (
                 "Convert the invalid assessment below to the requested JSON schema. "
-                "Preserve its conclusion, use at most two evidence categories, and "
-                "return JSON only.\n\n"
+                "Preserve its conclusion, cite at most three supplied evidence IDs, and "
+                "return JSON only. "
+                f"Allowed evidence IDs: {json.dumps(list(available_evidence_ids))}.\n\n"
                 f"INVALID ASSESSMENT:\n{text[:4000]}"
             )
             repaired = _call_local_structured(
@@ -349,14 +382,15 @@ def assess_fundamentals(prompt):
                 max_tokens=192,
             )
             try:
-                return _parse_fundamental_assessment(repaired)
+                return _parse_fundamental_assessment(repaired, available_evidence_ids)
             except ValueError:
                 pass
         return FundamentalAssessment(
-            verdict="BAD",
+            verdict="REVIEW",
             reason_code="INSUFFICIENT_EVIDENCE",
             reason="Model did not return a valid structured assessment.",
-            evidence=(),
+            evidence_ids=(),
+            missing=("invalid_model_response",),
         )
 
 

@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -9,10 +10,11 @@ import pandas as pd
 import nse_trade_graph
 from evaluation import EvaluationLedger
 from llm import FundamentalAssessment
+from shareholding import ShareholdingHistory, ShareholdingPeriod
 
 
 class FundamentalPromptTests(unittest.TestCase):
-    def test_delivery_context_is_described_as_non_directional(self):
+    def test_prompt_excludes_delivery_and_uses_grounded_shareholding_ids(self):
         state = {
             "symbol": "ACE",
             "fundamental_snapshot": {
@@ -20,6 +22,12 @@ class FundamentalPromptTests(unittest.TestCase):
                 "company_name": "Action Construction Equipment",
                 "eps": 10.0,
                 "pat": 100.0,
+                "corp_actions": [],
+                "corp_announcements": [],
+                "peer_comparison_quarter": "2026-06",
+                "peer_comparison": [
+                    {"symbol": "ACE", "eps": 10.0, "pat": 100.0, "pe": 20.0}
+                ],
             },
             "delivery_trend": {
                 "status": "ready",
@@ -29,16 +37,71 @@ class FundamentalPromptTests(unittest.TestCase):
             },
         }
 
-        with patch.object(
-            nse_trade_graph,
-            "assess_fundamentals",
-            return_value=FundamentalAssessment(
-                verdict="GOOD",
-                reason_code="NO_MATERIAL_RED_FLAG",
-                reason="No fundamental red flags.",
-                evidence=("SHAREHOLDING", "ANNOUNCEMENTS"),
+        history = ShareholdingHistory(
+            symbol="ACE",
+            periods=tuple(
+                ShareholdingPeriod(
+                    record_id=str(index),
+                    period=period,
+                    schema_version="2025-10-31",
+                    fii_pct=12.0 + index,
+                    dii_pct=18.0 - index,
+                    government_pct=0.0,
+                    promoter_pct=55.0,
+                    other_public_pct=15.0,
+                    public_shares=45,
+                    component_shares=45,
+                    reconciled=True,
+                    checksum="abc",
+                )
+                for index, period in enumerate(
+                    (
+                        "2026-06-30",
+                        "2026-03-31",
+                        "2025-12-31",
+                        "2025-09-30",
+                        "2025-06-30",
+                    )
+                )
             ),
-        ) as assess_fundamentals:
+            latest_period="2026-06-30",
+            latest_record_id="0",
+            periods_available=5,
+            complete=True,
+            changes_bps={
+                "fii_qoq": -100,
+                "dii_qoq": 100,
+                "government_qoq": 0,
+                "promoter_qoq": 0,
+                "other_public_qoq": 0,
+                "fii_4q": -400,
+                "dii_4q": 400,
+                "government_4q": 0,
+                "promoter_4q": 0,
+                "other_public_4q": 0,
+            },
+            trend_labels={
+                "fii": "falling",
+                "dii": "rising",
+                "government": "flat",
+                "promoter": "flat",
+                "other_public": "flat",
+            },
+        )
+        with (
+            patch.object(nse_trade_graph, "get_shareholding_history", return_value=history),
+            patch.object(
+                nse_trade_graph,
+                "assess_fundamentals",
+                return_value=FundamentalAssessment(
+                    verdict="PASS",
+                    reason_code="NO_MATERIAL_RED_FLAG",
+                    reason="No fundamental red flags.",
+                    evidence_ids=("SHAREHOLDING_2026-06-30",),
+                    missing=(),
+                ),
+            ) as assess_fundamentals,
+        ):
             route, result_state = nse_trade_graph.node_fundamental(state)
 
         prompt = assess_fundamentals.call_args.args[0]
@@ -47,9 +110,13 @@ class FundamentalPromptTests(unittest.TestCase):
             result_state["fundamental_assessment"]["reason_code"],
             "NO_MATERIAL_RED_FLAG",
         )
-        self.assertIn("does not reveal buyer or seller direction", prompt)
-        self.assertIn("supporting market-participation context", prompt)
-        self.assertNotIn("rising means more genuine buying interest", prompt)
+        self.assertIn("SHAREHOLDING_2026-06-30", prompt)
+        self.assertIn("government_qoq", prompt)
+        self.assertIn("other_public_4q", prompt)
+        self.assertIn('"peer_stale":false', prompt)
+        self.assertIn('"shareholding_stale":false', prompt)
+        self.assertNotIn("delivery", prompt.lower())
+        self.assertNotIn("delivery_pct_rise_unconfirmed_by_volume", prompt)
 
     def test_fetch_stage_does_not_download_fundamentals_before_technical_passes(self):
         state = {
@@ -261,7 +328,9 @@ class RiskNodeTests(unittest.TestCase):
         with patch.object(
             nse_trade_graph,
             "now_ist",
-            return_value=datetime(2026, 7, 29, 12, 30),
+            return_value=datetime(
+                2026, 7, 29, 12, 30, tzinfo=ZoneInfo("Asia/Kolkata")
+            ),
         ):
             route, result_state = nse_trade_graph.node_risk(state)
 
@@ -331,6 +400,21 @@ class RiskNodeTests(unittest.TestCase):
         self.assertIn("0.20% actual", result_state["proposal"])
         self.assertIn("1.0% policy cap", result_state["proposal"])
         self.assertNotIn("₹200 (1.0% of", result_state["proposal"])
+
+    def test_sentiment_gate_uses_atr_instead_of_model_inference(self):
+        base_state = {
+            "quote": {"changepct": 2.0},
+            "risk_plan": {"entry_price": 100.0},
+            "technical_indicators": {"D": {"atr14": 2.0}},
+        }
+
+        route, state = nse_trade_graph.node_sentiment(base_state)
+        self.assertEqual(route, "propose")
+        self.assertIn("4.00% review threshold", state["sentiment_verdict"])
+
+        base_state["quote"]["changepct"] = 5.0
+        route, _ = nse_trade_graph.node_sentiment(base_state)
+        self.assertEqual(route, "flag_review")
 
 
 if __name__ == "__main__":

@@ -61,7 +61,9 @@ OpenAI-compatible URL used here is `http://localhost:11434/v1`.
 
 Config (`.env`): `LOCAL_LLM_URL` (default `http://localhost:11434/v1`),
 `LOCAL_LLM_MODEL` (default `hf.co/alexsabaka/ODA-Fin-RL-8B-GGUF:Q4_K_M`),
-`LOCAL_LLM_MAX_TOKENS` (default `800`), and `LOCAL_LLM_REASONING_EFFORT`
+`LOCAL_LLM_MAX_TOKENS` (default `800`), `FUNDAMENTAL_LLM_MAX_TOKENS` (default
+`384` for the compact structured assessment; it can be raised deliberately if a
+replacement model needs more room), and `LOCAL_LLM_REASONING_EFFORT`
 (default `none`). `LOCAL_LLM_NO_THINK_DIRECTIVE` defaults to `/no_think` for the
 configured Qwen3 model; set it empty for models that do not support that control token.
 
@@ -69,13 +71,14 @@ Local `check` calls request a strict JSON-schema response (`GOOD` or `BAD`, plus
 short reason) at temperature zero, then normalize it to the graph's existing
 one-line verdict contract. If a compatible server ignores the schema, one bounded
 64-token repair call is attempted before the original response is returned.
-Fundamental checks use a narrower typed assessment: verdict, controlled reason code,
-a reason capped at 160 characters, and at most two evidence-category tags. The local
-adapter makes one bounded 192-token repair attempt; every adapter fails closed if valid
-JSON is still unavailable.
+Fundamental checks use a narrower typed assessment: `PASS` / `REVIEW` / `REJECT`,
+a controlled reason code, a summary capped at 220 characters, up to three validated
+evidence IDs, and an explicit missing-evidence list. The local adapter makes one
+bounded 192-token repair attempt; every adapter fails closed if valid JSON is still
+unavailable.
 
-**Why ODA-Fin-RL-8B instead of Fin-R1:** only `node_fundamental` and
-`node_sentiment` still use an LLM.
+**Why ODA-Fin-RL-8B instead of Fin-R1:** only `node_fundamental` in the trade
+pipeline uses an LLM.
 [ODA-Fin-RL-8B](https://huggingface.co/OpenDataArena/ODA-Fin-RL-8B) is a March
 2026 Qwen3-8B finance fine-tune trained with SFT and GRPO. In the same nine-benchmark
 comparison, its [paper](https://arxiv.org/abs/2603.07223) reports a 74.6% average versus
@@ -148,9 +151,9 @@ fetch -> technical -> [BAD] -> abort (no retry -- see below)
   - **Confluence across signal roles, not across timeframes.** Trend and momentum are each computed at four timeframes, but those readings are correlated because they derive from price. Each role is collapsed to one daily-heavy weighted score. A `GOOD` result requires both engaged trend and momentum to be positive; RSI is a neutral-or-negative extreme penalty, not a third bullish vote. This is rule-level confirmation, not statistical independence.
 
   `nse_data.get_market_snapshot` is the completed-candle seam. During market hours it excludes today's unfinished daily candle and the provider's latest intraday tail; for 15 minutes after 15:30 it keeps the same conservative policy while NSE's historical endpoint settles. The subsequent closed-session request uses a distinct key, fetches again, and then caches the completed session for 24 hours. Each trade-log record retains per-timeframe source, fetch timestamp, cache hit/miss, TTL, completion drops, and latest completed bar. A `BAD` verdict aborts immediately, no retry — a retry inside the same cache phase would just re-score identical numbers. Deliberately not split into one node per timeframe — this project only splits nodes when the retry/remediation path genuinely differs, and all four timeframes feed one score either way.
-- **fundamental** — fetched only for symbols that pass the technical gate, avoiding roughly seven unnecessary NSE calls for every technical rejection. `fundamentals.get_fundamental_snapshot` pulls corporate announcements, corporate actions, shareholding pattern, yearwise returns, and a peer comparison (all via raw NSE `NextApi` endpoints, see `fundamentals.py`), plus a delivery-percentage trend from `bhavcopy.get_delivery_trend` (see below). A deterministic hard check runs first: negative EPS or PAT aborts immediately, same philosophy as `risk`'s circuit-limit check — an objective number isn't the LLM's job to hallucinate over. Otherwise the LLM returns a compact typed assessment with a `GOOD`/`BAD` verdict, controlled reason code, short explanation, and up to two evidence-category tags; a soft `BAD` routes to `flag_review`.
+- **fundamental** — fetched only for symbols that pass the technical gate, avoiding unnecessary NSE calls for every technical rejection. `fundamentals.get_fundamental_snapshot` pulls corporate announcements, corporate actions, yearwise returns, and peer comparison data via NSE's `NextApi`. NSE's shallow quote shareholding response is supplemented by Regulation 31 XBRL history warmed into Aerospike: FII, DII, government, promoter, and other-public percentages are derived from reconciled share counts across five consecutive quarters. QoQ and four-quarter changes plus trend labels are deterministic for all five categories. The compact prompt contains only typed facts with stable evidence IDs; delivery and raw table dumps are excluded. Source ages are calculated as of the scan date; peer data older than 200 days or shareholding data older than 160 days forces `REVIEW`. Model output uses `PASS` / `REVIEW` / `REJECT`, and cited IDs are checked against the supplied input before a result can proceed. A missing or expired live manifest is explicitly pending and enqueued; scans do not make an NSE manifest or XBRL request.
 - **risk** — deterministic code, not an LLM call. `position_risk.size_position` places an initial stop at `ATR14 * NSE_ATR_STOP_MULTIPLE` below the estimated entry and a profit target at `NSE_REWARD_RISK_RATIO` times that stop distance above entry (default 2R), then caps shares by both `NSE_MAX_LOSS_PCT` of principal and `NSE_MAX_ALLOCATION_PCT` of principal. Zero-share plans, invalid ATR/input, non-positive stops, stops below the lower circuit, and prices near either circuit abort explicitly. Proposal text includes entry, stop, target, capital, planned maximum loss, and planned target profit.
-- **sentiment** — LLM checks whether today's price move looks like a reasonable entry (not a crash or a spike), using the live quote's `changepct` and sector. Include the company's full name, not just the ticker, in the prompt — a bare ticker (e.g. `ACE`) can be genuinely ambiguous to the model and has been observed to send gemma4 into a repetitive non-terminating reasoning loop.
+- **sentiment** — deterministic volatility-aware entry gate, not an LLM call. It compares the absolute daily move with twice daily ATR as a percentage of entry, bounded to a 3%-10% review threshold. The old prompt supplied a sector name but no sector return, which invited unsupported claims such as “within sector range.”
 - **propose** — never calls a broker. Only ever produces a proposal string for a human to review and act on manually.
 
 Known data quirks:
@@ -160,7 +163,22 @@ Known data quirks:
 
 ### Index scan / batch mode
 
-Besides one symbol or an explicit list, `nse_trade_graph.py` can resolve and scan an entire index's constituents via `nse_data.get_index_symbols` (wraps `nsemine.live.get_index_constituents_live_snapshot`). A per-symbol failure (e.g. one blocked/slow fetch) is caught and logged so it doesn't abort the rest of the batch. `cache.py` backs both the multi-timeframe history and fundamentals fetches with a per-key JSON file under `CACHE_DIR` — this matters at batch scale: a full-index scan is ~13 HTTP calls per symbol (quote + 4 historical timeframes + several fundamentals endpoints), and repeated same-symbol fetches (e.g. `intraday_recheck.py` rechecking the same picks through the day) would otherwise re-hit NSE for same-day data that hasn't changed.
+Besides one symbol or an explicit list, `nse_trade_graph.py` can resolve and scan an entire index's constituents via `nse_data.get_index_symbols` (wraps `nsemine.live.get_index_constituents_live_snapshot`). A per-symbol failure (e.g. one blocked/slow fetch) is caught and logged so it doesn't abort the rest of the batch. `cache.py` still backs short-lived market/fundamental snapshots with per-key JSON files. Immutable XBRL filings use Aerospike Community Edition instead: each record keeps compressed source XML, normalized facts, checksum, schema reference, and parser version.
+
+### XBRL shareholding history
+
+Start the persistent local Aerospike server and warm symbols outside NSE market hours:
+
+```bash
+docker compose up -d aerospike
+uv run warm_shareholding.py FEDERALBNK
+uv run warm_shareholding.py --index "NIFTY NEXT 50"
+uv run warm_shareholding.py --queued
+# Multiple --index arguments are deduplicated in one paced run.
+uv run warm_shareholding.py --index "NIFTY NEXT 50" --index "NIFTY MIDCAP 50"
+```
+
+`shareholding.get_shareholding_history` is the network-free live-scan interface. It reads the latest five consecutive periods from Aerospike and returns `pending` if a filing is not warm or the short-lived manifest has expired; the durable stale index remains available for inspection but cannot pass the fundamental gate. `warm_shareholding.py` is the only path that downloads missing XBRL; it waits two seconds plus jitter after every request, backs off and stops after repeated/blocked NSE access, and can drain queued live misses. The latest valid revision wins for each period. Raw compressed XML and its checksum remain immutable; normalized facts can be reparsed from that source when the parser version changes. Invalid or unreconciled XML is not cached as successful.
 
 ### Delivery-percentage trend (`bhavcopy.py`)
 
@@ -194,7 +212,7 @@ These are paper/reference outcomes, not a production backtest. Bhavcopy OHLC is 
 
 ### Config (`.env`)
 
-`NSE_SYMBOL` (default `RELIANCE`, used only when no symbols are passed on the command line and `NSE_INDEX` is unset), `NSE_PRINCIPAL` (default `100000`), `NSE_MAX_ALLOCATION_PCT` (default `10`), `NSE_MAX_LOSS_PCT` (default `1`), `NSE_ATR_STOP_MULTIPLE` (default `2`), `NSE_REWARD_RISK_RATIO` (default `2`), `NSE_POLICY_VERSION` (bump when technical/risk/prompt semantics change), `TRADE_LOG_PATH` (default `trade_log.jsonl`, gitignored), `EVALUATION_DB_PATH` (default `evaluation.db`, gitignored), `EVALUATION_BENCHMARK_SYMBOL` (default `JUNIORBEES`), `EVALUATION_ROUND_TRIP_COST_BPS` (default `30`, an explicit starting assumption), `NSE_INDEX` (e.g. `NIFTY 50` — if set and no symbols are passed on the command line, scans the index's constituents instead of falling back to `NSE_SYMBOL`), `NSE_SCAN_LIMIT` (optional, caps how many constituents are scanned), `NSE_SCAN_DELAY_SECONDS` (default `1`, pause between symbols in a batch/index scan), `NSE_CALL_DELAY_SECONDS` (default `0.3`, pause after each quote/historical-data call), `CACHE_DIR` (default `.cache`, gitignored), `FUNDAMENTALS_CACHE_TTL_HOURS` (default `24`), `FUNDAMENTALS_CALL_DELAY_SECONDS` (default `0.5`, pause after each of the ~7 fundamentals API calls per surviving symbol), `INTRADAY_CACHE_TTL_MINUTES` (default `5`), `NSE_MARKET_DATA_GRACE_MINUTES` (default `15`, short-cache settlement window after 15:30 IST), `BHAVCOPY_DB_PATH` (default `bhavcopy.db`, gitignored), `BHAVCOPY_BACKFILL_DAYS` (default `30`), `BHAVCOPY_REQUEST_DELAY_SECONDS` (default `2`, pause between whole-market archive requests), `BHAVCOPY_PUBLISH_HOUR_IST` (default `18`, before which backfill begins from yesterday). `NSE_RISK_PCT` remains a temporary fallback for the allocation cap so existing local `.env` files continue to run; replace it with `NSE_MAX_ALLOCATION_PCT`.
+`NSE_SYMBOL` (default `RELIANCE`, used only when no symbols are passed on the command line and `NSE_INDEX` is unset), `NSE_PRINCIPAL` (default `100000`), `NSE_MAX_ALLOCATION_PCT` (default `10`), `NSE_MAX_LOSS_PCT` (default `1`), `NSE_ATR_STOP_MULTIPLE` (default `2`), `NSE_REWARD_RISK_RATIO` (default `2`), `NSE_POLICY_VERSION` (bump when technical/risk/prompt semantics change), `TRADE_LOG_PATH` (default `trade_log.jsonl`, gitignored), `EVALUATION_DB_PATH` (default `evaluation.db`, gitignored), `EVALUATION_BENCHMARK_SYMBOL` (default `JUNIORBEES`), `EVALUATION_ROUND_TRIP_COST_BPS` (default `30`, an explicit starting assumption), `NSE_INDEX` (e.g. `NIFTY 50` — if set and no symbols are passed on the command line, scans the index's constituents instead of falling back to `NSE_SYMBOL`), `NSE_SCAN_LIMIT` (optional, caps how many constituents are scanned), `NSE_SCAN_DELAY_SECONDS` (default `1`, pause between symbols in a batch/index scan), `NSE_CALL_DELAY_SECONDS` (default `0.3`, pause after each quote/historical-data call), `CACHE_DIR` (default `.cache`, gitignored), `FUNDAMENTALS_CACHE_TTL_HOURS` (default `24`), `FUNDAMENTALS_CALL_DELAY_SECONDS` (default `0.5`), `INTRADAY_CACHE_TTL_MINUTES` (default `5`), `NSE_MARKET_DATA_GRACE_MINUTES` (default `15`), `AEROSPIKE_HOST` / `AEROSPIKE_PORT` / `AEROSPIKE_NAMESPACE`, `NSE_XBRL_CALL_DELAY_SECONDS` (default `2`), `NSE_XBRL_JITTER_SECONDS` (default `0.5`), `NSE_XBRL_LOOKBACK_DAYS` (default `730`), `NSE_XBRL_MANIFEST_TTL_SECONDS` (default `21600`), `BHAVCOPY_DB_PATH` (default `bhavcopy.db`), `BHAVCOPY_BACKFILL_DAYS` (default `30`), `BHAVCOPY_REQUEST_DELAY_SECONDS` (default `2`), and `BHAVCOPY_PUBLISH_HOUR_IST` (default `18`). `NSE_RISK_PCT` remains a temporary fallback for the allocation cap.
 
 ### Running
 

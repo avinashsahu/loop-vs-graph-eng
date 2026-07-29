@@ -90,50 +90,58 @@ class LocalLlmTests(unittest.TestCase):
 
     def test_fundamental_assessment_returns_compact_structured_evidence(self):
         self.completions.content = (
-            '{"verdict":"GOOD","reason_code":"NO_MATERIAL_RED_FLAG",'
-            '"reason":"Stable ownership and no adverse announcements.",'
-            '"evidence":["SHAREHOLDING","ANNOUNCEMENTS"]}'
+            '{"verdict":"PASS","reason_code":"NO_MATERIAL_RED_FLAG",'
+            '"summary":"Stable ownership and no adverse announcements.",'
+            '"evidence_ids":["SHAREHOLDING_2026-06-30","ANNOUNCEMENT_1"],'
+            '"missing":[]}'
         )
 
         with patch.multiple(llm, USE_LOCAL_LLM=True, USE_REAL_LLM=False):
-            assessment = llm.assess_fundamentals("Judge these fundamentals")
+            assessment = llm.assess_fundamentals(
+                "Judge these fundamentals",
+                ("SHAREHOLDING_2026-06-30", "ANNOUNCEMENT_1"),
+            )
 
         self.assertEqual(
             assessment.to_dict(),
             {
-                "verdict": "GOOD",
+                "verdict": "PASS",
                 "reason_code": "NO_MATERIAL_RED_FLAG",
-                "reason": "Stable ownership and no adverse announcements.",
-                "evidence": ["SHAREHOLDING", "ANNOUNCEMENTS"],
+                "summary": "Stable ownership and no adverse announcements.",
+                "evidence_ids": ["SHAREHOLDING_2026-06-30", "ANNOUNCEMENT_1"],
+                "missing": [],
             },
         )
         schema = self.completions.request["response_format"]["json_schema"][
             "schema"
         ]
-        self.assertEqual(schema["properties"]["reason"]["maxLength"], 160)
-        self.assertEqual(schema["properties"]["evidence"]["maxItems"], 2)
+        self.assertEqual(schema["properties"]["summary"]["maxLength"], 220)
+        self.assertEqual(schema["properties"]["evidence_ids"]["maxItems"], 3)
         self.assertEqual(self.completions.request["temperature"], 0)
 
     def test_fundamental_assessment_deduplicates_repeated_evidence_tags(self):
         self.completions.content = (
-            '{"verdict":"BAD","reason_code":"INSUFFICIENT_EVIDENCE",'
-            '"reason":"The supplied evidence is incomplete.",'
-            '"evidence":["CORPORATE_ACTIONS","CORPORATE_ACTIONS"]}'
+            '{"verdict":"REVIEW","reason_code":"INSUFFICIENT_EVIDENCE",'
+            '"summary":"The supplied evidence is incomplete.",'
+            '"evidence_ids":["CORPORATE_ACTION_1","CORPORATE_ACTION_1"],'
+            '"missing":["shareholding_history"]}'
         )
 
         with patch.multiple(llm, USE_LOCAL_LLM=True, USE_REAL_LLM=False):
-            assessment = llm.assess_fundamentals("Judge these fundamentals")
+            assessment = llm.assess_fundamentals(
+                "Judge these fundamentals", ("CORPORATE_ACTION_1",)
+            )
 
-        self.assertEqual(assessment.evidence, ("CORPORATE_ACTIONS",))
+        self.assertEqual(assessment.evidence_ids, ("CORPORATE_ACTION_1",))
 
     def test_fundamental_assessment_repairs_one_invalid_structured_response(self):
         completions = _SequencedCompletions(
             [
                 "The company appears stable.",
                 (
-                    '{"verdict":"GOOD","reason_code":"NO_MATERIAL_RED_FLAG",'
-                    '"reason":"No material red flag in the supplied evidence.",'
-                    '"evidence":["ANNOUNCEMENTS"]}'
+                    '{"verdict":"PASS","reason_code":"NO_MATERIAL_RED_FLAG",'
+                    '"summary":"No material red flag in the supplied evidence.",'
+                    '"evidence_ids":["ANNOUNCEMENT_1"],"missing":[]}'
                 ),
             ]
         )
@@ -142,9 +150,11 @@ class LocalLlmTests(unittest.TestCase):
         )
 
         with patch.multiple(llm, USE_LOCAL_LLM=True, USE_REAL_LLM=False):
-            assessment = llm.assess_fundamentals("Judge these fundamentals")
+            assessment = llm.assess_fundamentals(
+                "Judge these fundamentals", ("ANNOUNCEMENT_1",)
+            )
 
-        self.assertEqual(assessment.verdict, "GOOD")
+        self.assertEqual(assessment.verdict, "PASS")
         self.assertEqual(len(completions.requests), 2)
         self.assertEqual(completions.requests[1]["max_tokens"], 192)
         self.assertIn(
@@ -156,14 +166,14 @@ class LocalLlmTests(unittest.TestCase):
         completions = _SequencedCompletions(
             [
                 (
-                    '{"verdict":"BAD","reason_code":"NO_MATERIAL_RED_FLAG",'
-                    '"reason":"No material red flag was identified.",'
-                    '"evidence":["ANNOUNCEMENTS"]}'
+                    '{"verdict":"REJECT","reason_code":"NO_MATERIAL_RED_FLAG",'
+                    '"summary":"No material red flag was identified.",'
+                    '"evidence_ids":["ANNOUNCEMENT_1"],"missing":[]}'
                 ),
                 (
-                    '{"verdict":"GOOD","reason_code":"NO_MATERIAL_RED_FLAG",'
-                    '"reason":"No material red flag was identified.",'
-                    '"evidence":["ANNOUNCEMENTS"]}'
+                    '{"verdict":"PASS","reason_code":"NO_MATERIAL_RED_FLAG",'
+                    '"summary":"No material red flag was identified.",'
+                    '"evidence_ids":["ANNOUNCEMENT_1"],"missing":[]}'
                 ),
             ]
         )
@@ -172,22 +182,24 @@ class LocalLlmTests(unittest.TestCase):
         )
 
         with patch.multiple(llm, USE_LOCAL_LLM=True, USE_REAL_LLM=False):
-            assessment = llm.assess_fundamentals("Judge these fundamentals")
+            assessment = llm.assess_fundamentals(
+                "Judge these fundamentals", ("ANNOUNCEMENT_1",)
+            )
 
-        self.assertEqual(assessment.verdict, "GOOD")
+        self.assertEqual(assessment.verdict, "PASS")
         self.assertEqual(len(completions.requests), 2)
 
     def test_fundamental_assessment_repairs_wrong_json_field_types(self):
         completions = _SequencedCompletions(
             [
                 (
-                    '{"verdict":"GOOD","reason_code":"NO_MATERIAL_RED_FLAG",'
-                    '"reason":42,"evidence":""}'
+                    '{"verdict":"PASS","reason_code":"NO_MATERIAL_RED_FLAG",'
+                    '"summary":42,"evidence_ids":"","missing":[]}'
                 ),
                 (
-                    '{"verdict":"GOOD","reason_code":"NO_MATERIAL_RED_FLAG",'
-                    '"reason":"No material red flag was identified.",'
-                    '"evidence":[]}'
+                    '{"verdict":"PASS","reason_code":"NO_MATERIAL_RED_FLAG",'
+                    '"summary":"No material red flag was identified.",'
+                    '"evidence_ids":["EARNINGS_2026-06"],"missing":[]}'
                 ),
             ]
         )
@@ -196,7 +208,9 @@ class LocalLlmTests(unittest.TestCase):
         )
 
         with patch.multiple(llm, USE_LOCAL_LLM=True, USE_REAL_LLM=False):
-            assessment = llm.assess_fundamentals("Judge these fundamentals")
+            assessment = llm.assess_fundamentals(
+                "Judge these fundamentals", ("EARNINGS_2026-06",)
+            )
 
         self.assertEqual(assessment.reason, "No material red flag was identified.")
         self.assertEqual(len(completions.requests), 2)
@@ -205,14 +219,14 @@ class LocalLlmTests(unittest.TestCase):
         completions = _SequencedCompletions(
             [
                 (
-                    '{"verdict":"GOOD","reason_code":"NO_MATERIAL_RED_FLAG",'
-                    '"reason":"No material red flag was identified.",'
-                    '"evidence":["YEARWISE_RETURNS"],"confidence":0.9}'
+                    '{"verdict":"PASS","reason_code":"NO_MATERIAL_RED_FLAG",'
+                    '"summary":"No material red flag was identified.",'
+                    '"evidence_ids":["EARNINGS_2026-06"],"missing":[],"confidence":0.9}'
                 ),
                 (
-                    '{"verdict":"GOOD","reason_code":"NO_MATERIAL_RED_FLAG",'
-                    '"reason":"No material red flag was identified.",'
-                    '"evidence":["YEARWISE_RETURNS"]}'
+                    '{"verdict":"PASS","reason_code":"NO_MATERIAL_RED_FLAG",'
+                    '"summary":"No material red flag was identified.",'
+                    '"evidence_ids":["EARNINGS_2026-06"],"missing":[]}'
                 ),
             ]
         )
@@ -221,9 +235,11 @@ class LocalLlmTests(unittest.TestCase):
         )
 
         with patch.multiple(llm, USE_LOCAL_LLM=True, USE_REAL_LLM=False):
-            assessment = llm.assess_fundamentals("Judge these fundamentals")
+            assessment = llm.assess_fundamentals(
+                "Judge these fundamentals", ("EARNINGS_2026-06",)
+            )
 
-        self.assertEqual(assessment.evidence, ("YEARWISE_RETURNS",))
+        self.assertEqual(assessment.evidence_ids, ("EARNINGS_2026-06",))
         self.assertEqual(len(completions.requests), 2)
 
     def test_active_model_config_describes_the_backend_that_will_run(self):
@@ -234,6 +250,7 @@ class LocalLlmTests(unittest.TestCase):
                     "backend": "openai_compatible_local",
                     "name": llm.LOCAL_LLM_MODEL,
                     "max_tokens": llm.LOCAL_LLM_MAX_TOKENS,
+                    "fundamental_max_tokens": llm.FUNDAMENTAL_LLM_MAX_TOKENS,
                 },
             )
         with patch.multiple(llm, USE_LOCAL_LLM=False, USE_REAL_LLM=True):
@@ -243,6 +260,10 @@ class LocalLlmTests(unittest.TestCase):
                     "backend": "anthropic",
                     "name": llm.ANTHROPIC_MODEL,
                     "max_tokens": llm.ANTHROPIC_MAX_TOKENS,
+                    "fundamental_max_tokens": min(
+                        llm.ANTHROPIC_MAX_TOKENS,
+                        llm.FUNDAMENTAL_LLM_MAX_TOKENS,
+                    ),
                 },
             )
         with patch.multiple(llm, USE_LOCAL_LLM=False, USE_REAL_LLM=False):
@@ -252,6 +273,7 @@ class LocalLlmTests(unittest.TestCase):
                     "backend": "stub",
                     "name": "deterministic-stub",
                     "max_tokens": None,
+                    "fundamental_max_tokens": None,
                 },
             )
 

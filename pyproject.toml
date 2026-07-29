@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.14"
 dependencies = [
+    "aerospike>=19.2.2",
     "anthropic>=0.120.0",
     "nsemine>=1.5",
     "openai>=2.49.0",

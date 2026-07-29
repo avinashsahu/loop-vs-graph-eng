@@ -8,8 +8,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import json
+import math
 import os
 import time
+from dataclasses import asdict
 
 from nsemine.live import get_stock_live_quotes
 
@@ -19,24 +21,29 @@ import nse_data
 import position_risk
 import ta_analysis
 from evaluation import EvaluationLedger
-from llm import active_model_config, assess_fundamentals, call_llm
+from fundamental_evidence import (
+    EVIDENCE_VERSION,
+    PROMPT_VERSION,
+    build_fundamental_evidence,
+)
+from llm import (
+    FUNDAMENTAL_SCHEMA_VERSION,
+    active_model_config,
+    assess_fundamentals,
+)
 from logging_config import setup_logging
 from market_time import now_ist
+from shareholding import get_shareholding_history
 
 TRADE_LOG_PATH = os.environ.get("TRADE_LOG_PATH", "trade_log.jsonl")
 EVALUATION_DB_PATH = os.environ.get("EVALUATION_DB_PATH", "evaluation.db")
 NSE_SCAN_LABEL = os.environ.get("NSE_SCAN_LABEL", "manual")
 NSE_POLICY_VERSION = os.environ.get(
     "NSE_POLICY_VERSION",
-    "technical-confluence-v1+risk-atr-target-v2+llm-prompts-v2",
+    "technical-confluence-v1+risk-atr-target-v2+sentiment-volatility-v1+llm-prompts-v4",
 )
 
 log = setup_logging("nse")
-
-
-def _verdict_prompt(question):
-    return f"{question}\nReply with exactly one word first: GOOD or BAD. Then, on the same line, a short reason."
-
 
 def node_fetch(state):
     state["iters"] += 1
@@ -119,12 +126,13 @@ def node_fundamental(state):
     eps, pat = snap.get("eps"), snap.get("pat")
 
     if (isinstance(eps, (int, float)) and eps < 0) or (isinstance(pat, (int, float)) and pat < 0):
-        state["fundamental_verdict"] = f"BAD: negative EPS/PAT (eps={eps}, pat={pat})"
+        state["fundamental_verdict"] = f"REJECT: negative EPS/PAT (eps={eps}, pat={pat})"
         state["fundamental_assessment"] = {
-            "verdict": "BAD",
+            "verdict": "REJECT",
             "reason_code": "PEER_OR_EARNINGS_WEAKNESS",
-            "reason": f"Negative EPS/PAT (eps={eps}, pat={pat}).",
-            "evidence": ["PEER_COMPARISON"],
+            "summary": f"Negative EPS/PAT (eps={eps}, pat={pat}).",
+            "evidence_ids": ["EARNINGS_HARD_CHECK"],
+            "missing": [],
         }
         log.warning(state["fundamental_verdict"])
         return "abort", state
@@ -134,34 +142,79 @@ def node_fundamental(state):
         # prompt full of Nones isn't a real fundamental read, and silently defaulting to
         # GOOD would present an unvetted symbol as fully checked. Surface it for a human
         # to look at instead of guessing.
-        state["fundamental_verdict"] = "BAD: fundamental data fetch was incomplete, not evaluated"
+        state["fundamental_verdict"] = "REVIEW: fundamental data fetch was incomplete, not evaluated"
         state["fundamental_assessment"] = {
-            "verdict": "BAD",
+            "verdict": "REVIEW",
             "reason_code": "INSUFFICIENT_EVIDENCE",
-            "reason": "Fundamental data fetch was incomplete.",
-            "evidence": [],
+            "summary": "Fundamental data fetch was incomplete.",
+            "evidence_ids": [],
+            "missing": ["fundamental_snapshot"],
         }
         log.warning(state["fundamental_verdict"])
         return "flag_review", state
 
-    assessment = assess_fundamentals(
-        f"Fundamental snapshot for {state['symbol']} ({snap.get('company_name')}): "
-        f"corp actions={snap.get('corp_actions')}, "
-        f"corp announcements={snap.get('corp_announcements')}, "
-        f"shareholding pattern (recent periods)={snap.get('shareholding_pattern')}, "
-        f"yearwise returns={snap.get('yearwise_returns')}, "
-        f"peer comparison (quarter {snap.get('peer_comparison_quarter')})={snap.get('peer_comparison')}, "
-        f"delivery participation (from NSE bhavcopy)={state.get('delivery_trend')}.\n"
-        "Delivery data is supporting market-participation context only: it does not reveal buyer "
-        "or seller direction and cannot establish accumulation or distribution by itself. "
-        "Does the company look fundamentally sound -- no red flags in recent corporate actions, "
-        "announcements, or shareholding trend, and reasonable standing versus peers?"
-    )
+    try:
+        history = get_shareholding_history(state["symbol"])
+    except Exception:
+        log.warning(
+            "shareholding[%s]: cached history unavailable",
+            state["symbol"],
+            exc_info=True,
+        )
+        state["fundamental_verdict"] = "REVIEW: cached shareholding history unavailable"
+        state["fundamental_assessment"] = {
+            "verdict": "REVIEW",
+            "reason_code": "INSUFFICIENT_EVIDENCE",
+            "summary": "Cached shareholding history is unavailable.",
+            "evidence_ids": [],
+            "missing": ["shareholding_history"],
+        }
+        return "flag_review", state
+
+    state["shareholding_history"] = asdict(history)
+    if history.status != "ready":
+        state["fundamental_verdict"] = (
+            "REVIEW: shareholding history is pending background XBRL warm"
+        )
+        state["fundamental_assessment"] = {
+            "verdict": "REVIEW",
+            "reason_code": "INSUFFICIENT_EVIDENCE",
+            "summary": "Shareholding history is pending background XBRL warm.",
+            "evidence_ids": [],
+            "missing": ["shareholding_history"],
+        }
+        return "flag_review", state
+
+    evidence = build_fundamental_evidence(state["symbol"], snap, history)
+    state["fundamental_evidence"] = evidence.payload
+    if not evidence.payload["coverage"]["complete"]:
+        missing = evidence.payload["coverage"]["missing"][:3]
+        state["fundamental_verdict"] = (
+            f"REVIEW: required fundamental evidence is missing ({', '.join(missing)})"
+        )
+        state["fundamental_assessment"] = {
+            "verdict": "REVIEW",
+            "reason_code": "INSUFFICIENT_EVIDENCE",
+            "summary": "Required fundamental evidence is missing.",
+            "evidence_ids": [],
+            "missing": missing,
+        }
+        return "flag_review", state
+
+    prompt = evidence.prompt()
+    state["fundamental_prompt"] = {
+        "prompt_version": PROMPT_VERSION,
+        "evidence_version": EVIDENCE_VERSION,
+        "schema_version": FUNDAMENTAL_SCHEMA_VERSION,
+        "prompt_hash": evidence.prompt_hash,
+        "evidence_hash": evidence.evidence_hash,
+    }
+    assessment = assess_fundamentals(prompt, evidence.ids)
     state["fundamental_assessment"] = assessment.to_dict()
     state["fundamental_verdict"] = assessment.summary
     log.info("fundamental_assessment=%r", state["fundamental_assessment"])
 
-    if assessment.verdict == "GOOD":
+    if assessment.verdict == "PASS":
         return "risk", state
     return "flag_review", state
 
@@ -242,13 +295,24 @@ def node_risk(state):
 
 def node_sentiment(state):
     quote = state["quote"]
-    verdict = call_llm(
-        _verdict_prompt(
-            f"Stock {state['symbol']} ({quote['name']}) is {quote['changepct']}% today, sector {quote['sector']}. "
-            "Does this look like a reasonable entry point (not a crash, not an extreme spike)?"
-        ),
-        mode="check",
+    change_pct = float(quote["changepct"])
+    entry_price = float(state["risk_plan"]["entry_price"])
+    atr_pct = (
+        float(state["technical_indicators"]["D"]["atr14"]) / entry_price * 100
     )
+    threshold_pct = min(10.0, max(3.0, 2.0 * atr_pct))
+    if not all(math.isfinite(value) for value in (change_pct, atr_pct, threshold_pct)):
+        verdict = "BAD: invalid daily-move or ATR context"
+    elif abs(change_pct) > threshold_pct:
+        verdict = (
+            f"BAD: daily move {change_pct:+.2f}% exceeds volatility-aware "
+            f"{threshold_pct:.2f}% review threshold"
+        )
+    else:
+        verdict = (
+            f"GOOD: daily move {change_pct:+.2f}% is within volatility-aware "
+            f"{threshold_pct:.2f}% review threshold"
+        )
     state["sentiment_verdict"] = verdict
     log.info("sentiment_verdict=%r", verdict)
 
@@ -319,6 +383,9 @@ def build_record(state):
         "technical_verdict": state.get("technical_verdict"),
         "fundamental_verdict": state.get("fundamental_verdict"),
         "fundamental_assessment": state.get("fundamental_assessment"),
+        "fundamental_evidence": state.get("fundamental_evidence"),
+        "fundamental_prompt": state.get("fundamental_prompt"),
+        "shareholding_history": state.get("shareholding_history"),
         "eps": (state.get("fundamental_snapshot") or {}).get("eps"),
         "pat": (state.get("fundamental_snapshot") or {}).get("pat"),
         "delivery_trend": state.get("delivery_trend"),
@@ -386,6 +453,9 @@ def run(
         "technical_verdict": None,
         "fundamental_verdict": None,
         "fundamental_assessment": None,
+        "fundamental_evidence": None,
+        "fundamental_prompt": None,
+        "shareholding_history": None,
         "risk_plan": None,
         "risk_verdict": None,
         "sentiment_verdict": None,
