@@ -10,8 +10,16 @@ import sys
 from functools import partial
 
 import notify
-from alert_ledger import AlertLedger, AlertLedgerStateError
-from digest import format_symbol_section, format_symbol_section_slack, read_jsonl_records
+from alert_ledger import (
+    AlertLedger,
+    AlertLedgerStateError,
+    build_decision_fingerprint,
+)
+from digest import (
+    format_symbol_section,
+    format_symbol_section_slack,
+    read_jsonl_records,
+)
 from logging_config import setup_logging
 from market_time import is_market_hours, now_ist
 
@@ -39,10 +47,13 @@ def _load_pick_symbols(run_id):
     symbols = []
     seen = set()
     for record in read_jsonl_records(TRADE_LOG_PATH):
-        if record.get("scan_label") == run_id and record["status"] in ("proposed", "flagged_for_review"):
-            if record["symbol"] not in seen:
-                seen.add(record["symbol"])
-                symbols.append(record["symbol"])
+        if (
+            record.get("scan_label") == run_id
+            and record["status"] in ("proposed", "flagged_for_review")
+            and record["symbol"] not in seen
+        ):
+            seen.add(record["symbol"])
+            symbols.append(record["symbol"])
     return symbols
 
 
@@ -100,11 +111,14 @@ if __name__ == "__main__":
             continue
 
         status = final_state["status"]
+        # The fingerprint excludes timestamps and prose, so only disposition, material
+        # plan fields, or typed decision reasons create a new alert transition.
+        record = nse_trade_graph.build_record(final_state)
+        fingerprint = build_decision_fingerprint(record)
         channels = {}
         if status in ("proposed", "flagged_for_review"):
             # Same builder node_log already used internally (run() logs as part of the graph
             # itself) -- guarantees alerts contain exactly what's in trade_log.jsonl.
-            record = nse_trade_graph.build_record(final_state)
             subject = f"NSE Intraday Alert -- {symbol} -- {status}"
             if notify.EMAIL_ENABLED and notify.get_recipients():
                 channels["email"] = partial(
@@ -124,20 +138,19 @@ if __name__ == "__main__":
                 run_id=run_id,
                 symbol=symbol,
                 status=status,
+                fingerprint=fingerprint,
                 channels=channels,
             )
         except AlertLedgerStateError:
-            log.error(
+            log.exception(
                 "alert ledger failed closed for %s; no notification attempted",
                 symbol,
-                exc_info=True,
             )
             continue
         except Exception:
-            log.error(
+            log.exception(
                 "alert delivery state uncertain for %s; a channel may have been sent and retried",
                 symbol,
-                exc_info=True,
             )
             continue
         for channel, outcome in outcomes.items():

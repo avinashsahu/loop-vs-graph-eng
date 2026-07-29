@@ -1,3 +1,4 @@
+import json
 import tempfile
 import threading
 import time
@@ -7,10 +8,69 @@ from pathlib import Path
 from unittest.mock import patch
 
 import alert_ledger
-from alert_ledger import AlertLedger, AlertLedgerStateError
+from alert_ledger import (
+    AlertLedger,
+    AlertLedgerStateError,
+    build_decision_fingerprint,
+)
 
 
 class AlertLedgerTests(unittest.TestCase):
+    def test_material_plan_change_is_delivered_once_per_channel(self):
+        delivered = []
+        base_record = {
+            "disposition": "PROPOSE",
+            "decision_reason": {
+                "stage": "decision",
+                "code": "ALL_GATES_PASSED",
+            },
+            "risk_plan": {
+                "entry_price": 100.0,
+                "stop_price": 90.0,
+                "target_price": 120.0,
+                "shares": 10,
+            },
+        }
+        changed_record = {
+            **base_record,
+            "risk_plan": {
+                **base_record["risk_plan"],
+                "stop_price": 92.0,
+                "target_price": 116.0,
+                "shares": 8,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = AlertLedger(Path(temp_dir) / "intraday-alerts.json")
+            outcomes = []
+            for record in (
+                base_record,
+                base_record,
+                changed_record,
+                changed_record,
+            ):
+                outcomes.append(
+                    ledger.observe_and_deliver(
+                        run_id="overnight_20260729_0100",
+                        symbol="ACE",
+                        status="proposed",
+                        fingerprint=build_decision_fingerprint(record),
+                        channels={
+                            "email": lambda: delivered.append("email"),
+                            "slack": lambda: delivered.append("slack"),
+                        },
+                    )
+                )
+
+        self.assertEqual(
+            delivered,
+            ["email", "slack", "email", "slack"],
+        )
+        self.assertEqual(outcomes[1]["email"], "skipped_unchanged")
+        self.assertEqual(outcomes[2]["email"], "delivered")
+        self.assertEqual(outcomes[3]["slack"], "skipped_unchanged")
+
     def test_unchanged_actionable_status_is_delivered_once_across_process_restarts(self):
         delivered = []
 
@@ -122,7 +182,20 @@ class AlertLedgerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "intraday-alerts.json"
-            path.write_text('{"version": 1, "alerts": {"broken": {}}}')
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "alerts": {
+                            "run:ACE": {
+                                "status": "proposed",
+                                "fingerprint": "truncated",
+                                "delivered_channels": ["slack"],
+                            }
+                        },
+                    }
+                )
+            )
 
             with self.assertRaises(AlertLedgerStateError):
                 AlertLedger(path).observe_and_deliver(
@@ -166,14 +239,20 @@ class AlertLedgerTests(unittest.TestCase):
                 channels={},
             )
 
-            with patch.object(alert_ledger.os, "replace", side_effect=OSError("disk failure")):
-                with self.assertRaises(OSError):
-                    ledger.observe_and_deliver(
-                        run_id="overnight_20260729_0100",
-                        symbol="ACE",
-                        status="proposed",
-                        channels={"slack": lambda: delivered.append("slack")},
-                    )
+            with (
+                patch.object(
+                    alert_ledger.os,
+                    "replace",
+                    side_effect=OSError("disk failure"),
+                ),
+                self.assertRaises(OSError),
+            ):
+                ledger.observe_and_deliver(
+                    run_id="overnight_20260729_0100",
+                    symbol="ACE",
+                    status="proposed",
+                    channels={"slack": lambda: delivered.append("slack")},
+                )
 
         self.assertEqual(delivered, ["slack"])
 

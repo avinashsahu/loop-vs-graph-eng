@@ -1,12 +1,42 @@
 import fcntl
+import hashlib
 import json
 import os
 import tempfile
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Callable
-
+from typing import Any
 
 _ACTIONABLE_STATUSES = {"proposed", "flagged_for_review"}
+
+
+def _is_valid_fingerprint(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def build_decision_fingerprint(record: Mapping[str, Any]) -> str:
+    risk_plan = record.get("risk_plan") or {}
+    decision_reason = record.get("decision_reason") or {}
+    material_decision = {
+        "disposition": record.get("disposition"),
+        "entry_price": risk_plan.get("entry_price"),
+        "stop_price": risk_plan.get("stop_price"),
+        "target_price": risk_plan.get("target_price"),
+        "shares": risk_plan.get("shares"),
+        "reason_stage": decision_reason.get("stage"),
+        "reason_code": decision_reason.get("code"),
+    }
+    canonical = json.dumps(
+        material_decision,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 class AlertLedgerStateError(RuntimeError):
@@ -14,7 +44,7 @@ class AlertLedgerStateError(RuntimeError):
 
 
 class AlertLedger:
-    """Persist status transitions and deliver each channel once per transition."""
+    """Persist material decision transitions and deliver each channel once."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -25,8 +55,11 @@ class AlertLedger:
         run_id: str,
         symbol: str,
         status: str,
+        fingerprint: str | None = None,
         channels: dict[str, Callable[[], None]],
     ) -> dict[str, str]:
+        if fingerprint is not None and not _is_valid_fingerprint(fingerprint):
+            raise ValueError("fingerprint must be a lowercase SHA-256 hex digest")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = self.path.with_name(f"{self.path.name}.lock")
         with lock_path.open("a") as lock_file:
@@ -36,6 +69,7 @@ class AlertLedger:
                     run_id=run_id,
                     symbol=symbol,
                     status=status,
+                    fingerprint=fingerprint,
                     channels=channels,
                 )
             finally:
@@ -47,14 +81,35 @@ class AlertLedger:
         run_id: str,
         symbol: str,
         status: str,
+        fingerprint: str | None,
         channels: dict[str, Callable[[], None]],
     ) -> dict[str, str]:
         state = self._read()
         key = f"{run_id}:{symbol}"
         entry = state["alerts"].get(key)
+        effective_fingerprint = fingerprint or hashlib.sha256(
+            f"status:{status}".encode()
+        ).hexdigest()
 
         if entry is None or entry["status"] != status:
-            entry = {"status": status, "delivered_channels": []}
+            entry = {
+                "status": status,
+                "fingerprint": effective_fingerprint,
+                "delivered_channels": [],
+            }
+            state["alerts"][key] = entry
+            self._write(state)
+        elif "fingerprint" not in entry:
+            # Version-1 ledgers tracked status only. Establish a material baseline
+            # without replaying every previously delivered actionable alert.
+            entry["fingerprint"] = effective_fingerprint
+            self._write(state)
+        elif entry["fingerprint"] != effective_fingerprint:
+            entry = {
+                "status": status,
+                "fingerprint": effective_fingerprint,
+                "delivered_channels": [],
+            }
             state["alerts"][key] = entry
             self._write(state)
 
@@ -69,7 +124,7 @@ class AlertLedger:
                 continue
             try:
                 send()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 outcomes[channel] = f"failed: {exc}"
                 continue
             delivered.add(channel)
@@ -99,6 +154,10 @@ class AlertLedger:
                 not isinstance(key, str)
                 or not isinstance(entry, dict)
                 or not isinstance(entry.get("status"), str)
+                or (
+                    "fingerprint" in entry
+                    and not _is_valid_fingerprint(entry["fingerprint"])
+                )
                 or not isinstance(entry.get("delivered_channels"), list)
                 or not all(isinstance(channel, str) for channel in entry["delivered_channels"])
             ):
