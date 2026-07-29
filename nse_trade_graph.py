@@ -48,7 +48,9 @@ def node_fetch(state):
         log.warning(state["risk_verdict"])
         return "abort", state
 
-    state["hist_multi"] = nse_data.get_multi_timeframe_history(state["symbol"])
+    market_snapshot = nse_data.get_market_snapshot(state["symbol"])
+    state["market_snapshot"] = market_snapshot.metadata()
+    state["hist_multi"] = market_snapshot.histories
     state["hist"] = state["hist_multi"]["D"]
 
     try:
@@ -291,6 +293,7 @@ def build_record(state):
         "iters": state["iters"],
         "technical_indicators": state.get("technical_indicators"),
         "technical_assessment": state.get("technical_assessment"),
+        "market_snapshot": state.get("market_snapshot"),
         "technical_verdict": state.get("technical_verdict"),
         "fundamental_verdict": state.get("fundamental_verdict"),
         "eps": (state.get("fundamental_snapshot") or {}).get("eps"),
@@ -342,6 +345,7 @@ def run(
         "quote": None,
         "hist": None,
         "hist_multi": None,
+        "market_snapshot": None,
         "fundamental_snapshot": None,
         "delivery_trend": None,
         "technical_indicators": None,

@@ -56,6 +56,18 @@ class FundamentalPromptTests(unittest.TestCase):
             "lower_circuit": 120.0,
         }
         histories = {timeframe: _history() for timeframe in ("D", "30", "15", "5")}
+        snapshot = nse_trade_graph.nse_data.MarketSnapshot(
+            symbol="ACE",
+            observed_at="2026-07-29T13:08:00+05:30",
+            histories=histories,
+            provenance={
+                timeframe: {
+                    "source": "NSE via nsemine",
+                    "latest_complete_bar": "2026-07-29T13:00:00",
+                }
+                for timeframe in histories
+            },
+        )
 
         with (
             patch.object(
@@ -65,8 +77,13 @@ class FundamentalPromptTests(unittest.TestCase):
             ),
             patch.object(
                 nse_trade_graph.nse_data,
+                "get_market_snapshot",
+                return_value=snapshot,
+            ),
+            patch.object(
+                nse_trade_graph.nse_data,
                 "get_multi_timeframe_history",
-                return_value=histories,
+                side_effect=AssertionError("node_fetch must retain snapshot provenance"),
             ),
             patch.object(
                 nse_trade_graph.bhavcopy,
@@ -83,6 +100,10 @@ class FundamentalPromptTests(unittest.TestCase):
 
         self.assertEqual(route, "technical")
         self.assertIsNone(result_state["fundamental_snapshot"])
+        self.assertEqual(
+            result_state["market_snapshot"]["timeframes"]["D"]["source"],
+            "NSE via nsemine",
+        )
         get_fundamentals.assert_not_called()
 
 
@@ -124,6 +145,37 @@ class TechnicalNodeTests(unittest.TestCase):
             result_state["technical_assessment"]["reason_codes"],
         )
         self.assertIn("invalid_data", result_state["technical_verdict"])
+
+
+class MarketSnapshotRecordTests(unittest.TestCase):
+    def test_trade_record_retains_market_snapshot_provenance(self):
+        snapshot_metadata = {
+            "symbol": "ACE",
+            "observed_at": "2026-07-29T13:08:00+05:30",
+            "timeframes": {
+                "D": {
+                    "source": "NSE via nsemine",
+                    "fetched_at": "2026-07-29T13:07:59+05:30",
+                    "cache_hit": False,
+                    "latest_complete_bar": "2026-07-28T00:00:00",
+                }
+            },
+        }
+        state = {
+            "symbol": "ACE",
+            "principal": 100_000.0,
+            "max_loss_pct": 1.0,
+            "max_allocation_pct": 10.0,
+            "atr_stop_multiple": 2.0,
+            "iters": 1,
+            "status": "aborted",
+            "proposal": None,
+            "market_snapshot": snapshot_metadata,
+        }
+
+        record = nse_trade_graph.build_record(state)
+
+        self.assertEqual(record["market_snapshot"], snapshot_metadata)
 
 
 class RiskNodeTests(unittest.TestCase):
