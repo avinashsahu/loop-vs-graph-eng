@@ -44,7 +44,15 @@ _FAMILY_ENGAGEMENT_THRESHOLD = 0.1
 def _clip(value, lo=-1.0, hi=1.0):
     # float() up front -- indicators are numpy floats, and numpy comparisons/arithmetic
     # produce numpy scalars that repr as "np.float64(...)" in log strings.
-    return max(lo, min(hi, float(value)))
+    value = float(value)
+    # NaN (not enough bars yet for a SMA50/ATR14 -- e.g. a recently-listed stock) must
+    # not reach min()/max(): min(1.0, nan) silently returns 1.0 in Python (nan compares
+    # False against everything), turning missing data into a fake maxed-out bullish
+    # signal instead of "no signal." Found live: BAJAJ-AUTO's daily SMA50 was nan and
+    # still produced trend_score=1.0, feeding a real (wrong) BUY proposal.
+    if value != value:
+        return 0.0
+    return max(lo, min(hi, value))
 
 
 def _adaptive_rsi_bands(atr_pct):
