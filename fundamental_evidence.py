@@ -13,6 +13,7 @@ EVIDENCE_VERSION = "fundamental-evidence-v3"
 PROMPT_VERSION = "fundamental-assessment-v5"
 PEER_MAX_AGE_DAYS = 200
 SHAREHOLDING_MAX_AGE_DAYS = 160
+FINANCIAL_MAX_AGE_DAYS = 200
 _IST = ZoneInfo("Asia/Kolkata")
 
 
@@ -211,19 +212,36 @@ def build_fundamental_evidence(
 
     peer_period = _period_end(snapshot.get("peer_comparison_quarter"))
     shareholding_period = _period_end(history.latest_period)
+    financial_periods = financial_history.get("periods")
+    latest_financial = (
+        financial_periods[0]
+        if isinstance(financial_periods, list)
+        and financial_periods
+        and isinstance(financial_periods[0], dict)
+        else {}
+    )
+    financial_period = _period_end(latest_financial.get("period_end"))
     peer_age_days = (as_of - peer_period).days if peer_period else None
     shareholding_age_days = (
         (as_of - shareholding_period).days if shareholding_period else None
+    )
+    financial_age_days = (
+        (as_of - financial_period).days if financial_period else None
     )
     peer_stale = peer_age_days is None or peer_age_days > PEER_MAX_AGE_DAYS
     shareholding_stale = (
         shareholding_age_days is None
         or shareholding_age_days > SHAREHOLDING_MAX_AGE_DAYS
     )
+    financial_stale = (
+        financial_age_days is None or financial_age_days > FINANCIAL_MAX_AGE_DAYS
+    )
     if peer_stale:
         missing.append("peer_comparison_stale")
     if shareholding_stale:
         missing.append("shareholding_history_stale")
+    if financial_stale:
+        missing.append("financial_history_stale")
 
     coverage_complete = bool(snapshot.get("complete")) and not missing
     return FundamentalEvidence(
@@ -242,6 +260,12 @@ def build_fundamental_evidence(
                 "shareholding_age_days": shareholding_age_days,
                 "shareholding_stale": shareholding_stale,
                 "shareholding_max_age_days": SHAREHOLDING_MAX_AGE_DAYS,
+                "financial_period": (
+                    financial_period.isoformat() if financial_period else None
+                ),
+                "financial_age_days": financial_age_days,
+                "financial_stale": financial_stale,
+                "financial_max_age_days": FINANCIAL_MAX_AGE_DAYS,
                 "latest_announcement": (
                     announcements[0].get("an_dt")
                     or announcements[0].get("sort_date")
