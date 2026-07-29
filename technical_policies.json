@@ -1,0 +1,84 @@
+{
+  "technical-confluence-v1": {
+    "description": "Replay-compatible baseline matching the original SMA, MACD and RSI policy.",
+    "timeframe_weights": {
+      "D": 3.0,
+      "30": 2.0,
+      "15": 1.0,
+      "5": 1.0
+    },
+    "families": [
+      "trend",
+      "momentum",
+      "rsi"
+    ],
+    "sma_gap_scale_pct": 3.0,
+    "macd_atr_scale": 0.5,
+    "family_engagement_threshold": 0.1,
+    "relative_strength_lookback": 20,
+    "relative_strength_scale_pct": 5.0,
+    "minimum_daily_turnover": 10000000.0,
+    "participation_score": 1.0,
+    "rsi_atr_thresholds": [
+      1.0,
+      2.5
+    ],
+    "rsi_bands": [
+      [
+        35.0,
+        65.0
+      ],
+      [
+        30.0,
+        70.0
+      ],
+      [
+        20.0,
+        80.0
+      ]
+    ],
+    "enforce_daily_anchor": false
+  },
+  "technical-relative-participation-v2": {
+    "description": "Daily-anchored candidate adding benchmark-relative strength and volume-confirmed participation.",
+    "timeframe_weights": {
+      "D": 4.0,
+      "30": 2.0,
+      "15": 1.0,
+      "5": 1.0
+    },
+    "families": [
+      "trend",
+      "momentum",
+      "rsi",
+      "relative_strength",
+      "participation"
+    ],
+    "sma_gap_scale_pct": 3.0,
+    "macd_atr_scale": 0.5,
+    "family_engagement_threshold": 0.1,
+    "relative_strength_lookback": 20,
+    "relative_strength_scale_pct": 5.0,
+    "minimum_daily_turnover": 10000000.0,
+    "participation_score": 1.0,
+    "rsi_atr_thresholds": [
+      1.0,
+      2.5
+    ],
+    "rsi_bands": [
+      [
+        35.0,
+        65.0
+      ],
+      [
+        30.0,
+        70.0
+      ],
+      [
+        20.0,
+        80.0
+      ]
+    ],
+    "enforce_daily_anchor": true
+  }
+}

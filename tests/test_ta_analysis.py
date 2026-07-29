@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -9,6 +10,23 @@ from ta_analysis import _clip
 
 def _history(rows=60):
     close = np.linspace(100.0, 130.0, rows)
+    return pd.DataFrame(
+        {
+            "close": close,
+            "high": close + 1.0,
+            "low": close - 1.0,
+        }
+    )
+
+
+def _bullish_history():
+    close = np.concatenate(
+        (
+            np.linspace(100.0, 110.0, 40),
+            np.linspace(110.0, 105.0, 10),
+            np.linspace(105.0, 115.0, 10),
+        )
+    )
     return pd.DataFrame(
         {
             "close": close,
@@ -35,6 +53,134 @@ class ClipTests(unittest.TestCase):
 
 
 class TechnicalAssessmentTests(unittest.TestCase):
+    def test_replay_selects_versioned_policies_once_per_symbol_day_and_applies_cost(self):
+        histories = {
+            timeframe: _bullish_history()
+            for timeframe in ("D", "30", "15", "5")
+        }
+        benchmark = _history()
+        observations = ta_analysis.TechnicalObservations(
+            histories=histories,
+            benchmark_daily=benchmark,
+            delivery_trend={
+                "status": "ready",
+                "delivery_pct_trend": "rising",
+                "delivery_volume_trend": "rising",
+                "recent_avg_total_volume": 200_000.0,
+                "baseline_avg_total_volume": 100_000.0,
+                "latest_vwap": 110.0,
+                "interpretation": "possible_accumulation",
+            },
+        )
+        samples = [
+            ta_analysis.TechnicalReplaySample(
+                symbol="ACE",
+                observed_at=datetime(2026, 7, 29, 10, 0),
+                observations=observations,
+                forward_return_pct=4.0,
+            ),
+            ta_analysis.TechnicalReplaySample(
+                symbol="ACE",
+                observed_at=datetime(2026, 7, 29, 14, 0),
+                observations=observations,
+                forward_return_pct=8.0,
+            ),
+        ]
+
+        replay = ta_analysis.replay_technical_policies(
+            samples,
+            policy_ids=(
+                "technical-confluence-v1",
+                "technical-relative-participation-v2",
+            ),
+            round_trip_cost_bps=20.0,
+        )
+
+        self.assertEqual(
+            set(replay),
+            {
+                "technical-confluence-v1",
+                "technical-relative-participation-v2",
+            },
+        )
+        revised = replay["technical-relative-participation-v2"]
+        self.assertEqual(revised.sample_count, 1)
+        self.assertEqual(revised.signal_count, 1)
+        self.assertAlmostEqual(revised.gross_return_pct, 4.0)
+        self.assertAlmostEqual(revised.net_return_pct, 3.8)
+        policy = ta_analysis.select_technical_policy(revised.policy_id)
+        self.assertGreaterEqual(
+            policy.timeframe_weight("D"),
+            sum(
+                policy.timeframe_weight(timeframe)
+                for timeframe in ("30", "15", "5")
+            ),
+        )
+
+    def test_revised_policy_requires_volume_to_confirm_delivery_percentage(self):
+        histories = {
+            timeframe: _bullish_history()
+            for timeframe in ("D", "30", "15", "5")
+        }
+        benchmark_close = np.linspace(100.0, 160.0, 60)
+        benchmark = pd.DataFrame(
+            {
+                "close": benchmark_close,
+                "high": benchmark_close + 1.0,
+                "low": benchmark_close - 1.0,
+            }
+        )
+        policy = ta_analysis.select_technical_policy(
+            "technical-relative-participation-v2"
+        )
+        percentage_only = ta_analysis.evaluate_technical(
+            ta_analysis.TechnicalObservations(
+                histories=histories,
+                benchmark_daily=benchmark,
+                delivery_trend={
+                    "status": "ready",
+                    "delivery_pct_trend": "rising",
+                    "delivery_volume_trend": "falling",
+                    "recent_avg_total_volume": 200_000.0,
+                    "baseline_avg_total_volume": 100_000.0,
+                    "latest_vwap": 110.0,
+                    "interpretation": "delivery_pct_rise_unconfirmed_by_volume",
+                },
+            ),
+            policy,
+        )
+        volume_confirmed = ta_analysis.evaluate_technical(
+            ta_analysis.TechnicalObservations(
+                histories=histories,
+                benchmark_daily=benchmark,
+                delivery_trend={
+                    "status": "ready",
+                    "delivery_pct_trend": "rising",
+                    "delivery_volume_trend": "rising",
+                    "recent_avg_total_volume": 200_000.0,
+                    "baseline_avg_total_volume": 100_000.0,
+                    "latest_vwap": 110.0,
+                    "interpretation": "possible_accumulation",
+                },
+            ),
+            policy,
+        )
+
+        self.assertLess(
+            percentage_only.evidence["families"]["relative_strength"],
+            0,
+        )
+        self.assertEqual(
+            percentage_only.evidence["families"]["participation"],
+            0.0,
+        )
+        self.assertEqual(percentage_only.verdict, "BAD")
+        self.assertGreater(
+            volume_confirmed.evidence["families"]["participation"],
+            0,
+        )
+        self.assertEqual(volume_confirmed.verdict, "GOOD")
+
     def test_insufficient_daily_history_is_rejected_before_scoring(self):
         histories = {
             "D": _history(rows=20),

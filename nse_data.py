@@ -115,12 +115,17 @@ def _completed_history(history, interval, observed_at, phase):
     return result.reset_index(drop=True), original_count - len(result)
 
 
-def get_market_snapshot(symbol: str) -> MarketSnapshot:
+def get_market_snapshot(
+    symbol: str,
+    timeframes: tuple | None = None,
+) -> MarketSnapshot:
     observed_at = now_ist()
     phase = _market_phase(observed_at)
     histories = {}
     provenance = {}
-    for interval, lookback_days in _TIMEFRAME_LOOKBACK_DAYS.items():
+    selected_timeframes = timeframes or tuple(_TIMEFRAME_LOOKBACK_DAYS)
+    for interval in selected_timeframes:
+        lookback_days = _TIMEFRAME_LOOKBACK_DAYS[interval]
         key, ttl = _cache_key_and_ttl(symbol, interval, observed_at)
 
         def fetch_fn(interval=interval, lookback_days=lookback_days):

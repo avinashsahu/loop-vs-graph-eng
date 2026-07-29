@@ -1,4 +1,8 @@
+import hashlib
+import json
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import talib
@@ -6,6 +10,136 @@ import talib
 _REQUIRED_TIMEFRAMES = ("D", "30", "15", "5")
 _REQUIRED_COLUMNS = ("close", "high", "low")
 _MINIMUM_BARS = 50
+BASELINE_TECHNICAL_POLICY_ID = "technical-confluence-v1"
+REVISED_TECHNICAL_POLICY_ID = "technical-relative-participation-v2"
+_POLICY_PATH = Path(__file__).with_name("technical_policies.json")
+_KNOWN_FAMILIES = {
+    "trend",
+    "momentum",
+    "rsi",
+    "relative_strength",
+    "participation",
+}
+
+
+@dataclass(frozen=True)
+class TechnicalPolicy:
+    policy_id: str
+    description: str
+    timeframe_weights: tuple[tuple[str, float], ...]
+    families: tuple[str, ...]
+    sma_gap_scale_pct: float
+    macd_atr_scale: float
+    family_engagement_threshold: float
+    relative_strength_lookback: int
+    relative_strength_scale_pct: float
+    minimum_daily_turnover: float
+    participation_score: float
+    rsi_atr_thresholds: tuple[float, float]
+    rsi_bands: tuple[tuple[float, float], ...]
+    enforce_daily_anchor: bool
+    fingerprint: str
+
+    def timeframe_weight(self, timeframe):
+        return dict(self.timeframe_weights)[timeframe]
+
+    @property
+    def total_timeframe_weight(self):
+        return sum(weight for _, weight in self.timeframe_weights)
+
+
+@dataclass(frozen=True)
+class TechnicalObservations:
+    """The completed-bar inputs shared by live evaluation and historical replay."""
+
+    histories: dict
+    benchmark_daily: object | None = None
+    delivery_trend: dict | None = None
+
+
+@dataclass(frozen=True)
+class TechnicalReplaySample:
+    symbol: str
+    observed_at: datetime
+    observations: TechnicalObservations
+    forward_return_pct: float
+
+
+@dataclass(frozen=True)
+class TechnicalReplayResult:
+    policy_id: str
+    policy_fingerprint: str
+    sample_count: int
+    signal_count: int
+    gross_return_pct: float
+    transaction_cost_pct: float
+    net_return_pct: float
+
+
+def _load_technical_policies():
+    raw_policies = json.loads(_POLICY_PATH.read_text())
+    policies = {}
+    for policy_id, raw in raw_policies.items():
+        canonical = json.dumps(raw, sort_keys=True, separators=(",", ":"))
+        policy = TechnicalPolicy(
+            policy_id=policy_id,
+            description=raw["description"],
+            timeframe_weights=tuple(
+                (timeframe, float(raw["timeframe_weights"][timeframe]))
+                for timeframe in _REQUIRED_TIMEFRAMES
+            ),
+            families=tuple(raw["families"]),
+            sma_gap_scale_pct=float(raw["sma_gap_scale_pct"]),
+            macd_atr_scale=float(raw["macd_atr_scale"]),
+            family_engagement_threshold=float(
+                raw["family_engagement_threshold"]
+            ),
+            relative_strength_lookback=int(raw["relative_strength_lookback"]),
+            relative_strength_scale_pct=float(
+                raw["relative_strength_scale_pct"]
+            ),
+            minimum_daily_turnover=float(raw["minimum_daily_turnover"]),
+            participation_score=float(raw["participation_score"]),
+            rsi_atr_thresholds=tuple(
+                float(value) for value in raw["rsi_atr_thresholds"]
+            ),
+            rsi_bands=tuple(
+                tuple(float(value) for value in band)
+                for band in raw["rsi_bands"]
+            ),
+            enforce_daily_anchor=bool(raw["enforce_daily_anchor"]),
+            fingerprint=hashlib.sha256(canonical.encode()).hexdigest()[:16],
+        )
+        unknown_families = set(policy.families) - _KNOWN_FAMILIES
+        if unknown_families:
+            raise ValueError(
+                f"{policy_id} has unknown indicator families: "
+                f"{sorted(unknown_families)}"
+            )
+        if (
+            policy.enforce_daily_anchor
+            and policy.timeframe_weight("D")
+            < sum(
+                policy.timeframe_weight(timeframe)
+                for timeframe in ("30", "15", "5")
+            )
+        ):
+            raise ValueError(
+                f"{policy_id} lets combined intraday weights outweigh daily"
+            )
+        policies[policy_id] = policy
+    return policies
+
+
+_TECHNICAL_POLICIES = _load_technical_policies()
+
+
+def select_technical_policy(policy_id):
+    """Resolve a persisted policy identity or fail instead of silently defaulting."""
+    try:
+        return _TECHNICAL_POLICIES[policy_id]
+    except KeyError as error:
+        raise ValueError(f"Unknown technical policy: {policy_id}") from error
 
 
 @dataclass(frozen=True)
@@ -15,6 +149,8 @@ class TechnicalAssessment:
     reason_codes: tuple[str, ...]
     indicators: dict
     evidence: dict
+    policy_id: str
+    policy_fingerprint: str
 
     def to_dict(self):
         # Indicators are persisted separately as `technical_indicators`; do not double
@@ -24,11 +160,17 @@ class TechnicalAssessment:
             "verdict": self.verdict,
             "reason_codes": list(self.reason_codes),
             "evidence": self.evidence,
+            "policy_id": self.policy_id,
+            "policy_fingerprint": self.policy_fingerprint,
         }
 
 
-def evaluate_technical(histories):
-    """Validate multi-timeframe bars, calculate indicators, and score one candidate."""
+def evaluate_technical(observations, policy=None):
+    """Validate and score one completed-bar observation under an explicit policy."""
+    policy = policy or select_technical_policy(BASELINE_TECHNICAL_POLICY_ID)
+    if isinstance(observations, dict):
+        observations = TechnicalObservations(histories=observations)
+    histories = observations.histories
     reasons = []
     for timeframe in _REQUIRED_TIMEFRAMES:
         history = histories.get(timeframe)
@@ -56,6 +198,33 @@ def evaluate_technical(histories):
             reason_codes=tuple(reasons),
             indicators={},
             evidence={},
+            policy_id=policy.policy_id,
+            policy_fingerprint=policy.fingerprint,
+        )
+
+    if "relative_strength" in policy.families:
+        benchmark = observations.benchmark_daily
+        required_benchmark_bars = policy.relative_strength_lookback + 1
+        if benchmark is None:
+            reasons.append("MISSING_BENCHMARK")
+        elif "close" not in benchmark.columns:
+            reasons.append("MISSING_BENCHMARK_CLOSE")
+        elif len(benchmark) < required_benchmark_bars:
+            reasons.append("INSUFFICIENT_BENCHMARK_BARS")
+        elif not np.isfinite(
+            benchmark["close"].tail(required_benchmark_bars).to_numpy(dtype=float)
+        ).all():
+            reasons.append("NON_FINITE_BENCHMARK_BARS")
+
+    if reasons:
+        return TechnicalAssessment(
+            status="invalid_data",
+            verdict="BAD",
+            reason_codes=tuple(reasons),
+            indicators={},
+            evidence={},
+            policy_id=policy.policy_id,
+            policy_fingerprint=policy.fingerprint,
         )
 
     indicators = {
@@ -76,15 +245,19 @@ def evaluate_technical(histories):
             reason_codes=tuple(indicator_reasons),
             indicators={},
             evidence={},
+            policy_id=policy.policy_id,
+            policy_fingerprint=policy.fingerprint,
         )
 
-    evidence = score_technical(indicators)
+    evidence = score_technical(indicators, observations, policy)
     return TechnicalAssessment(
         status="ready",
         verdict=evidence["verdict"],
         reason_codes=(),
         indicators=indicators,
         evidence=evidence,
+        policy_id=policy.policy_id,
+        policy_fingerprint=policy.fingerprint,
     )
 
 
@@ -119,21 +292,6 @@ def compute_indicators(hist):
     }
 
 
-# Daily counts most, matching the "weight the daily trend most heavily, use intraday to
-# confirm timing" rule this scoring replaces an LLM call for.
-_TIMEFRAME_WEIGHTS = {"D": 3, "30": 2, "15": 1, "5": 1}
-
-# Scale for the SMA20/50 gap: a 3% separation maxes out the trend score at +/-1. Picked
-# because a 3% SMA20/50 gap is already a well-established trend on NSE large caps, not
-# backtested against this app's own data (see README/commit for the sourcing caveat).
-_SMA_GAP_SCALE_PCT = 3.0
-
-# A family score below this magnitude is "not really saying anything" -- excluded from
-# the confluence vote so it can't count as either agreement or disagreement. Same class
-# of heuristic as the other constants here: reasonable, not backtested.
-_FAMILY_ENGAGEMENT_THRESHOLD = 0.1
-
-
 def _clip(value, lo=-1.0, hi=1.0):
     # float() up front -- indicators are numpy floats, and numpy comparisons/arithmetic
     # produce numpy scalars that repr as "np.float64(...)" in log strings.
@@ -148,7 +306,7 @@ def _clip(value, lo=-1.0, hi=1.0):
     return max(lo, min(hi, value))
 
 
-def _adaptive_rsi_bands(atr_pct):
+def _adaptive_rsi_bands(atr_pct, policy):
     """Overbought/oversold RSI band, widened or narrowed by recent volatility (ATR% of
     price) instead of Wilder's fixed 70/30 -- that fixed pair is an unvalidated 1978
     convention, not something derived from data. Volatility-adjusted bands are a real,
@@ -157,11 +315,12 @@ def _adaptive_rsi_bands(atr_pct):
     universe -- that calibration needs a backtest harness over the bhavcopy history,
     which doesn't exist yet.
     """
-    if atr_pct < 1.0:
-        return 35.0, 65.0
-    if atr_pct < 2.5:
-        return 30.0, 70.0
-    return 20.0, 80.0
+    low_threshold, high_threshold = policy.rsi_atr_thresholds
+    if atr_pct < low_threshold:
+        return policy.rsi_bands[0]
+    if atr_pct < high_threshold:
+        return policy.rsi_bands[1]
+    return policy.rsi_bands[2]
 
 
 def _rsi_penalty(rsi, lower, upper):
@@ -178,10 +337,79 @@ def _rsi_penalty(rsi, lower, upper):
     return 0.0
 
 
-_TOTAL_TIMEFRAME_WEIGHT = sum(_TIMEFRAME_WEIGHTS.values())
+def _relative_strength_score(observations, policy):
+    lookback = policy.relative_strength_lookback
+    stock_close = observations.histories["D"]["close"].to_numpy(dtype=float)
+    benchmark_close = observations.benchmark_daily["close"].to_numpy(dtype=float)
+    stock_return = stock_close[-1] / stock_close[-(lookback + 1)] - 1.0
+    benchmark_return = (
+        benchmark_close[-1] / benchmark_close[-(lookback + 1)] - 1.0
+    )
+    relative_return_pct = (
+        ((1.0 + stock_return) / (1.0 + benchmark_return)) - 1.0
+    ) * 100.0
+    return (
+        _clip(relative_return_pct / policy.relative_strength_scale_pct),
+        {
+            "lookback_sessions": lookback,
+            "stock_return_pct": round(stock_return * 100.0, 3),
+            "benchmark_return_pct": round(benchmark_return * 100.0, 3),
+            "relative_return_pct": round(relative_return_pct, 3),
+        },
+    )
 
 
-def score_technical(indicators):
+def _participation_score(delivery_trend, policy):
+    evidence = {
+        "available": False,
+        "liquid": None,
+        "delivery_volume_confirmation": False,
+        "delivery_percentage_directional": False,
+    }
+    if not delivery_trend or delivery_trend.get("status") != "ready":
+        return 0.0, evidence
+
+    recent_volume = float(delivery_trend.get("recent_avg_total_volume") or 0.0)
+    baseline_volume = float(
+        delivery_trend.get("baseline_avg_total_volume") or 0.0
+    )
+    vwap = float(delivery_trend.get("latest_vwap") or 0.0)
+    turnover = recent_volume * vwap
+    liquid = turnover >= policy.minimum_daily_turnover
+    volume_expanded = recent_volume > baseline_volume * 1.1
+    delivery_volume_rising = (
+        delivery_trend.get("delivery_volume_trend") == "rising"
+    )
+    interpretation = delivery_trend.get("interpretation")
+    evidence.update(
+        {
+            "available": True,
+            "liquid": liquid,
+            "recent_daily_turnover": round(turnover, 2),
+            "minimum_daily_turnover": policy.minimum_daily_turnover,
+            "total_volume_expanded": volume_expanded,
+            "delivery_volume_confirmation": delivery_volume_rising,
+            "interpretation": interpretation,
+        }
+    )
+
+    if not liquid:
+        return -policy.participation_score, evidence
+    if (
+        delivery_volume_rising
+        and volume_expanded
+        and interpretation == "possible_accumulation"
+    ):
+        return policy.participation_score, evidence
+    if delivery_volume_rising and interpretation == "possible_distribution":
+        return -policy.participation_score, evidence
+    # Delivery percentage describes the share of volume delivered, not whether buyers
+    # or sellers initiated it. Without delivery-volume and price confirmation it stays
+    # neutral, even when the percentage itself is rising.
+    return 0.0, evidence
+
+
+def score_technical(indicators, observations=None, policy=None):
     """Deterministic replacement for what node_technical used to ask an LLM to judge.
 
     Live testing (both gemma4 and Fin-R1) showed LLMs aren't reliable at applying exact
@@ -216,29 +444,36 @@ def score_technical(indicators):
        (strong bullish trend, real bearish momentum, RSI neutral) that has a positive
        weighted score but only 1 of 2 engaged families agreeing: correctly BAD.
     """
+    policy = policy or select_technical_policy(BASELINE_TECHNICAL_POLICY_ID)
+    observations = observations or TechnicalObservations(histories={})
     breakdown = {}
     trend_weighted_sum = 0.0
     momentum_weighted_sum = 0.0
 
     daily_atr_pct = indicators["D"]["atr_pct"]
-    rsi_lower, rsi_upper = _adaptive_rsi_bands(daily_atr_pct)
+    rsi_lower, rsi_upper = _adaptive_rsi_bands(daily_atr_pct, policy)
 
-    for tf, weight in _TIMEFRAME_WEIGHTS.items():
+    for tf, weight in policy.timeframe_weights:
         ind = indicators[tf]
         sma_gap_pct = (ind["sma20"] - ind["sma50"]) / ind["sma50"] * 100
-        trend_score = _clip(sma_gap_pct / _SMA_GAP_SCALE_PCT)
+        trend_score = _clip(sma_gap_pct / policy.sma_gap_scale_pct)
 
         atr = ind["atr14"] or 1e-9  # guard against a zero-ATR flat series
-        momentum_score = _clip(ind["macd_hist"] / (atr * 0.5))
+        momentum_score = _clip(
+            ind["macd_hist"] / (atr * policy.macd_atr_scale)
+        )
 
-        breakdown[tf] = {"trend_score": round(trend_score, 3), "momentum_score": round(momentum_score, 3)}
+        breakdown[tf] = {
+            "trend_score": round(trend_score, 3),
+            "momentum_score": round(momentum_score, 3),
+        }
         trend_weighted_sum += weight * trend_score
         momentum_weighted_sum += weight * momentum_score
 
     # Weighted average (not sum) -- each family score stays on the same +/-1 scale as
     # its inputs, comparable to the RSI family score below.
-    trend_family = trend_weighted_sum / _TOTAL_TIMEFRAME_WEIGHT
-    momentum_family = momentum_weighted_sum / _TOTAL_TIMEFRAME_WEIGHT
+    trend_family = trend_weighted_sum / policy.total_timeframe_weight
+    momentum_family = momentum_weighted_sum / policy.total_timeframe_weight
 
     daily_rsi = float(indicators["D"]["rsi14"])
     rsi_family = _rsi_penalty(daily_rsi, rsi_lower, rsi_upper)
@@ -250,7 +485,29 @@ def score_technical(indicators):
     else:
         rsi_note = "neutral"
 
-    families = {"trend": trend_family, "momentum": momentum_family, "rsi": rsi_family}
+    candidate_families = {
+        "trend": trend_family,
+        "momentum": momentum_family,
+        "rsi": rsi_family,
+    }
+    relative_strength = None
+    if "relative_strength" in policy.families:
+        relative_strength_score, relative_strength = _relative_strength_score(
+            observations,
+            policy,
+        )
+        candidate_families["relative_strength"] = relative_strength_score
+    participation = None
+    if "participation" in policy.families:
+        participation_score, participation = _participation_score(
+            observations.delivery_trend,
+            policy,
+        )
+        candidate_families["participation"] = participation_score
+
+    families = {
+        family: candidate_families[family] for family in policy.families
+    }
     total_score = sum(families.values())
 
     # Confluence: at least 2 of the (up to 3) "engaged" families -- magnitude above the
@@ -259,13 +516,21 @@ def score_technical(indicators):
     # that compared each family against the sum they produced (circular -- see
     # docstring). A lone strong family with no confirmation is exactly what "confluence"
     # (multiple signals agreeing) is meant to exclude, even if the raw sum is positive.
-    engaged = {k: v for k, v in families.items() if abs(v) > _FAMILY_ENGAGEMENT_THRESHOLD}
+    engaged = {
+        key: value
+        for key, value in families.items()
+        if abs(value) > policy.family_engagement_threshold
+    }
     agree_count = sum(1 for v in engaged.values() if v > 0)
     disagree_count = len(engaged) - agree_count
     confluence_ratio = agree_count / len(engaged) if engaged else 0.0
     verdict = "GOOD" if (total_score > 0 and len(engaged) >= 2 and agree_count > disagree_count) else "BAD"
 
     return {
+        "policy_id": policy.policy_id,
+        "policy_fingerprint": policy.fingerprint,
+        "timeframe_weights": dict(policy.timeframe_weights),
+        "indicator_families": list(policy.families),
         "score": round(total_score, 3),
         "verdict": verdict,
         "confluence_ratio": round(confluence_ratio, 2),
@@ -275,4 +540,56 @@ def score_technical(indicators):
         "daily_rsi": daily_rsi,
         "rsi_note": rsi_note,
         "rsi_band": (rsi_lower, rsi_upper),
+        "relative_strength": relative_strength,
+        "participation": participation,
     }
+
+
+def replay_technical_policies(
+    samples,
+    policy_ids,
+    round_trip_cost_bps,
+):
+    """Replay policies on one canonical observation per symbol/session.
+
+    The earliest observation is retained when a live scanner sampled the same symbol
+    repeatedly on one day. Reported returns are means across GOOD signals; round-trip
+    costs are deducted from every signal in percentage-point units.
+    """
+    if round_trip_cost_bps < 0:
+        raise ValueError("round_trip_cost_bps must be non-negative")
+
+    canonical_samples = {}
+    for sample in sorted(samples, key=lambda item: item.observed_at):
+        key = (sample.symbol.upper(), sample.observed_at.date())
+        canonical_samples.setdefault(key, sample)
+
+    results = {}
+    transaction_cost_pct = float(round_trip_cost_bps) / 100.0
+    for policy_id in policy_ids:
+        policy = select_technical_policy(policy_id)
+        gross_returns = []
+        for sample in canonical_samples.values():
+            assessment = evaluate_technical(sample.observations, policy)
+            if assessment.status == "ready" and assessment.verdict == "GOOD":
+                gross_returns.append(float(sample.forward_return_pct))
+        signal_count = len(gross_returns)
+        gross_return_pct = (
+            sum(gross_returns) / signal_count if signal_count else 0.0
+        )
+        results[policy_id] = TechnicalReplayResult(
+            policy_id=policy.policy_id,
+            policy_fingerprint=policy.fingerprint,
+            sample_count=len(canonical_samples),
+            signal_count=signal_count,
+            gross_return_pct=gross_return_pct,
+            transaction_cost_pct=(
+                transaction_cost_pct if signal_count else 0.0
+            ),
+            net_return_pct=(
+                gross_return_pct - transaction_cost_pct
+                if signal_count
+                else 0.0
+            ),
+        )
+    return results

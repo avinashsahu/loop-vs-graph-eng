@@ -44,9 +44,19 @@ SCAN_RUN_STALE_AFTER_SECONDS = float(
 )
 EVALUATION_DB_PATH = os.environ.get("EVALUATION_DB_PATH", "evaluation.db")
 NSE_SCAN_LABEL = os.environ.get("NSE_SCAN_LABEL", "manual")
+NSE_TECHNICAL_POLICY_ID = os.environ.get(
+    "NSE_TECHNICAL_POLICY_ID",
+    ta_analysis.REVISED_TECHNICAL_POLICY_ID,
+)
+NSE_TECHNICAL_BENCHMARK_SYMBOL = os.environ.get(
+    "NSE_TECHNICAL_BENCHMARK_SYMBOL",
+    os.environ.get("EVALUATION_BENCHMARK_SYMBOL", "JUNIORBEES"),
+)
+TECHNICAL_POLICY = ta_analysis.select_technical_policy(NSE_TECHNICAL_POLICY_ID)
 NSE_POLICY_VERSION = os.environ.get(
     "NSE_POLICY_VERSION",
-    "technical-confluence-v1+risk-atr-target-v3+sentiment-volatility-v1+llm-prompts-v4",
+    f"{NSE_TECHNICAL_POLICY_ID}+risk-atr-target-v3"
+    "+sentiment-volatility-v1+llm-prompts-v4",
 )
 
 log = setup_logging("nse")
@@ -161,6 +171,13 @@ def node_fetch(state):
         log.warning("bhavcopy delivery trend unavailable for %s", state["symbol"], exc_info=True)
         state["delivery_trend"] = None
 
+    benchmark_snapshot = nse_data.get_market_snapshot(
+        NSE_TECHNICAL_BENCHMARK_SYMBOL,
+        timeframes=("D",),
+    )
+    state["benchmark_daily"] = benchmark_snapshot.histories["D"]
+    state["market_snapshot"]["benchmark"] = benchmark_snapshot.metadata()
+
     return "technical", state
 
 
@@ -169,7 +186,14 @@ def node_technical(state):
     # score_technical for
     # why: live testing showed this exact threshold/comparison task isn't something an
     # LLM (gemma4 or Fin-R1) applies reliably, regardless of model quality.
-    assessment = ta_analysis.evaluate_technical(state["hist_multi"])
+    assessment = ta_analysis.evaluate_technical(
+        ta_analysis.TechnicalObservations(
+            histories=state["hist_multi"],
+            benchmark_daily=state.get("benchmark_daily"),
+            delivery_trend=state.get("delivery_trend"),
+        ),
+        TECHNICAL_POLICY,
+    )
     state["technical_indicators"] = assessment.indicators
     state["technical_assessment"] = assessment.to_dict()
     log.info(
@@ -615,6 +639,7 @@ def run(
         "quote": None,
         "hist": None,
         "hist_multi": None,
+        "benchmark_daily": None,
         "market_snapshot": None,
         "fundamental_snapshot": None,
         "delivery_trend": None,
