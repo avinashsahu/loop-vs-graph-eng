@@ -11,7 +11,7 @@ from collections import defaultdict
 
 from logging_config import setup_logging
 from market_time import now_ist
-from notify import send_email
+from notify import send_email, send_slack
 
 # Read directly rather than `from nse_trade_graph import TRADE_LOG_PATH` -- that import
 # would execute nse_trade_graph's module-level code (including its own NSE_SCAN_LABEL
@@ -108,3 +108,4 @@ if __name__ == "__main__":
 
     subject, body = build_digest(sys.argv[1])
     send_email(subject, body)
+    send_slack(subject, body)

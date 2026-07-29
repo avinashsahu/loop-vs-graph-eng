@@ -178,7 +178,7 @@ Malformed lines (partial writes from a disk-full condition, concurrent appends) 
 
 `notify.py`, `digest.py`, and `intraday_recheck.py` turn the trade graph into a cron-driven alert pipeline: scan the whole market overnight, email a full-detail digest once that scan completes, then keep an eye on that run's picks during the day.
 
-- **`notify.py`** — generic email sending (`smtplib`, stdlib only). Stub by default (`EMAIL_ENABLED=0`): composes the email and logs it instead of sending, so everything downstream is testable without real SMTP credentials. `EMAIL_TO` is a comma-separated list — one address today, more later, no code change needed. Slack/Telegram aren't built (deliberately out of scope for now), but adding one later means adding one function here, not touching `digest.py`/`intraday_recheck.py`.
+- **`notify.py`** — generic email sending (`smtplib`, stdlib only), plus Slack (`urllib.request` + an incoming webhook, still stdlib only). Both stub by default (`EMAIL_ENABLED=0`/`SLACK_ENABLED=0`): compose the message and log it instead of sending, so everything downstream is testable without real credentials. `digest.py`/`intraday_recheck.py` call both — Slack is additive, not a replacement for email. `EMAIL_TO` is a comma-separated list — one address today, more later, no code change needed. `send_slack` splits long digests into multiple messages on record boundaries (`_slack_chunks`) since Slack folds long messages behind a "show more". Telegram still isn't built — adding it means adding one function here, not touching `digest.py`/`intraday_recheck.py`.
 - **`scan_label`** — every row `nse_trade_graph.py` appends to `trade_log.jsonl` is tagged with `NSE_SCAN_LABEL` (default `manual`). This is how `digest.py`/`intraday_recheck.py` find "this run's" records without relying on calendar-date matching, which would be fragile for an overnight scan spanning midnight.
 - **`run_overnight_scan.sh`** — the actual cron target. Generates a run id (`overnight_YYYYMMDD_HHMM`), runs `nse_trade_graph.py` over `NSE_INDEX="NIFTY TOTAL MKT"` tagged with that id, then calls `digest.py` with the same id. (`nsemine` recognizes the index name `NIFTY TOTAL MKT` — 750 constituents; `"NIFTY TOTAL MARKET"` does not, it hits an internal `nsemine` bug and returns `None`.)
 - **`digest.py <run_id>`** — reads `trade_log.jsonl` filtered to that `scan_label`, emails one full-detail section (all four timeframes' indicators, every node's verdict text, the proposal) per `proposed`/`flagged_for_review` symbol, plus a one-line count of everything scanned/aborted for context.
@@ -196,7 +196,7 @@ Fixed via `market_time.py`: `now_ist()` / `now_ist_naive()` return the real IST 
 
 ### Config (`.env`)
 
-`NSE_SCAN_LABEL` (default `manual`), `EMAIL_ENABLED` (default `0`, stub), `SMTP_HOST`, `SMTP_PORT` (default `587`), `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_USE_TLS` (default `1`), `EMAIL_FROM`, `EMAIL_TO` (comma-separated), `NSE_SKIP_MARKET_HOURS_CHECK` (testing only, bypasses `intraday_recheck.py`'s market-hours gate).
+`NSE_SCAN_LABEL` (default `manual`), `EMAIL_ENABLED` (default `0`, stub), `SMTP_HOST`, `SMTP_PORT` (default `587`), `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_USE_TLS` (default `1`), `EMAIL_FROM`, `EMAIL_TO` (comma-separated), `SLACK_ENABLED` (default `0`, stub), `SLACK_WEBHOOK_URL` (create one at [api.slack.com/messaging/webhooks](https://api.slack.com/messaging/webhooks) — per-channel, no bot/app needed), `NSE_SKIP_MARKET_HOURS_CHECK` (testing only, bypasses `intraday_recheck.py`'s market-hours gate).
 
 ### Cron setup
 
