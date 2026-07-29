@@ -240,12 +240,14 @@ def node_sentiment(state):
 def node_propose(state):
     state["status"] = "proposed"
     plan = state["risk_plan"]
+    actual_loss_pct = plan["max_loss_at_stop"] / state["principal"] * 100
     state["proposal"] = (
         f"PROPOSAL (not executed): BUY {state['symbol']} — up to "
         f"{state['max_shares']} shares, entry ~₹{plan['entry_price']:.2f}, "
         f"stop ₹{plan['stop_price']:.2f}, capital ~₹{state['position_size']:.0f}, "
         f"max loss ~₹{plan['max_loss_at_stop']:.0f} "
-        f"({state['max_loss_pct']}% of ₹{state['principal']:.0f} principal). "
+        f"({actual_loss_pct:.2f}% actual; {state['max_loss_pct']}% policy cap "
+        f"of ₹{state['principal']:.0f} principal). "
         "Confirm manually before placing any order."
     )
     return "log", state

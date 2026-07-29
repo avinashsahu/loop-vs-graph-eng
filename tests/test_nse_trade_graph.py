@@ -193,6 +193,28 @@ class RiskNodeTests(unittest.TestCase):
         self.assertIn("max loss ~₹1000", result_state["proposal"])
         self.assertNotIn("risk_pct", result_state["proposal"])
 
+    def test_proposal_distinguishes_actual_loss_from_policy_cap(self):
+        state = {
+            "symbol": "TITAN",
+            "principal": 100_000.0,
+            "max_loss_pct": 1.0,
+            "max_allocation_pct": 10.0,
+            "max_shares": 2,
+            "position_size": 9_700.0,
+            "risk_plan": {
+                "entry_price": 4_850.0,
+                "stop_price": 4_750.0,
+                "max_loss_at_stop": 200.0,
+                "risk_budget": 1_000.0,
+            },
+        }
+
+        _, result_state = nse_trade_graph.node_propose(state)
+
+        self.assertIn("0.20% actual", result_state["proposal"])
+        self.assertIn("1.0% policy cap", result_state["proposal"])
+        self.assertNotIn("₹200 (1.0% of", result_state["proposal"])
+
 
 if __name__ == "__main__":
     unittest.main()
