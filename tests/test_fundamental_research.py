@@ -13,6 +13,12 @@ def _evidence(financial_history):
             "symbol": "TEST",
             "company_name": "Test Limited",
             "coverage": {"complete": True, "missing": []},
+            "freshness": {
+                "as_of": "2026-07-29",
+                "financial_period": financial_history["periods"][0]["period_end"],
+                "financial_age_days": 29,
+                "financial_stale": False,
+            },
             "financial_history": financial_history,
             "facts": [
                 {

@@ -14,7 +14,8 @@ from logging_config import setup_logging
 log = setup_logging("financial_results")
 
 FINANCIAL_RESULTS_PARSER_VERSION = "nse-integrated-xbrl-v1"
-FINANCIAL_RESULTS_MAX_FILINGS = 6
+FINANCIAL_RESULTS_QUARTER_PERIODS = 4
+FINANCIAL_RESULTS_ANNUAL_PERIODS = 2
 FINANCIAL_RESULTS_CALL_DELAY_SECONDS = float(
     os.environ.get("FINANCIAL_RESULTS_CALL_DELAY_SECONDS", "1")
 )
@@ -63,7 +64,12 @@ def get_financial_history(symbol: str) -> dict:
             }
         )
 
-    status = "ready" if periods else "unavailable"
+    if not periods:
+        status = "unavailable"
+    elif len(periods) != len(selected):
+        status = "partial"
+    else:
+        status = "ready"
     return _result(status, profile, subtype, periods, sources)
 
 
@@ -100,14 +106,29 @@ def _select_filings(rows: object) -> list[dict]:
                 broadcast,
                 {**row, "period_end": key},
             )
-    return [
+    newest = [
         item[1]
         for _, item in sorted(
             newest_by_period.items(),
             key=lambda pair: pair[0],
             reverse=True,
-        )[:FINANCIAL_RESULTS_MAX_FILINGS]
+        )
     ]
+    if not newest:
+        return []
+    quarterly = newest[:FINANCIAL_RESULTS_QUARTER_PERIODS]
+    _, subtype = _profile_for_url(newest[0].get("xbrl", ""))
+    annual = (
+        [
+            filing
+            for filing in newest
+            if filing["period_end"].endswith("-03-31")
+        ][:FINANCIAL_RESULTS_ANNUAL_PERIODS]
+        if subtype == "ind_as"
+        else []
+    )
+    selected = {filing["period_end"]: filing for filing in (*quarterly, *annual)}
+    return sorted(selected.values(), key=lambda filing: filing["period_end"], reverse=True)
 
 
 def _parse_period(xml: bytes, period_end: str, subtype: str) -> dict:
@@ -178,18 +199,12 @@ def _parse_period(xml: bytes, period_end: str, subtype: str) -> dict:
 
 
 def _fact(root, name: str, context: str) -> float | None:
-    fallback = None
     for element in root.iter():
         if element.tag.rsplit("}", 1)[-1] != name:
             continue
-        value = _float(element.text)
-        if value is None:
-            continue
         if element.attrib.get("contextRef") == context:
-            return value
-        if fallback is None:
-            fallback = value
-    return fallback
+            return _float(element.text)
+    return None
 
 
 def _percent(root, name: str, context: str) -> float | None:

@@ -171,18 +171,22 @@ class FundamentalPromptTests(unittest.TestCase):
                 "other_public": "flat",
             },
         )
+
+        def pass_assessment(_prompt, evidence_ids):
+            return FundamentalAssessment(
+                verdict="PASS",
+                reason_code="NO_MATERIAL_RED_FLAG",
+                reason="No qualitative red flags.",
+                evidence_ids=evidence_ids[:1],
+                missing=(),
+            )
+
         with (
             patch.object(nse_trade_graph, "get_shareholding_history", return_value=history),
             patch.object(
                 nse_trade_graph,
                 "assess_fundamentals",
-                return_value=FundamentalAssessment(
-                    verdict="PASS",
-                    reason_code="NO_MATERIAL_RED_FLAG",
-                    reason="No qualitative red flags.",
-                    evidence_ids=("ANNOUNCEMENT_8D5543E864",),
-                    missing=(),
-                ),
+                side_effect=pass_assessment,
             ) as assess_fundamentals,
         ):
             route, result_state = nse_trade_graph.node_fundamental(state)

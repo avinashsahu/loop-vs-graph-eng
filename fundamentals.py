@@ -162,6 +162,17 @@ def get_fundamental_snapshot(symbol: str) -> dict:
             log.warning("fundamentals[%s]: %s fetch failed", symbol, field, exc_info=True)
             all_ok = False
 
+    financial_history = snapshot.get("financial_history")
+    if (
+        not isinstance(financial_history, dict)
+        or financial_history.get("status") != "ready"
+    ):
+        log.warning(
+            "fundamentals[%s]: integrated financial history is not ready",
+            symbol,
+        )
+        all_ok = False
+
     try:
         quarter, peer_data = _get_peer_comparison(symbol)
         snapshot["peer_comparison_quarter"] = quarter

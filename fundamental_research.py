@@ -80,6 +80,15 @@ def evaluate_fundamental_research(
     ],
 ) -> FundamentalDecision:
     """Apply deterministic coverage/numeric policy around a bounded LLM interpretation."""
+    coverage = evidence.payload.get("coverage")
+    if not isinstance(coverage, dict) or not coverage.get("complete"):
+        missing = (
+            coverage.get("missing", ())
+            if isinstance(coverage, dict)
+            else ("fundamental_coverage",)
+        )
+        return _review(None, None, tuple(missing) or ("fundamental_coverage",))
+
     history = evidence.payload.get("financial_history")
     if not isinstance(history, dict) or history.get("status") != "ready":
         return _review(
@@ -90,6 +99,12 @@ def evaluate_fundamental_research(
 
     profile = history.get("profile")
     subtype = history.get("subtype")
+    freshness = evidence.payload.get("freshness")
+    if not isinstance(freshness, dict):
+        return _review(profile, subtype, ("financial_freshness",))
+    if freshness.get("financial_stale") is not False:
+        return _review(profile, subtype, ("financial_history_stale",))
+
     periods = history.get("periods")
     periods = periods if isinstance(periods, list) else []
     missing = _coverage_missing(profile, subtype, periods)
@@ -133,19 +148,76 @@ def evaluate_fundamental_research(
             model_invoked=True,
         )
 
-    if assessment.verdict == "PASS":
+    if any(item not in qualitative_ids for item in assessment.evidence_ids):
+        return FundamentalDecision(
+            verdict="REVIEW",
+            reason_code="INSUFFICIENT_EVIDENCE",
+            reason="Qualitative interpretation cited evidence outside the supplied set.",
+            missing=("invalid_qualitative_citation",),
+            profile=profile,
+            subtype=subtype,
+            model_invoked=True,
+        )
+
+    if assessment.reason_code == "NO_MATERIAL_RED_FLAG":
+        if assessment.verdict != "PASS":
+            return _unmapped_qualitative(profile, subtype, assessment)
         return _pass(
             profile,
             subtype,
             model_invoked=True,
             evidence_ids=assessment.evidence_ids,
         )
+    if assessment.reason_code == "INSUFFICIENT_EVIDENCE":
+        if assessment.verdict != "REVIEW":
+            return _unmapped_qualitative(profile, subtype, assessment)
+        return FundamentalDecision(
+            verdict="REVIEW",
+            reason_code="INSUFFICIENT_EVIDENCE",
+            reason="Qualitative disclosures require human interpretation.",
+            evidence_ids=assessment.evidence_ids,
+            missing=assessment.missing,
+            checks=("QUALITATIVE_EVIDENCE_AMBIGUOUS",),
+            profile=profile,
+            subtype=subtype,
+            model_invoked=True,
+        )
+    material_codes = {
+        "GOVERNANCE_OR_REGULATORY",
+        "PROMOTER_OR_DILUTION",
+        "ADVERSE_CORPORATE_EVENT",
+        "PEER_OR_EARNINGS_WEAKNESS",
+    }
+    if assessment.reason_code in material_codes:
+        if assessment.verdict != "REJECT":
+            return _unmapped_qualitative(profile, subtype, assessment)
+        return FundamentalDecision(
+            verdict="REJECT",
+            reason_code=assessment.reason_code,
+            reason=(
+                "Supplied qualitative evidence supports a material "
+                f"{assessment.reason_code.lower()} concern."
+            ),
+            evidence_ids=assessment.evidence_ids,
+            checks=(f"QUALITATIVE_{assessment.reason_code}",),
+            profile=profile,
+            subtype=subtype,
+            model_invoked=True,
+        )
+    return _unmapped_qualitative(profile, subtype, assessment)
+
+
+def _unmapped_qualitative(
+    profile: str | None,
+    subtype: str | None,
+    assessment: FundamentalAssessment,
+) -> FundamentalDecision:
     return FundamentalDecision(
-        verdict=assessment.verdict,
-        reason_code=assessment.reason_code,
-        reason=assessment.reason,
+        verdict="REVIEW",
+        reason_code="INSUFFICIENT_EVIDENCE",
+        reason="Qualitative interpretation did not map to a known policy category.",
         evidence_ids=assessment.evidence_ids,
-        missing=assessment.missing,
+        missing=("qualitative_policy_mapping",),
         profile=profile,
         subtype=subtype,
         model_invoked=True,
