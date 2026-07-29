@@ -17,6 +17,20 @@ class _Completions:
         return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)])
 
 
+class _SequencedCompletions:
+    def __init__(self, contents):
+        self.contents = iter(contents)
+        self.requests = []
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        message = types.SimpleNamespace(
+            content=next(self.contents),
+            reasoning="",
+        )
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)])
+
+
 class LocalLlmTests(unittest.TestCase):
     def setUp(self):
         self.original_client = llm._local_client
@@ -66,6 +80,14 @@ class LocalLlmTests(unittest.TestCase):
 
         self.assertEqual(result, "GOOD Stable fundamentals.")
 
+    def test_normalizes_a_schema_constrained_verdict(self):
+        result = llm._normalize_local_response(
+            '{"verdict":"GOOD","reason":"stable fundamentals"}',
+            mode="check",
+        )
+
+        self.assertEqual(result, "GOOD: stable fundamentals")
+
     def test_active_model_config_describes_the_backend_that_will_run(self):
         with patch.multiple(llm, USE_LOCAL_LLM=True, USE_REAL_LLM=False):
             self.assertEqual(
@@ -94,6 +116,37 @@ class LocalLlmTests(unittest.TestCase):
                     "max_tokens": None,
                 },
             )
+
+    def test_repairs_a_verbose_check_response_that_omits_the_verdict(self):
+        completions = _SequencedCompletions(
+            [
+                "The company has stable ownership and no obvious red flags.",
+                (
+                    '{"verdict":"GOOD","reason":'
+                    '"stable ownership and no obvious red flags"}'
+                ),
+            ]
+        )
+        llm._local_client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=completions)
+        )
+
+        result = llm._call_local_llm("Judge the fundamentals", mode="check")
+
+        self.assertEqual(
+            result,
+            "GOOD: stable ownership and no obvious red flags",
+        )
+        self.assertEqual(len(completions.requests), 2)
+        self.assertEqual(completions.requests[1]["max_tokens"], 64)
+        self.assertEqual(
+            completions.requests[0]["response_format"]["type"],
+            "json_schema",
+        )
+        self.assertIn(
+            "The company has stable ownership",
+            completions.requests[1]["messages"][0]["content"],
+        )
 
 
 if __name__ == "__main__":

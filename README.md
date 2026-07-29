@@ -61,9 +61,14 @@ OpenAI-compatible URL used here is `http://localhost:11434/v1`.
 
 Config (`.env`): `LOCAL_LLM_URL` (default `http://localhost:11434/v1`),
 `LOCAL_LLM_MODEL` (default `hf.co/alexsabaka/ODA-Fin-RL-8B-GGUF:Q4_K_M`),
-`LOCAL_LLM_MAX_TOKENS` (default `400`), and `LOCAL_LLM_REASONING_EFFORT`
+`LOCAL_LLM_MAX_TOKENS` (default `800`), and `LOCAL_LLM_REASONING_EFFORT`
 (default `none`). `LOCAL_LLM_NO_THINK_DIRECTIVE` defaults to `/no_think` for the
 configured Qwen3 model; set it empty for models that do not support that control token.
+
+Local `check` calls request a strict JSON-schema response (`GOOD` or `BAD`, plus a
+short reason) at temperature zero, then normalize it to the graph's existing
+one-line verdict contract. If a compatible server ignores the schema, one bounded
+64-token repair call is attempted before the original response is returned.
 
 **Why ODA-Fin-RL-8B instead of Fin-R1:** only `node_fundamental` and
 `node_sentiment` still use an LLM.

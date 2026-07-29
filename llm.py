@@ -1,3 +1,4 @@
+import json
 import os
 
 from dotenv import load_dotenv
@@ -10,7 +11,7 @@ LOCAL_LLM_URL = os.environ.get("LOCAL_LLM_URL", "http://localhost:11434/v1")
 LOCAL_LLM_MODEL = os.environ.get(
     "LOCAL_LLM_MODEL", "hf.co/alexsabaka/ODA-Fin-RL-8B-GGUF:Q4_K_M"
 )
-LOCAL_LLM_MAX_TOKENS = int(os.environ.get("LOCAL_LLM_MAX_TOKENS", "400"))
+LOCAL_LLM_MAX_TOKENS = int(os.environ.get("LOCAL_LLM_MAX_TOKENS", "800"))
 LOCAL_LLM_REASONING_EFFORT = os.environ.get("LOCAL_LLM_REASONING_EFFORT", "none")
 LOCAL_LLM_NO_THINK_DIRECTIVE = os.environ.get(
     "LOCAL_LLM_NO_THINK_DIRECTIVE", "/no_think"
@@ -20,6 +21,28 @@ ANTHROPIC_MAX_TOKENS = 200
 
 _call_count = 0
 _local_client = None
+LOCAL_CHECK_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "financial_verdict",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "verdict": {
+                    "type": "string",
+                    "enum": ["GOOD", "BAD"],
+                },
+                "reason": {
+                    "type": "string",
+                    "maxLength": 240,
+                },
+            },
+            "required": ["verdict", "reason"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
 def active_model_config():
@@ -53,6 +76,14 @@ def _normalize_local_response(text, mode):
     text = text.strip()
 
     if mode == "check":
+        try:
+            payload = json.loads(text)
+            verdict = str(payload["verdict"]).upper()
+            reason = str(payload["reason"]).strip()
+            if verdict in {"GOOD", "BAD"}:
+                return f"{verdict}: {reason}" if reason else verdict
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            pass
         for line in text.splitlines():
             line = line.strip()
             if line.startswith(("GOOD", "BAD")):
@@ -74,6 +105,9 @@ def _call_local_llm(prompt, mode):
         max_tokens=LOCAL_LLM_MAX_TOKENS,
         messages=[{"role": "user", "content": prompt}],
     )
+    if mode == "check":
+        request["response_format"] = LOCAL_CHECK_RESPONSE_FORMAT
+        request["temperature"] = 0
     if LOCAL_LLM_REASONING_EFFORT:
         request["reasoning_effort"] = LOCAL_LLM_REASONING_EFFORT
 
@@ -81,7 +115,35 @@ def _call_local_llm(prompt, mode):
     message = resp.choices[0].message
     # Fall back in case a compatible server returns only a reasoning channel.
     text = message.content if message.content is not None else getattr(message, "reasoning", "")
-    return _normalize_local_response(text, mode)
+    normalized = _normalize_local_response(text, mode)
+    if mode != "check" or normalized.startswith(("GOOD", "BAD")):
+        return normalized
+
+    repair_prompt = (
+        "Return exactly one line beginning GOOD: or BAD:. "
+        "Do not explain your process. Classify the assessment below.\n\n"
+        f"ASSESSMENT:\n{text[:4000]}"
+    )
+    if LOCAL_LLM_NO_THINK_DIRECTIVE:
+        repair_prompt = f"{LOCAL_LLM_NO_THINK_DIRECTIVE}\n{repair_prompt}"
+    repair_request = dict(
+        model=LOCAL_LLM_MODEL,
+        max_tokens=64,
+        messages=[{"role": "user", "content": repair_prompt}],
+    )
+    repair_request["response_format"] = LOCAL_CHECK_RESPONSE_FORMAT
+    repair_request["temperature"] = 0
+    if LOCAL_LLM_REASONING_EFFORT:
+        repair_request["reasoning_effort"] = LOCAL_LLM_REASONING_EFFORT
+    repair_response = _local_client.chat.completions.create(**repair_request)
+    repair_message = repair_response.choices[0].message
+    repaired_text = (
+        repair_message.content
+        if repair_message.content is not None
+        else getattr(repair_message, "reasoning", "")
+    )
+    repaired = _normalize_local_response(repaired_text, mode)
+    return repaired if repaired.startswith(("GOOD", "BAD")) else normalized
 
 
 def call_llm(prompt, mode):
