@@ -7,6 +7,12 @@ cd "$(dirname "$0")"
 # (e.g. a public holiday); the scan just runs without today's row added.
 uv run bhavcopy.py || true
 
+# Grade prior decisions now that another completed session may be available. This is
+# telemetry only: a damaged/missing local evaluation store must not prevent the scan.
+if ! uv run evaluation.py update; then
+    echo "warning: paper-outcome evaluation failed; continuing scan" >&2
+fi
+
 # IST explicitly -- the host machine's own system timezone may not be IST.
 RUN_ID="overnight_$(TZ='Asia/Kolkata' date +%Y%m%d_%H%M)"
 NSE_SCAN_LABEL="$RUN_ID" NSE_INDEX="NIFTY TOTAL MKT" uv run nse_trade_graph.py

@@ -18,12 +18,18 @@ import fundamentals
 import nse_data
 import position_risk
 import ta_analysis
-from llm import call_llm
+from evaluation import EvaluationLedger
+from llm import active_model_config, call_llm
 from logging_config import setup_logging
 from market_time import now_ist
 
 TRADE_LOG_PATH = os.environ.get("TRADE_LOG_PATH", "trade_log.jsonl")
+EVALUATION_DB_PATH = os.environ.get("EVALUATION_DB_PATH", "evaluation.db")
 NSE_SCAN_LABEL = os.environ.get("NSE_SCAN_LABEL", "manual")
+NSE_POLICY_VERSION = os.environ.get(
+    "NSE_POLICY_VERSION",
+    "technical-confluence-v1+risk-atr-v1+llm-prompts-v1",
+)
 
 log = setup_logging("nse")
 
@@ -299,6 +305,8 @@ def build_record(state):
         "eps": (state.get("fundamental_snapshot") or {}).get("eps"),
         "pat": (state.get("fundamental_snapshot") or {}).get("pat"),
         "delivery_trend": state.get("delivery_trend"),
+        "model_config": active_model_config(),
+        "policy_version": NSE_POLICY_VERSION,
         "risk_plan": state.get("risk_plan"),
         "risk_verdict": state.get("risk_verdict"),
         "sentiment_verdict": state.get("sentiment_verdict"),
@@ -311,6 +319,12 @@ def node_log(state):
     record = build_record(state)
     with open(TRADE_LOG_PATH, "a") as f:
         f.write(json.dumps(record) + "\n")
+    try:
+        EvaluationLedger(EVALUATION_DB_PATH).record_decision(record)
+    except Exception:
+        # JSONL remains the durable fallback and can be imported later. Evaluation
+        # telemetry must not turn an otherwise completed scan into a failed scan.
+        log.warning("evaluation ledger write failed", exc_info=True)
     log.info("status=%s proposal=%r", state["status"], state["proposal"])
     return None, state
 

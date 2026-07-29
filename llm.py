@@ -15,9 +15,31 @@ LOCAL_LLM_REASONING_EFFORT = os.environ.get("LOCAL_LLM_REASONING_EFFORT", "none"
 LOCAL_LLM_NO_THINK_DIRECTIVE = os.environ.get(
     "LOCAL_LLM_NO_THINK_DIRECTIVE", "/no_think"
 )
+ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+ANTHROPIC_MAX_TOKENS = 200
 
 _call_count = 0
 _local_client = None
+
+
+def active_model_config():
+    if USE_LOCAL_LLM:
+        return {
+            "backend": "openai_compatible_local",
+            "name": LOCAL_LLM_MODEL,
+            "max_tokens": LOCAL_LLM_MAX_TOKENS,
+        }
+    if USE_REAL_LLM:
+        return {
+            "backend": "anthropic",
+            "name": ANTHROPIC_MODEL,
+            "max_tokens": ANTHROPIC_MAX_TOKENS,
+        }
+    return {
+        "backend": "stub",
+        "name": "deterministic-stub",
+        "max_tokens": None,
+    }
 
 
 def _normalize_local_response(text, mode):
@@ -74,8 +96,8 @@ def call_llm(prompt, mode):
         import anthropic
         client = anthropic.Anthropic()
         resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=200,
+            model=ANTHROPIC_MODEL,
+            max_tokens=ANTHROPIC_MAX_TOKENS,
             messages=[{"role": "user", "content": prompt}],
         )
         return resp.content[0].text

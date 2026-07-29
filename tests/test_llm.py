@@ -1,5 +1,6 @@
 import types
 import unittest
+from unittest.mock import patch
 
 import llm
 
@@ -64,6 +65,35 @@ class LocalLlmTests(unittest.TestCase):
         result = llm._call_local_llm("Judge this", mode="check")
 
         self.assertEqual(result, "GOOD Stable fundamentals.")
+
+    def test_active_model_config_describes_the_backend_that_will_run(self):
+        with patch.multiple(llm, USE_LOCAL_LLM=True, USE_REAL_LLM=False):
+            self.assertEqual(
+                llm.active_model_config(),
+                {
+                    "backend": "openai_compatible_local",
+                    "name": llm.LOCAL_LLM_MODEL,
+                    "max_tokens": llm.LOCAL_LLM_MAX_TOKENS,
+                },
+            )
+        with patch.multiple(llm, USE_LOCAL_LLM=False, USE_REAL_LLM=True):
+            self.assertEqual(
+                llm.active_model_config(),
+                {
+                    "backend": "anthropic",
+                    "name": llm.ANTHROPIC_MODEL,
+                    "max_tokens": llm.ANTHROPIC_MAX_TOKENS,
+                },
+            )
+        with patch.multiple(llm, USE_LOCAL_LLM=False, USE_REAL_LLM=False):
+            self.assertEqual(
+                llm.active_model_config(),
+                {
+                    "backend": "stub",
+                    "name": "deterministic-stub",
+                    "max_tokens": None,
+                },
+            )
 
 
 if __name__ == "__main__":

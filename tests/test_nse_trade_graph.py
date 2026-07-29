@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from datetime import datetime
 from unittest.mock import patch
@@ -6,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 import nse_trade_graph
+from evaluation import EvaluationLedger
 
 
 class FundamentalPromptTests(unittest.TestCase):
@@ -176,6 +178,41 @@ class MarketSnapshotRecordTests(unittest.TestCase):
         record = nse_trade_graph.build_record(state)
 
         self.assertEqual(record["market_snapshot"], snapshot_metadata)
+        self.assertEqual(
+            record["model_config"],
+            nse_trade_graph.active_model_config(),
+        )
+        self.assertEqual(
+            record["policy_version"],
+            nse_trade_graph.NSE_POLICY_VERSION,
+        )
+
+    def test_log_node_records_the_same_decision_in_the_evaluation_ledger(self):
+        state = {
+            "symbol": "ACE",
+            "principal": 100_000.0,
+            "max_loss_pct": 1.0,
+            "max_allocation_pct": 10.0,
+            "atr_stop_multiple": 2.0,
+            "iters": 1,
+            "status": "aborted",
+            "proposal": None,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            trade_log_path = f"{temp_dir}/trade_log.jsonl"
+            evaluation_path = f"{temp_dir}/evaluation.db"
+            with (
+                patch.object(nse_trade_graph, "TRADE_LOG_PATH", trade_log_path),
+                patch.object(
+                    nse_trade_graph,
+                    "EVALUATION_DB_PATH",
+                    evaluation_path,
+                ),
+            ):
+                nse_trade_graph.node_log(state)
+
+            ledger = EvaluationLedger(evaluation_path)
+            self.assertEqual(ledger.status_counts(), {"aborted": 1})
 
 
 class RiskNodeTests(unittest.TestCase):
