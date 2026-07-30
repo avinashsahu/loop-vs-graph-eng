@@ -39,24 +39,59 @@ Result files are local and gitignored. They include per-case outcomes plus:
 
 - exact verdict and reason-code rates;
 - false-PASS rates overall and split by expected `REVIEW`/`REJECT`;
+- two-sided 95% Wilson intervals for each false-PASS rate;
 - grounded and acceptable citation rates;
 - first-pass validity, final validity, and repair rate;
 - runtime error rate, p50/p95 latency, and mean response size.
+
+Build an unlabeled review queue from the local NSE cache:
+
+```bash
+uv run build_llm_eval_candidates.py
+```
+
+The builder deduplicates snapshots and assigns event families, but deliberately
+does not create expected verdicts. Its output remains under `evals/results/`
+until a reviewer checks the source attachment, assigns a verdict/reason code,
+and promotes the case into a versioned corpus.
 
 ## Initial baseline
 
 Measured locally on 2026-07-30 using prompt v6, schema v4, temperature zero,
 and a 2048-token response ceiling:
 
-| Model | Verdict | Reason code | False PASS | REJECT→PASS | REVIEW→PASS | First-pass valid | p50 |
+| Model | Verdict | Reason code | False PASS | REJECT→PASS (95% Wilson) | REVIEW→PASS | First-pass valid | p50 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| ODA-Fin-RL-8B Q4_K_M | 46.2% | 38.5% | 72.2% | 55.6% | 88.9% | 88.5% | 1.43s |
-| Gemma 4 12B IT QAT | 76.9% | 76.9% | 5.6% | 0.0% | 11.1% | 100.0% | 2.69s |
+| Qwen3-8B Q4_K_M | 57.7% | 57.7% | 44.4% | 22.2% (6.3–54.7%) | 66.7% | 100.0% | 1.42s |
+| ODA-Fin-SFT-8B Q4_K_M | 42.3% | 38.5% | 55.6% | 66.7% (35.4–87.9%) | 44.4% | 100.0% | 1.34s |
+| ODA-Fin-RL-8B Q4_K_M | 46.2% | 38.5% | 72.2% | 55.6% (26.7–81.1%) | 88.9% | 88.5% | 1.43s |
+| Gemma 4 12B IT QAT | 76.9% | 76.9% | 5.6% | 0.0% (0.0–29.9%) | 11.1% | 100.0% | 2.69s |
 
-Both models produced schema-valid final output and grounded citations for all
+All four models produced schema-valid final output and grounded citations for all
 26 cases. That validates the guardrails, not the classifier semantics.
 
+The three Q4_K_M checkpoints form the published lineage
+Qwen3-8B → ODA-Fin-SFT-8B → ODA-Fin-RL-8B. On this task, most of the regression
+appears at SFT: exact verdict accuracy falls from 57.7% to 42.3%, and explicit
+REJECT false-PASS rises from 2/9 to 6/9. RL recovers one exact verdict and one
+REJECT case but does not restore the base behavior.
+
+None of the three Qwen-lineage checkpoints emits `REVIEW` on this corpus.
+Their predicted `PASS` counts rise from 16/26 at the base checkpoint to 18/26
+after SFT and 21/26 after RL, although only 8/26 labels are `PASS`. This is
+consistent with an increasingly strong binary/PASS shortcut and loss of
+abstention behavior.
+
+That does not establish classic reward hacking. The
+[published training mixture](https://arxiv.org/html/2603.07223v1) is dominated
+by financial QA and sentiment, while specialized risk-analysis tasks are
+negligible. The RL subset further retains concise, verifier-friendly answers.
+The observed failure is therefore more consistent with negative
+transfer/objective mismatch than a learned preference for `PASS`.
+
 This first corpus is too small to authorize a production model switch by
-itself. Expand it with reviewed real adverse disclosures, repeat each model run
-to measure stability, and treat false `PASS` on explicit `REJECT` cases as the
-primary safety metric.
+itself. Gemma's observed 0/9 REJECT false-PASS still has a 29.9% upper Wilson
+bound. Expand with reviewed, deduplicated real disclosures stratified by event
+family, target at least 100 REJECT and 100 REVIEW cases, repeat runs to measure
+stability, and keep false `PASS` on explicit `REJECT` cases as the primary
+safety metric.

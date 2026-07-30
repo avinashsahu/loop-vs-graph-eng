@@ -111,6 +111,9 @@ def score_predictions(
     review_results = tuple(
         item for item in results if item.expected_verdict == "REVIEW"
     )
+    false_pass_count = _count(results, "false_pass")
+    reject_false_pass_count = _count(reject_results, "false_pass")
+    review_false_pass_count = _count(review_results, "false_pass")
     latencies = sorted(item.latency_ms for item in results)
     return EvaluationReport(
         metrics={
@@ -119,22 +122,31 @@ def score_predictions(
             "exact_verdict_rate": _rate(results, "exact_verdict"),
             "exact_reason_code_count": _count(results, "exact_reason_code"),
             "exact_reason_code_rate": _rate(results, "exact_reason_code"),
-            "false_pass_count": _count(results, "false_pass"),
+            "false_pass_count": false_pass_count,
             "non_pass_case_count": non_pass_count,
             "false_pass_rate": (
-                _count(results, "false_pass") / non_pass_count
+                false_pass_count / non_pass_count
                 if non_pass_count
                 else 0.0
             ),
+            "false_pass_wilson_95": _wilson_95(
+                false_pass_count, non_pass_count
+            ),
             "reject_case_count": len(reject_results),
-            "reject_false_pass_count": _count(reject_results, "false_pass"),
+            "reject_false_pass_count": reject_false_pass_count,
             "reject_false_pass_rate": _rate_or_zero(
                 reject_results, "false_pass"
             ),
+            "reject_false_pass_wilson_95": _wilson_95(
+                reject_false_pass_count, len(reject_results)
+            ),
             "review_case_count": len(review_results),
-            "review_false_pass_count": _count(review_results, "false_pass"),
+            "review_false_pass_count": review_false_pass_count,
             "review_false_pass_rate": _rate_or_zero(
                 review_results, "false_pass"
+            ),
+            "review_false_pass_wilson_95": _wilson_95(
+                review_false_pass_count, len(review_results)
             ),
             "grounded_citation_count": _count(results, "grounded_citations"),
             "grounded_citation_rate": _rate(results, "grounded_citations"),
@@ -221,6 +233,29 @@ def _rate_or_zero(
     results: tuple[EvaluationResult, ...], attribute: str
 ) -> float:
     return _rate(results, attribute) if results else 0.0
+
+
+def _wilson_95(successes: int, trials: int) -> dict[str, float] | None:
+    """Return a two-sided 95% Wilson score interval for a binomial rate."""
+    if not trials:
+        return None
+    z = 1.959963984540054
+    rate = successes / trials
+    z_squared = z**2
+    denominator = 1 + z_squared / trials
+    center = (rate + z_squared / (2 * trials)) / denominator
+    margin = (
+        z
+        * math.sqrt(
+            rate * (1 - rate) / trials
+            + z_squared / (4 * trials**2)
+        )
+        / denominator
+    )
+    return {
+        "lower": max(0.0, center - margin),
+        "upper": min(1.0, center + margin),
+    }
 
 
 def _nearest_rank(values: list[float], percentile: float) -> float:

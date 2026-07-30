@@ -67,8 +67,13 @@ class LlmEvaluationTests(unittest.TestCase):
 
         report = score_predictions(cases, predictions).to_dict()
 
+        metrics = report["metrics"]
+        false_pass_interval = metrics.pop("false_pass_wilson_95")
+        reject_interval = metrics.pop("reject_false_pass_wilson_95")
+        review_interval = metrics.pop("review_false_pass_wilson_95")
+
         self.assertEqual(
-            report["metrics"],
+            metrics,
             {
                 "case_count": 3,
                 "exact_verdict_count": 1,
@@ -101,6 +106,12 @@ class LlmEvaluationTests(unittest.TestCase):
                 "response_chars_mean": 140.0,
             },
         )
+        self.assertAlmostEqual(false_pass_interval["lower"], 0.094531, places=6)
+        self.assertAlmostEqual(false_pass_interval["upper"], 0.905469, places=6)
+        self.assertAlmostEqual(reject_interval["lower"], 0.206549, places=6)
+        self.assertEqual(reject_interval["upper"], 1.0)
+        self.assertEqual(review_interval["lower"], 0.0)
+        self.assertAlmostEqual(review_interval["upper"], 0.793451, places=6)
         self.assertEqual(
             [item["case_id"] for item in report["failures"]],
             ["ambiguous-litigation", "regulatory-penalty"],
