@@ -94,6 +94,19 @@ so the local profile sets both `LOCAL_LLM_REASONING_EFFORT=none` and the Qwen3
 and extracts the first `GOOD`/`BAD` line for check calls. Set either control empty for
 an OpenAI-compatible server or model that does not support it.
 
+### Qualitative LLM evaluation
+
+Run the versioned announcement/corporate-action corpus before changing the model or
+prompt:
+
+```bash
+uv run run_llm_eval.py --output evals/results/current.json
+```
+
+The corpus, provenance rules, metrics, model-comparison command, and initial baseline
+are documented in [`evals/README.md`](evals/README.md). Local result files are
+gitignored.
+
 ## Logging
 
 Both `loop_agent.py` and `graph_agent.py` (and `nse_trade_graph.py`) log through `logging_config.setup_logging(name)` instead of `print` — timestamped, one logger per module (`loop`, `graph`, `nse`), with the noisy `httpx` request logger quieted to `WARNING`. A `WARNING` is emitted whenever a run hits `MAX_ITERS` without a passing verdict.

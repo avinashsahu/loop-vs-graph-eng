@@ -195,11 +195,15 @@ class LocalLlmTests(unittest.TestCase):
         )
 
         with patch.multiple(llm, USE_LOCAL_LLM=True, USE_REAL_LLM=False):
-            assessment = llm.assess_fundamentals(
+            run = llm.assess_fundamentals_run(
                 dividend_prompt, ("CORPORATE_ACTION_DIVIDEND_1",)
             )
 
+        assessment = run.assessment
         self.assertEqual(assessment.verdict, "PASS")
+        self.assertFalse(run.first_pass_valid)
+        self.assertTrue(run.repair_attempted)
+        self.assertTrue(run.output_valid)
         self.assertEqual(len(completions.requests), 2)
         repair_prompt = completions.requests[1]["messages"][0]["content"]
         self.assertIn(dividend_prompt, repair_prompt)

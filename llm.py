@@ -131,6 +131,15 @@ class FundamentalAssessment:
         }
 
 
+@dataclass(frozen=True)
+class FundamentalAssessmentRun:
+    assessment: FundamentalAssessment
+    output_valid: bool
+    first_pass_valid: bool
+    repair_attempted: bool
+    response_chars: int
+
+
 def active_model_config():
     if USE_LOCAL_LLM:
         return {
@@ -322,7 +331,12 @@ def _parse_fundamental_assessment(text, available_evidence_ids=()):
 
 
 def assess_fundamentals(prompt, available_evidence_ids=()):
-    """Classify bounded qualitative disclosures through the configured model adapter."""
+    """Return the bounded qualitative assessment used by the trade pipeline."""
+    return assess_fundamentals_run(prompt, available_evidence_ids).assessment
+
+
+def assess_fundamentals_run(prompt, available_evidence_ids=()):
+    """Classify disclosures and expose bounded attempt metadata for evaluation."""
     global _call_count
     _call_count += 1
 
@@ -353,15 +367,29 @@ def assess_fundamentals(prompt, available_evidence_ids=()):
         )
         text = response.content[0].text
     else:
-        return FundamentalAssessment(
-            verdict="REVIEW",
-            reason_code="INSUFFICIENT_EVIDENCE",
-            reason="No fundamental model backend is enabled.",
-            evidence_ids=(),
-            missing=("model_backend",),
+        return FundamentalAssessmentRun(
+            assessment=FundamentalAssessment(
+                verdict="REVIEW",
+                reason_code="INSUFFICIENT_EVIDENCE",
+                reason="No fundamental model backend is enabled.",
+                evidence_ids=(),
+                missing=("model_backend",),
+            ),
+            output_valid=False,
+            first_pass_valid=False,
+            repair_attempted=False,
+            response_chars=0,
         )
     try:
-        return _parse_fundamental_assessment(text, available_evidence_ids)
+        return FundamentalAssessmentRun(
+            assessment=_parse_fundamental_assessment(
+                text, available_evidence_ids
+            ),
+            output_valid=True,
+            first_pass_valid=True,
+            repair_attempted=False,
+            response_chars=len(text),
+        )
     except ValueError:
         if USE_LOCAL_LLM:
             repair_prompt = (
@@ -380,15 +408,30 @@ def assess_fundamentals(prompt, available_evidence_ids=()):
                 max_tokens=FUNDAMENTAL_LLM_MAX_TOKENS,
             )
             try:
-                return _parse_fundamental_assessment(repaired, available_evidence_ids)
+                return FundamentalAssessmentRun(
+                    assessment=_parse_fundamental_assessment(
+                        repaired, available_evidence_ids
+                    ),
+                    output_valid=True,
+                    first_pass_valid=False,
+                    repair_attempted=True,
+                    response_chars=len(text) + len(repaired),
+                )
             except ValueError:
                 pass
-        return FundamentalAssessment(
-            verdict="REVIEW",
-            reason_code="INSUFFICIENT_EVIDENCE",
-            reason="Model did not return a valid structured assessment.",
-            evidence_ids=(),
-            missing=("invalid_model_response",),
+        return FundamentalAssessmentRun(
+            assessment=FundamentalAssessment(
+                verdict="REVIEW",
+                reason_code="INSUFFICIENT_EVIDENCE",
+                reason="Model did not return a valid structured assessment.",
+                evidence_ids=(),
+                missing=("invalid_model_response",),
+            ),
+            output_valid=False,
+            first_pass_valid=False,
+            repair_attempted=USE_LOCAL_LLM,
+            response_chars=len(text)
+            + (len(repaired) if USE_LOCAL_LLM else 0),
         )
 
 

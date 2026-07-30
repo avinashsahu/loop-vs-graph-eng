@@ -28,3 +28,6 @@ cron.log
 
 # Local bhavcopy/delivery-trend database
 bhavcopy.db
+
+# Local LLM evaluation runs (the versioned corpus remains tracked)
+evals/results/
