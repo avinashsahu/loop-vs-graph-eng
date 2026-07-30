@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from time import perf_counter
 from typing import Any, Mapping, Protocol
 from zoneinfo import ZoneInfo
+
+from position_risk import is_valid_position_plan
 
 _IST = ZoneInfo("Asia/Kolkata")
 
@@ -51,15 +54,15 @@ class ScanRequest:
         symbol = self.symbol.strip().upper()
         if not symbol:
             raise ValueError("symbol is required")
-        if self.principal <= 0:
-            raise ValueError("principal must be positive")
         for name in (
+            "principal",
             "max_allocation_pct",
             "max_loss_pct",
             "atr_stop_multiple",
             "reward_risk_ratio",
         ):
-            if getattr(self, name) <= 0:
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be positive")
         object.__setattr__(self, "symbol", symbol)
         object.__setattr__(self, "scan_label", self.scan_label.strip() or "manual")
@@ -271,12 +274,21 @@ class ScanEngine:
             )
 
         elapsed_ms = (perf_counter() - started) * 1000
-        record = self._complete_record(
-            request,
-            execution.record,
-            execution.timings,
-            elapsed_ms,
-        )
+        try:
+            record = self._complete_record(
+                request,
+                execution.record,
+                execution.timings,
+                elapsed_ms,
+            )
+        except Exception as error:
+            return self._failed_result(
+                request,
+                "disposition",
+                error,
+                execution.timings,
+                elapsed_ms,
+            )
         try:
             receipt = self._store.persist(record)
         except Exception as error:
@@ -303,6 +315,7 @@ class ScanEngine:
         elapsed_ms: float,
     ) -> dict[str, Any]:
         record = dict(raw_record)
+        _validate_terminal_record(record)
         record.setdefault("timestamp", datetime.now(_IST).isoformat())
         record["scan_label"] = request.scan_label
         record["scan_purpose"] = request.purpose.value
@@ -461,47 +474,82 @@ def build_decision_graph(
     final_reason = record.get("decision_reason") or {}
     technical_reasons = tuple(assessment.get("reason_codes") or ())
     fundamental_reason = fundamental.get("reason_code")
+    model_invoked = bool(fundamental.get("model_invoked"))
+    assessment_missing = tuple(fundamental.get("missing") or ())
+    coverage_missing = tuple(coverage.get("missing") or ())
+    deterministic_missing = () if model_invoked else assessment_missing
+    missing_fundamentals = tuple(
+        dict.fromkeys((*coverage_missing, *deterministic_missing))
+    )
+    deterministic_checks = (
+        ()
+        if model_invoked
+        else tuple(fundamental.get("checks") or ())
+    )
+    qualitative_checks = (
+        tuple(fundamental.get("checks") or ())
+        if model_invoked
+        else ()
+    )
 
     technical_status = assessment.get("status") or (
         "skipped" if not record.get("technical_verdict") else "evaluated"
     )
     data_status = (
         "failed"
-        if final_reason.get("stage") in {"market_data", "scan_engine"}
+        if final_reason.get("stage")
+        in {"data_validity", "fetch", "market_data", "scan_engine"}
         else "ready"
         if technical_status != "invalid_data"
         else "invalid"
     )
-    coverage_status = (
-        "complete"
-        if coverage.get("complete")
-        else "missing"
-        if fundamental_evidence
-        else "skipped"
-    )
+    if not fundamental_evidence and not fundamental:
+        coverage_status = "skipped"
+    elif not coverage.get("complete") or missing_fundamentals:
+        coverage_status = "missing"
+    elif deterministic_checks and fundamental.get("verdict") == "REJECT":
+        coverage_status = "policy_rejected"
+    else:
+        coverage_status = "complete"
+    coverage_reason_codes = []
+    if coverage_status == "missing":
+        coverage_reason_codes.append("INSUFFICIENT_EVIDENCE")
+    coverage_reason_codes.extend(deterministic_checks)
+    if (
+        fundamental_reason
+        and not model_invoked
+        and fundamental_reason != "NO_MATERIAL_RED_FLAG"
+    ):
+        coverage_reason_codes.append(str(fundamental_reason))
     qualitative_status = (
-        "interpreted"
-        if fundamental.get("model_invoked")
-        else "not_required"
-        if fundamental
-        else "skipped"
+        "failed"
+        if "qualitative_interpretation" in assessment_missing
+        else "review"
+        if model_invoked and fundamental.get("verdict") == "REVIEW"
+        else "interpreted"
+        if model_invoked
+        else "not_required" if fundamental else "skipped"
     )
     risk_status = (
         "accepted"
-        if risk_plan and disposition == Disposition.PROPOSE
+        if risk_plan and str(record.get("risk_verdict") or "").startswith("GOOD")
         else "evaluated"
         if record.get("risk_verdict")
         else "skipped"
     )
     alert_status = (
-        "eligible"
+        "intraday_eligible"
         if purpose == ScanPurpose.INTRADAY
+        and disposition in {Disposition.PROPOSE, Disposition.REVIEW}
+        else "digest_eligible"
+        if purpose == ScanPurpose.BATCH
         and disposition in {Disposition.PROPOSE, Disposition.REVIEW}
         else "not_applicable"
     )
     outcome_status = (
         "eligible_pending_market_data"
-        if disposition == Disposition.PROPOSE
+        if disposition in {Disposition.PROPOSE, Disposition.REVIEW}
+        and is_valid_position_plan(risk_plan)
         else "not_eligible"
     )
 
@@ -510,8 +558,17 @@ def build_decision_graph(
             "data_validity",
             "data_validity",
             data_status,
-            technical_reasons if technical_status == "invalid_data" else (),
-            {"market_snapshot": bool(record.get("market_snapshot"))},
+            (str(final_reason.get("code")),)
+            if data_status == "failed" and final_reason.get("code")
+            else technical_reasons
+            if technical_status == "invalid_data"
+            else (),
+            {
+                "market_snapshot": bool(record.get("market_snapshot")),
+                "failure_stage": final_reason.get("stage")
+                if data_status == "failed"
+                else None,
+            },
             timing.get("fetch"),
         ),
         DecisionGraphNode(
@@ -530,11 +587,10 @@ def build_decision_graph(
             "fundamental_coverage",
             "fundamental_coverage",
             coverage_status,
-            ("INSUFFICIENT_EVIDENCE",)
-            if coverage_status == "missing"
-            else (),
+            tuple(dict.fromkeys(coverage_reason_codes)),
             {
-                "missing": coverage.get("missing") or [],
+                "missing": list(missing_fundamentals),
+                "deterministic_checks": list(deterministic_checks),
                 "profile": fundamental.get("profile"),
                 "policy_version": fundamental.get("policy_version"),
             },
@@ -544,10 +600,24 @@ def build_decision_graph(
             "qualitative_evidence",
             "qualitative_evidence",
             qualitative_status,
-            (fundamental_reason,) if fundamental_reason else (),
+            tuple(
+                dict.fromkeys(
+                    (
+                        *qualitative_checks,
+                        *(
+                            (str(fundamental_reason),)
+                            if fundamental_reason and model_invoked
+                            else ()
+                        ),
+                    )
+                )
+            ),
             {
-                "model_invoked": bool(fundamental.get("model_invoked")),
+                "model_invoked": model_invoked,
                 "evidence_ids": fundamental.get("evidence_ids") or [],
+                "missing": list(assessment_missing)
+                if model_invoked
+                else [],
             },
             timing.get("fundamental"),
         ),
@@ -709,3 +779,27 @@ def _status(value: object) -> ScanStatus:
         return ScanStatus(str(value))
     except ValueError:
         return ScanStatus.FAILED
+
+
+def _validate_terminal_record(record: Mapping[str, Any]) -> None:
+    try:
+        status = ScanStatus(str(record["status"]))
+        disposition = Disposition(str(record["disposition"]))
+    except (KeyError, ValueError) as error:
+        raise ValueError("adapter returned an invalid terminal state") from error
+    expected = {
+        ScanStatus.PROPOSED: Disposition.PROPOSE,
+        ScanStatus.FLAGGED_FOR_REVIEW: Disposition.REVIEW,
+        ScanStatus.ABORTED: Disposition.REJECT,
+    }
+    if status not in expected or expected[status] != disposition:
+        raise ValueError(
+            f"invalid terminal transition: {status.value}/{disposition.value}"
+        )
+    reason = record.get("decision_reason")
+    if (
+        not isinstance(reason, Mapping)
+        or not reason.get("stage")
+        or not reason.get("code")
+    ):
+        raise ValueError("terminal decision requires a typed reason")

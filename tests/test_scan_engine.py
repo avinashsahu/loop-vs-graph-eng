@@ -13,8 +13,9 @@ from scan_engine import (
 
 
 class _FixtureAdapter:
-    def __init__(self, *, fail_at=None):
+    def __init__(self, *, fail_at=None, disposition="PROPOSE"):
         self.fail_at = fail_at
+        self.disposition = disposition
 
     def execute(self, request):
         timings = (
@@ -35,7 +36,7 @@ class _FixtureAdapter:
                 "timestamp": "2026-07-30T09:00:00+05:30",
                 "symbol": request.symbol,
                 "status": "proposed",
-                "disposition": "PROPOSE",
+                "disposition": self.disposition,
                 "decision_reason": {
                     "stage": "decision",
                     "code": "ALL_GATES_PASSED",
@@ -132,18 +133,33 @@ class ScanEngineTests(unittest.TestCase):
         )
 
         failed = ScanEngine(
-            _FixtureAdapter(fail_at="fundamental"),
+            _FixtureAdapter(fail_at="fetch"),
             store,
         ).scan(request)
 
         self.assertEqual(failed.disposition, Disposition.FAILED)
-        self.assertEqual(failed.failure.stage, "fundamental")
+        self.assertEqual(failed.failure.stage, "fetch")
         self.assertTrue(failed.failure.durable)
         self.assertEqual(store.records[1]["status"], "failed")
+        data_node = next(
+            node
+            for node in failed.decision_graph.nodes
+            if node.node_id == "data_validity"
+        )
+        self.assertEqual(data_node.status, "failed")
         self.assertEqual(
             store.records[1]["durable_failure"]["error_type"],
             "RuntimeError",
         )
+
+        invalid = ScanEngine(
+            _FixtureAdapter(disposition="REVIEW"),
+            store,
+        ).scan(request)
+
+        self.assertEqual(invalid.disposition, Disposition.FAILED)
+        self.assertEqual(invalid.failure.stage, "disposition")
+        self.assertIn("invalid terminal transition", invalid.failure.message)
 
 
 if __name__ == "__main__":

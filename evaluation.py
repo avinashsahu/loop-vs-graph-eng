@@ -17,6 +17,8 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from position_risk import is_valid_position_plan
+
 load_dotenv()
 log = logging.getLogger(__name__)
 EVALUATOR_VERSION = "daily-reference-v2-target-aware"
@@ -1425,31 +1427,7 @@ class EvaluationLedger:
 
     @staticmethod
     def _is_valid_risk_plan(risk_plan: dict[str, Any]) -> bool:
-        try:
-            entry = float(risk_plan["entry_price"])
-            stop = float(risk_plan["stop_price"])
-            shares = float(risk_plan["shares"])
-            target_value = risk_plan.get("target_price")
-            target = (
-                float(target_value)
-                if target_value is not None
-                else None
-            )
-        except (KeyError, TypeError, ValueError):
-            return False
-        return (
-            math.isfinite(entry)
-            and math.isfinite(stop)
-            and math.isfinite(shares)
-            and entry > 0
-            and 0 < stop < entry
-            and shares > 0
-            and shares.is_integer()
-            and (
-                target is None
-                or (math.isfinite(target) and target > entry)
-            )
-        )
+        return is_valid_position_plan(risk_plan)
 
     @staticmethod
     def _is_finite_positive(value: Any) -> bool:

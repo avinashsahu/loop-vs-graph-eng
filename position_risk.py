@@ -1,5 +1,6 @@
 import math
 from dataclasses import asdict, dataclass
+from typing import Any, Mapping
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,35 @@ class RiskRejection:
 
     def to_dict(self):
         return asdict(self)
+
+
+def is_valid_position_plan(risk_plan: Mapping[str, Any]) -> bool:
+    """Return whether a persisted plan is eligible for outcome evaluation."""
+    try:
+        entry = float(risk_plan["entry_price"])
+        stop = float(risk_plan["stop_price"])
+        shares = float(risk_plan["shares"])
+        target_value = risk_plan.get("target_price")
+        target = (
+            float(target_value)
+            if target_value is not None
+            else None
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (
+        math.isfinite(entry)
+        and math.isfinite(stop)
+        and math.isfinite(shares)
+        and entry > 0
+        and 0 < stop < entry
+        and shares > 0
+        and shares.is_integer()
+        and (
+            target is None
+            or (math.isfinite(target) and target > entry)
+        )
+    )
 
 
 def size_position(
