@@ -205,6 +205,19 @@ class FundamentalPromptTests(unittest.TestCase):
         self.assertNotIn("gross_npa_pct", prompt)
         self.assertNotIn("delivery", prompt.lower())
         self.assertNotIn("delivery_pct_rise_unconfirmed_by_volume", prompt)
+        self.assertIn(
+            "A cash dividend is a distribution, not dilution",
+            prompt,
+        )
+        self.assertIn(
+            "never put evidence IDs in `missing`",
+            prompt,
+        )
+        self.assertIn(
+            "PROMOTER_OR_DILUTION: verdict REJECT. Supplied text explicitly states",
+            prompt,
+        )
+        self.assertNotIn("PEER_OR_EARNINGS_WEAKNESS", prompt)
 
     def test_model_reject_aborts_while_review_remains_visible(self):
         history = ShareholdingHistory(
@@ -222,7 +235,7 @@ class FundamentalPromptTests(unittest.TestCase):
         cases = (
             (
                 "REJECT",
-                "PEER_OR_EARNINGS_WEAKNESS",
+                "ADVERSE_CORPORATE_EVENT",
                 "abort",
                 nse_trade_graph.node_abort,
                 "aborted",

@@ -62,8 +62,8 @@ OpenAI-compatible URL used here is `http://localhost:11434/v1`.
 Config (`.env`): `LOCAL_LLM_URL` (default `http://localhost:11434/v1`),
 `LOCAL_LLM_MODEL` (default `hf.co/alexsabaka/ODA-Fin-RL-8B-GGUF:Q4_K_M`),
 `LOCAL_LLM_MAX_TOKENS` (default `800`), `FUNDAMENTAL_LLM_MAX_TOKENS` (default
-`384` for the compact structured assessment; it can be raised deliberately if a
-replacement model needs more room), and `LOCAL_LLM_REASONING_EFFORT`
+`2048`; this is a ceiling and the structured response normally uses much less),
+and `LOCAL_LLM_REASONING_EFFORT`
 (default `none`). `LOCAL_LLM_NO_THINK_DIRECTIVE` defaults to `/no_think` for the
 configured Qwen3 model; set it empty for models that do not support that control token.
 
@@ -74,8 +74,8 @@ one-line verdict contract. If a compatible server ignores the schema, one bounde
 Fundamental checks use a narrower typed assessment: `PASS` / `REVIEW` / `REJECT`,
 a controlled reason code, a summary capped at 220 characters, up to three validated
 evidence IDs, and an explicit missing-evidence list. The local adapter makes one
-bounded 192-token repair attempt; every adapter fails closed if valid JSON is still
-unavailable.
+bounded reclassification attempt under the same prompt and 2048-token ceiling; every
+adapter fails closed if valid JSON is still unavailable.
 
 **Why ODA-Fin-RL-8B instead of Fin-R1:** only `node_fundamental` in the trade
 pipeline uses an LLM.

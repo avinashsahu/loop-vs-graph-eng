@@ -134,10 +134,15 @@ class LocalLlmTests(unittest.TestCase):
 
         self.assertEqual(assessment.evidence_ids, ("CORPORATE_ACTION_1",))
 
-    def test_fundamental_assessment_repairs_one_invalid_structured_response(self):
+    def test_fundamental_assessment_repairs_reject_with_missing_facts(self):
         completions = _SequencedCompletions(
             [
-                "The company appears stable.",
+                (
+                    '{"verdict":"REJECT","reason_code":"ADVERSE_CORPORATE_EVENT",'
+                    '"summary":"A material event may be adverse.",'
+                    '"evidence_ids":["ANNOUNCEMENT_1"],'
+                    '"missing":["material_event_details"]}'
+                ),
                 (
                     '{"verdict":"PASS","reason_code":"NO_MATERIAL_RED_FLAG",'
                     '"summary":"No material red flag in the supplied evidence.",'
@@ -156,24 +161,32 @@ class LocalLlmTests(unittest.TestCase):
 
         self.assertEqual(assessment.verdict, "PASS")
         self.assertEqual(len(completions.requests), 2)
-        self.assertEqual(completions.requests[1]["max_tokens"], 192)
+        self.assertEqual(
+            completions.requests[1]["max_tokens"], llm.FUNDAMENTAL_LLM_MAX_TOKENS
+        )
         self.assertIn(
-            "The company appears stable.",
+            '"missing":["material_event_details"]',
             completions.requests[1]["messages"][0]["content"],
         )
 
     def test_fundamental_assessment_repairs_a_contradictory_verdict_code_pair(self):
+        dividend_prompt = (
+            "A cash dividend is a distribution, not dilution, and is never "
+            "evidence for PROMOTER_OR_DILUTION.\n"
+            'EVIDENCE=[{"id":"CORPORATE_ACTION_DIVIDEND_1",'
+            '"purpose":"Interim Dividend - Rs 30 Per Share"}]'
+        )
         completions = _SequencedCompletions(
             [
                 (
-                    '{"verdict":"REJECT","reason_code":"NO_MATERIAL_RED_FLAG",'
-                    '"summary":"No material red flag was identified.",'
-                    '"evidence_ids":["ANNOUNCEMENT_1"],"missing":[]}'
+                    '{"verdict":"REVIEW","reason_code":"PROMOTER_OR_DILUTION",'
+                    '"summary":"The dividend may dilute existing holders.",'
+                    '"evidence_ids":["CORPORATE_ACTION_DIVIDEND_1"],"missing":[]}'
                 ),
                 (
                     '{"verdict":"PASS","reason_code":"NO_MATERIAL_RED_FLAG",'
-                    '"summary":"No material red flag was identified.",'
-                    '"evidence_ids":["ANNOUNCEMENT_1"],"missing":[]}'
+                    '"summary":"The cash dividend is a routine distribution.",'
+                    '"evidence_ids":["CORPORATE_ACTION_DIVIDEND_1"],"missing":[]}'
                 ),
             ]
         )
@@ -183,11 +196,14 @@ class LocalLlmTests(unittest.TestCase):
 
         with patch.multiple(llm, USE_LOCAL_LLM=True, USE_REAL_LLM=False):
             assessment = llm.assess_fundamentals(
-                "Judge these fundamentals", ("ANNOUNCEMENT_1",)
+                dividend_prompt, ("CORPORATE_ACTION_DIVIDEND_1",)
             )
 
         self.assertEqual(assessment.verdict, "PASS")
         self.assertEqual(len(completions.requests), 2)
+        repair_prompt = completions.requests[1]["messages"][0]["content"]
+        self.assertIn(dividend_prompt, repair_prompt)
+        self.assertIn("do not preserve the invalid conclusion", repair_prompt)
 
     def test_fundamental_assessment_repairs_wrong_json_field_types(self):
         completions = _SequencedCompletions(
@@ -260,10 +276,7 @@ class LocalLlmTests(unittest.TestCase):
                     "backend": "anthropic",
                     "name": llm.ANTHROPIC_MODEL,
                     "max_tokens": llm.ANTHROPIC_MAX_TOKENS,
-                    "fundamental_max_tokens": min(
-                        llm.ANTHROPIC_MAX_TOKENS,
-                        llm.FUNDAMENTAL_LLM_MAX_TOKENS,
-                    ),
+                    "fundamental_max_tokens": llm.FUNDAMENTAL_LLM_MAX_TOKENS,
                 },
             )
         with patch.multiple(llm, USE_LOCAL_LLM=False, USE_REAL_LLM=False):

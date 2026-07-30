@@ -6,6 +6,7 @@ from typing import Callable
 
 from fundamental_evidence import FundamentalEvidence
 from llm import FundamentalAssessment
+from qualitative_policy import QUALITATIVE_REJECT_REASON_CODES
 
 FUNDAMENTAL_POLICY_VERSION = "fundamental-sector-policy-v1"
 
@@ -182,13 +183,7 @@ def evaluate_fundamental_research(
             subtype=subtype,
             model_invoked=True,
         )
-    material_codes = {
-        "GOVERNANCE_OR_REGULATORY",
-        "PROMOTER_OR_DILUTION",
-        "ADVERSE_CORPORATE_EVENT",
-        "PEER_OR_EARNINGS_WEAKNESS",
-    }
-    if assessment.reason_code in material_codes:
+    if assessment.reason_code in QUALITATIVE_REJECT_REASON_CODES:
         if assessment.verdict != "REJECT":
             return _unmapped_qualitative(profile, subtype, assessment)
         return FundamentalDecision(

@@ -67,7 +67,7 @@ TECHNICAL_POLICY = ta_analysis.select_technical_policy(NSE_TECHNICAL_POLICY_ID)
 NSE_POLICY_VERSION = os.environ.get(
     "NSE_POLICY_VERSION",
     f"{NSE_TECHNICAL_POLICY_ID}+risk-atr-target-v3"
-    "+sentiment-volatility-v1+fundamental-sector-v1+llm-prompts-v5",
+    "+sentiment-volatility-v1+fundamental-sector-v1+llm-prompts-v6",
 )
 
 log = setup_logging("nse")
