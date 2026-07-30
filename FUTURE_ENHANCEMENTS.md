@@ -130,6 +130,13 @@ reproducibility.
 
 ## Validation evidence — 30 July 2026
 
+This is a one-run operational observation, not a model benchmark. The raw
+records remain in the local, gitignored JSONL/SQLite ledgers under the run
+labels below; the summary is not independently reproducible from this document
+alone. The scan ledger also does not retain the index endpoint's ordered
+constituent response or an index-membership as-of identity, so the recorded
+first-ten ordering cannot be reconstructed later from the decision records.
+
 A paced production scan used the first ten constituents returned by the live
 `NIFTY NEXT 50` index endpoint:
 
@@ -163,9 +170,17 @@ reached:
   `REVIEW`/material-reject reason-code pair.
 
 Conclusion: the Scan Engine, persistence, evidence gating, graph attribution,
-and fail-closed adjudication behaved as designed. The current qualitative model
-did not. Increasing the response budget from 384 to 512 tokens did not correct
-the observed semantic/schema problem, so token count should not be the first
-remedy. Do not weaken the fail-closed checks to make more proposals. Prioritize
-the labelled qualitative benchmark and compare prompt/model candidates before
-trusting live LLM passes.
+and fail-closed adjudication behaved as designed. The configured qualitative
+model failed this three-symbol validation sample. Increasing the response
+budget from 384 to 512 tokens did not correct the observed semantic/schema
+problem in one isolated `DIVISLAB` retry, so token count should not be the first
+remedy; this does not establish that token budget never matters. Do not weaken
+the fail-closed checks to make more proposals. Prioritize the labelled
+qualitative benchmark and compare prompt/model candidates before trusting live
+LLM passes.
+
+This sample did not reach live risk sizing or proposal creation, and it did not
+exercise Slack delivery, future-outcome collection, or an injected durable
+infrastructure failure. Those paths remain covered by tests or await later
+operational evidence; this run is not proof of the entire application
+end-to-end.
