@@ -2,10 +2,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# Pull today's bhavcopy (whole-market delivery %) before the scan -- feeds
-# node_fundamental's delivery-trend context. Not fatal if NSE hasn't published it yet
-# (e.g. a public holiday); the scan just runs without today's row added.
-uv run bhavcopy.py || true
+# Catch up the configured recent bhavcopy window before the scan. Existing sessions
+# require no NSE request, so this is safe even when the scheduler already refreshed it.
+uv run bhavcopy.py backfill || true
 
 # Grade prior decisions now that another completed session may be available. This is
 # telemetry only: a damaged/missing local evaluation store must not prevent the scan.
@@ -15,5 +14,10 @@ fi
 
 # IST explicitly -- the host machine's own system timezone may not be IST.
 RUN_ID="overnight_$(TZ='Asia/Kolkata' date +%Y%m%d_%H%M)"
-NSE_SCAN_LABEL="$RUN_ID" NSE_INDEX="NIFTY TOTAL MKT" uv run nse_trade_graph.py
+OVERNIGHT_INDEX="${NSE_OVERNIGHT_INDEX:-NIFTY NEXT 50}"
+OVERNIGHT_LIMIT="${NSE_OVERNIGHT_SCAN_LIMIT:-}"
+NSE_SCAN_LABEL="$RUN_ID" \
+NSE_INDEX="$OVERNIGHT_INDEX" \
+NSE_SCAN_LIMIT="$OVERNIGHT_LIMIT" \
+uv run nse_trade_graph.py
 uv run digest.py "$RUN_ID"

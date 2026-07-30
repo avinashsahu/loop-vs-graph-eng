@@ -14,13 +14,11 @@ load_dotenv()
 USE_REAL_LLM = os.environ.get("USE_REAL_LLM") == "1"
 USE_LOCAL_LLM = os.environ.get("USE_LOCAL_LLM") == "1"
 LOCAL_LLM_URL = os.environ.get("LOCAL_LLM_URL", "http://localhost:11434/v1")
-LOCAL_LLM_MODEL = os.environ.get(
-    "LOCAL_LLM_MODEL", "hf.co/alexsabaka/ODA-Fin-RL-8B-GGUF:Q4_K_M"
-)
+LOCAL_LLM_MODEL = os.environ.get("LOCAL_LLM_MODEL", "phi4:14b-q4_K_M")
 LOCAL_LLM_MAX_TOKENS = int(os.environ.get("LOCAL_LLM_MAX_TOKENS", "800"))
 LOCAL_LLM_REASONING_EFFORT = os.environ.get("LOCAL_LLM_REASONING_EFFORT", "none")
 LOCAL_LLM_NO_THINK_DIRECTIVE = os.environ.get(
-    "LOCAL_LLM_NO_THINK_DIRECTIVE", "/no_think"
+    "LOCAL_LLM_NO_THINK_DIRECTIVE", ""
 )
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 ANTHROPIC_MAX_TOKENS = 200
@@ -138,6 +136,17 @@ class FundamentalAssessmentRun:
     first_pass_valid: bool
     repair_attempted: bool
     response_chars: int
+    reasoning: str = ""
+    completion_tokens: int = 0
+    reasoning_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class _LocalStructuredResponse:
+    content: str
+    reasoning: str
+    completion_tokens: int
+    reasoning_tokens: int | None
 
 
 def active_model_config():
@@ -264,12 +273,20 @@ def _call_local_structured(prompt, response_format, *, max_tokens=None):
         request["reasoning_effort"] = LOCAL_LLM_REASONING_EFFORT
     response = _local_client.chat.completions.create(**request)
     message = response.choices[0].message
-    return (
-        message.content
-        if message.content is not None
-        else getattr(message, "reasoning", "")
+    reasoning = (
+        getattr(message, "reasoning_content", None)
+        or getattr(message, "reasoning", None)
+        or ""
     )
-
+    content = message.content if message.content is not None else reasoning
+    usage = getattr(response, "usage", None)
+    completion_details = getattr(usage, "completion_tokens_details", None)
+    return _LocalStructuredResponse(
+        content=content,
+        reasoning=reasoning,
+        completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+        reasoning_tokens=getattr(completion_details, "reasoning_tokens", None),
+    )
 
 def _parse_fundamental_assessment(text, available_evidence_ids=()):
     try:
@@ -342,11 +359,12 @@ def assess_fundamentals_run(prompt, available_evidence_ids=()):
 
     classification_prompt = prompt
     if USE_LOCAL_LLM:
-        text = _call_local_structured(
+        local_response = _call_local_structured(
             classification_prompt,
             FUNDAMENTAL_RESPONSE_FORMAT,
             max_tokens=FUNDAMENTAL_LLM_MAX_TOKENS,
         )
+        text = local_response.content
     elif USE_REAL_LLM:
         import anthropic
 
@@ -389,6 +407,13 @@ def assess_fundamentals_run(prompt, available_evidence_ids=()):
             first_pass_valid=True,
             repair_attempted=False,
             response_chars=len(text),
+            reasoning=local_response.reasoning if USE_LOCAL_LLM else "",
+            completion_tokens=(
+                local_response.completion_tokens if USE_LOCAL_LLM else 0
+            ),
+            reasoning_tokens=(
+                local_response.reasoning_tokens if USE_LOCAL_LLM else None
+            ),
         )
     except ValueError:
         if USE_LOCAL_LLM:
@@ -402,11 +427,12 @@ def assess_fundamentals_run(prompt, available_evidence_ids=()):
                 f"ORIGINAL REQUEST:\n{classification_prompt}\n\n"
                 f"INVALID ASSESSMENT:\n{text[:4000]}"
             )
-            repaired = _call_local_structured(
+            repair_response = _call_local_structured(
                 repair_prompt,
                 FUNDAMENTAL_RESPONSE_FORMAT,
                 max_tokens=FUNDAMENTAL_LLM_MAX_TOKENS,
             )
+            repaired = repair_response.content
             try:
                 return FundamentalAssessmentRun(
                     assessment=_parse_fundamental_assessment(
@@ -416,6 +442,25 @@ def assess_fundamentals_run(prompt, available_evidence_ids=()):
                     first_pass_valid=False,
                     repair_attempted=True,
                     response_chars=len(text) + len(repaired),
+                    reasoning="\n\n".join(
+                        item
+                        for item in (
+                            local_response.reasoning,
+                            repair_response.reasoning,
+                        )
+                        if item
+                    ),
+                    completion_tokens=(
+                        local_response.completion_tokens
+                        + repair_response.completion_tokens
+                    ),
+                    reasoning_tokens=(
+                        local_response.reasoning_tokens
+                        + repair_response.reasoning_tokens
+                        if local_response.reasoning_tokens is not None
+                        and repair_response.reasoning_tokens is not None
+                        else None
+                    ),
                 )
             except ValueError:
                 pass

@@ -18,6 +18,11 @@ scan_runs.jsonl
 evaluation.db
 evaluation.db-*
 .intraday_alert_state.json*
+.app_scheduler_state.json*
+.app_scheduler.lock
+.app_scheduler.pid
+.ollama.pid
+ollama.log
 
 # On-disk data cache
 .cache/
@@ -31,3 +36,6 @@ bhavcopy.db
 
 # Local LLM evaluation runs (the versioned corpus remains tracked)
 evals/results/
+
+# JSONL lines removed by cleanup.py
+.archive/

@@ -28,6 +28,10 @@ class EvaluationPrediction:
     repair_attempted: bool
     latency_ms: float
     response_chars: int
+    assessment_reason: str = ""
+    reasoning: str = ""
+    completion_tokens: int = 0
+    reasoning_tokens: int | None = None
     error: str | None = None
 
 
@@ -49,6 +53,10 @@ class EvaluationResult:
     repair_attempted: bool
     latency_ms: float
     response_chars: int
+    assessment_reason: str
+    reasoning: str
+    completion_tokens: int
+    reasoning_tokens: int | None
     error: str | None
 
     @property
@@ -115,6 +123,8 @@ def score_predictions(
     reject_false_pass_count = _count(reject_results, "false_pass")
     review_false_pass_count = _count(review_results, "false_pass")
     latencies = sorted(item.latency_ms for item in results)
+    completion_tokens = sorted(item.completion_tokens for item in results)
+    reasoning_char_counts = sorted(len(item.reasoning) for item in results)
     return EvaluationReport(
         metrics={
             "case_count": count,
@@ -171,6 +181,24 @@ def score_predictions(
             "response_chars_mean": mean(
                 item.response_chars for item in results
             ),
+            "completion_tokens_p50": _nearest_rank(
+                completion_tokens, 0.50
+            ),
+            "completion_tokens_p95": _nearest_rank(
+                completion_tokens, 0.95
+            ),
+            "reasoning_present_count": sum(
+                bool(item.reasoning) for item in results
+            ),
+            "reasoning_present_rate": (
+                sum(bool(item.reasoning) for item in results) / count
+            ),
+            "reasoning_chars_p50": _nearest_rank(
+                reasoning_char_counts, 0.50
+            ),
+            "reasoning_chars_p95": _nearest_rank(
+                reasoning_char_counts, 0.95
+            ),
         },
         results=results,
     )
@@ -208,6 +236,10 @@ def _score_case(
         repair_attempted=prediction.repair_attempted,
         latency_ms=prediction.latency_ms,
         response_chars=prediction.response_chars,
+        assessment_reason=prediction.assessment_reason,
+        reasoning=prediction.reasoning,
+        completion_tokens=prediction.completion_tokens,
+        reasoning_tokens=prediction.reasoning_tokens,
         error=prediction.error,
     )
 

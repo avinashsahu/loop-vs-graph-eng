@@ -104,6 +104,12 @@ class LlmEvaluationTests(unittest.TestCase):
                 "latency_ms_p50": 200.0,
                 "latency_ms_p95": 300.0,
                 "response_chars_mean": 140.0,
+                "completion_tokens_p50": 0,
+                "completion_tokens_p95": 0,
+                "reasoning_present_count": 0,
+                "reasoning_present_rate": 0.0,
+                "reasoning_chars_p50": 0,
+                "reasoning_chars_p95": 0,
             },
         )
         self.assertAlmostEqual(false_pass_interval["lower"], 0.094531, places=6)

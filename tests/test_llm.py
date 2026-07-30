@@ -13,8 +13,17 @@ class _Completions:
 
     def create(self, **kwargs):
         self.request = kwargs
-        message = types.SimpleNamespace(content=self.content, reasoning=self.reasoning)
-        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)])
+        message = types.SimpleNamespace(
+            content=self.content,
+            reasoning_content=self.reasoning,
+        )
+        return types.SimpleNamespace(
+            choices=[types.SimpleNamespace(message=message)],
+            usage=types.SimpleNamespace(
+                completion_tokens=42,
+                completion_tokens_details=None,
+            ),
+        )
 
 
 class _SequencedCompletions:
@@ -69,7 +78,23 @@ class LocalLlmTests(unittest.TestCase):
         self.assertNotIn("reasoning_effort", self.completions.request)
         self.assertEqual(self.completions.request["messages"][0]["content"], "Judge this")
 
-    def test_extracts_verdict_from_qwen_reasoning_markup(self):
+    def test_retains_structured_response_reasoning_for_evaluation(self):
+        self.completions.content = '{"verdict":"PASS"}'
+        self.completions.reasoning = "Checked each required disclosure field."
+
+        result = llm._call_local_structured(
+            "Judge this",
+            {"type": "json_object"},
+        )
+
+        self.assertEqual(result.content, '{"verdict":"PASS"}')
+        self.assertEqual(
+            result.reasoning,
+            "Checked each required disclosure field.",
+        )
+        self.assertEqual(result.completion_tokens, 42)
+
+    def test_extracts_verdict_from_reasoning_markup(self):
         llm.LOCAL_LLM_NO_THINK_DIRECTIVE = "/no_think"
         self.completions.content = (
             "</think>\n<answer>\nGOOD Stable fundamentals.\n\n"

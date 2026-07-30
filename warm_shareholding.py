@@ -29,6 +29,11 @@ def _arguments():
     )
     parser.add_argument("--periods", type=int, default=5)
     parser.add_argument(
+        "--limit",
+        type=int,
+        help="process at most this many deduplicated symbols",
+    )
+    parser.add_argument(
         "--allow-market-hours",
         action="store_true",
         help="Override the default guard that keeps this job out of NSE trading hours.",
@@ -38,6 +43,8 @@ def _arguments():
 
 def main():
     args = _arguments()
+    if args.limit is not None and args.limit <= 0:
+        raise SystemExit("--limit must be greater than zero")
     if is_market_hours() and not args.allow_market_hours:
         raise SystemExit(
             "Refusing to warm during NSE market hours; retry after 15:30 IST or pass "
@@ -50,7 +57,12 @@ def main():
     if args.queued:
         symbols.extend(queued_shareholding_symbols())
     symbols = list(dict.fromkeys(symbol.strip().upper() for symbol in symbols if symbol))
+    if args.limit is not None:
+        symbols = symbols[: args.limit]
     if not symbols:
+        if args.queued and not args.symbols and not args.index_names:
+            log.info("shareholding warm queue is empty")
+            return
         raise SystemExit("Provide one or more symbols or --index.")
 
     failed = []

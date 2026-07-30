@@ -41,6 +41,7 @@ def main(argv=None) -> int:
             max_tokens=args.max_tokens,
             timeout_seconds=args.timeout_seconds,
             no_think_directive=directive,
+            reasoning_effort=args.reasoning_effort,
         )
         for model, directive in model_specs
     ]
@@ -82,6 +83,7 @@ def _evaluate_model(
     max_tokens: int,
     timeout_seconds: float,
     no_think_directive: str,
+    reasoning_effort: str,
 ) -> dict:
     previous = {
         "client": llm._local_client,
@@ -89,6 +91,7 @@ def _evaluate_model(
         "model": llm.LOCAL_LLM_MODEL,
         "max_tokens": llm.FUNDAMENTAL_LLM_MAX_TOKENS,
         "directive": llm.LOCAL_LLM_NO_THINK_DIRECTIVE,
+        "reasoning_effort": llm.LOCAL_LLM_REASONING_EFFORT,
         "use_local": llm.USE_LOCAL_LLM,
         "use_real": llm.USE_REAL_LLM,
     }
@@ -101,6 +104,7 @@ def _evaluate_model(
     llm.LOCAL_LLM_MODEL = model
     llm.FUNDAMENTAL_LLM_MAX_TOKENS = max_tokens
     llm.LOCAL_LLM_NO_THINK_DIRECTIVE = no_think_directive
+    llm.LOCAL_LLM_REASONING_EFFORT = reasoning_effort
     llm.USE_LOCAL_LLM = True
     llm.USE_REAL_LLM = False
     try:
@@ -114,6 +118,7 @@ def _evaluate_model(
         llm.LOCAL_LLM_MODEL = previous["model"]
         llm.FUNDAMENTAL_LLM_MAX_TOKENS = previous["max_tokens"]
         llm.LOCAL_LLM_NO_THINK_DIRECTIVE = previous["directive"]
+        llm.LOCAL_LLM_REASONING_EFFORT = previous["reasoning_effort"]
         llm.USE_LOCAL_LLM = previous["use_local"]
         llm.USE_REAL_LLM = previous["use_real"]
 
@@ -137,6 +142,7 @@ def _evaluate_model(
             "name": model,
             "max_tokens": max_tokens,
             "no_think_directive": no_think_directive,
+            "reasoning_effort": reasoning_effort,
             "timeout_seconds": timeout_seconds,
         },
         **report,
@@ -170,6 +176,10 @@ def _evaluate_case(
             repair_attempted=run.repair_attempted,
             latency_ms=round((time.perf_counter() - started) * 1000, 3),
             response_chars=run.response_chars,
+            assessment_reason=assessment.reason,
+            reasoning=run.reasoning,
+            completion_tokens=run.completion_tokens,
+            reasoning_tokens=run.reasoning_tokens,
         )
     except Exception as exc:
         return EvaluationPrediction(
@@ -267,6 +277,14 @@ def _parse_args(argv) -> argparse.Namespace:
     parser.add_argument(
         "--no-think-directive",
         default=llm.LOCAL_LLM_NO_THINK_DIRECTIVE,
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        default=llm.LOCAL_LLM_REASONING_EFFORT,
+        help=(
+            "OpenAI-compatible reasoning effort. Use 'none' to disable; "
+            "record the server-supported non-none value used for thinking."
+        ),
     )
     parser.add_argument(
         "--case-id",
