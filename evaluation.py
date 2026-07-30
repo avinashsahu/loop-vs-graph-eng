@@ -988,7 +988,7 @@ class EvaluationLedger:
                            decisions.llm_max_tokens
                        ) AS llm_max_tokens,
                        decisions.model_backend, decisions.policy_version,
-                       decisions.target_price
+                       decisions.target_price, decisions.raw_record_json
                 FROM outcomes
                 JOIN decisions USING (decision_id)
                 JOIN canonical USING (decision_id)
@@ -1092,6 +1092,9 @@ class EvaluationLedger:
             tuple[str | None, str | None, int | None, str | None],
             dict[int, list[sqlite3.Row]],
         ] = {}
+        decision_graph_performance: dict[
+            str, dict[str, dict[int, list[sqlite3.Row]]]
+        ] = {}
         for row in outcomes:
             horizon = int(row["horizon_sessions"])
             methodology_key = str(row["methodology_key"])
@@ -1122,6 +1125,10 @@ class EvaluationLedger:
             methodology_performance.setdefault(methodology_key, {}).setdefault(
                 horizon, []
             ).append(row)
+            for evidence_family, status in self._decision_graph_cohorts(row):
+                decision_graph_performance.setdefault(
+                    evidence_family, {}
+                ).setdefault(status, {}).setdefault(horizon, []).append(row)
 
         return {
             "decisions": {
@@ -1170,6 +1177,20 @@ class EvaluationLedger:
             )
             if len(methodology_performance) <= 1
             else [],
+            "decision_graph_performance": [
+                {
+                    "evidence_family": evidence_family,
+                    "status": status,
+                    "horizons": {
+                        str(horizon): self._summarize_outcomes(rows)
+                        for horizon, rows in sorted(horizons.items())
+                    },
+                }
+                for evidence_family, statuses in sorted(
+                    decision_graph_performance.items()
+                )
+                for status, horizons in sorted(statuses.items())
+            ],
             "methodology_performance": [
                 {
                     "methodology_key": methodology_key,
@@ -1349,6 +1370,44 @@ class EvaluationLedger:
                 ),
             )
         ]
+
+    @staticmethod
+    def _decision_graph_cohorts(row):
+        try:
+            record = json.loads(row["raw_record_json"])
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return ()
+        graph = record.get("decision_graph") or {}
+        nodes = {
+            node.get("id"): node
+            for node in graph.get("nodes") or ()
+            if isinstance(node, dict)
+        }
+        cohorts = []
+        technical = nodes.get("technical_families") or {}
+        families = (technical.get("evidence") or {}).get("families") or {}
+        for family, value in sorted(families.items()):
+            if not isinstance(value, (int, float)):
+                continue
+            direction = (
+                "positive"
+                if value > 0
+                else "negative"
+                if value < 0
+                else "neutral"
+            )
+            cohorts.append((f"technical:{family}", direction))
+        for node_id in (
+            "fundamental_coverage",
+            "qualitative_evidence",
+            "risk",
+        ):
+            node = nodes.get(node_id)
+            if node:
+                cohorts.append(
+                    (node_id, str(node.get("status") or "unknown"))
+                )
+        return tuple(cohorts)
 
     @staticmethod
     def _score_band(score: float | None) -> str:

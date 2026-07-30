@@ -10,6 +10,7 @@ import sys
 from functools import partial
 
 import notify
+import nse_trade_graph
 from alert_ledger import (
     AlertLedger,
     AlertLedgerStateError,
@@ -22,13 +23,10 @@ from digest import (
 )
 from logging_config import setup_logging
 from market_time import is_market_hours, now_ist
+from scan_engine import ScanPurpose, ScanRequest
 
 log = setup_logging("intraday_recheck")
 
-# Read directly, not `from nse_trade_graph import TRADE_LOG_PATH` -- importing
-# nse_trade_graph here would run its module-level NSE_SCAN_LABEL read before this
-# script sets its own label below, and sys.modules caching would make the later
-# `import nse_trade_graph` a no-op re-execution-wise.
 TRADE_LOG_PATH = os.environ.get("TRADE_LOG_PATH", "trade_log.jsonl")
 INTRADAY_ALERT_STATE_PATH = os.environ.get(
     "INTRADAY_ALERT_STATE_PATH",
@@ -75,11 +73,7 @@ if __name__ == "__main__":
         print(f"No proposed/flagged symbols found for scan_label={run_id!r}.")
         sys.exit(0)
 
-    # Set before importing nse_trade_graph -- its NSE_SCAN_LABEL constant is read once at
-    # import time, same pattern every other config value in that module already uses.
-    os.environ["NSE_SCAN_LABEL"] = f"intraday_{now_ist():%Y%m%d_%H%M%S}"
-    import nse_trade_graph
-
+    scan_label = f"intraday_{now_ist():%Y%m%d_%H%M%S}"
     principal = float(os.environ.get("NSE_PRINCIPAL", "100000"))
     max_allocation_pct = float(
         os.environ.get(
@@ -91,34 +85,39 @@ if __name__ == "__main__":
     atr_stop_multiple = float(os.environ.get("NSE_ATR_STOP_MULTIPLE", "2"))
     reward_risk_ratio = float(os.environ.get("NSE_REWARD_RISK_RATIO", "2"))
     alert_ledger = AlertLedger(INTRADAY_ALERT_STATE_PATH)
+    scan_engine = nse_trade_graph.create_scan_engine()
 
     for symbol in symbols:
-        try:
-            final_state = nse_trade_graph.run(
-                symbol,
-                principal,
-                max_allocation_pct,
-                max_loss_pct,
-                atr_stop_multiple,
-                reward_risk_ratio,
+        result = scan_engine.scan(
+            ScanRequest(
+                symbol=symbol,
+                principal=principal,
+                scan_label=scan_label,
+                purpose=ScanPurpose.INTRADAY,
+                max_allocation_pct=max_allocation_pct,
+                max_loss_pct=max_loss_pct,
+                atr_stop_multiple=atr_stop_multiple,
+                reward_risk_ratio=reward_risk_ratio,
+                run_id=run_id,
             )
-        except Exception:
-            # nsemine can return None (not raise) for illiquid/no-data symbols, which
-            # crashes deeper in the fetch chain -- one bad symbol shouldn't cost every
-            # remaining alert in this run, same as the batch scanner's own per-symbol
-            # try/except in nse_trade_graph.py's __main__.
-            log.warning("recheck failed for %s, continuing", symbol, exc_info=True)
+        )
+        if result.failure is not None:
+            log.warning(
+                "recheck failed for %s at %s: %s",
+                symbol,
+                result.failure.stage,
+                result.failure.message,
+            )
             continue
 
-        status = final_state["status"]
+        status = result.status
         # The fingerprint excludes timestamps and prose, so only disposition, material
         # plan fields, or typed decision reasons create a new alert transition.
-        record = nse_trade_graph.build_record(final_state)
+        record = result.record
         fingerprint = build_decision_fingerprint(record)
         channels = {}
         if status in ("proposed", "flagged_for_review"):
-            # Same builder node_log already used internally (run() logs as part of the graph
-            # itself) -- guarantees alerts contain exactly what's in trade_log.jsonl.
+            # The typed result exposes the exact record the Scan Engine persisted.
             subject = f"NSE Intraday Alert -- {symbol} -- {status}"
             if notify.EMAIL_ENABLED and notify.get_recipients():
                 channels["email"] = partial(

@@ -13,6 +13,7 @@ import nse_trade_graph
 from evaluation import EvaluationLedger
 from fundamental_research import FundamentalDecision
 from llm import FundamentalAssessment
+from scan_engine import ScanEngine, ScanExecution, ScanPurpose, ScanRequest
 from shareholding import ShareholdingHistory, ShareholdingPeriod
 
 
@@ -432,7 +433,7 @@ class MarketSnapshotRecordTests(unittest.TestCase):
             nse_trade_graph.NSE_POLICY_VERSION,
         )
 
-    def test_log_node_records_the_same_decision_in_the_evaluation_ledger(self):
+    def test_scan_engine_records_the_same_decision_in_the_evaluation_ledger(self):
         state = {
             "symbol": "ACE",
             "principal": 100_000.0,
@@ -454,15 +455,33 @@ class MarketSnapshotRecordTests(unittest.TestCase):
             evaluation_path = f"{temp_dir}/evaluation.db"
             with (
                 patch.object(nse_trade_graph, "TRADE_LOG_PATH", trade_log_path),
-                patch.object(
-                    nse_trade_graph,
-                    "EVALUATION_DB_PATH",
-                    evaluation_path,
-                ),
+                patch.object(nse_trade_graph, "EVALUATION_DB_PATH", evaluation_path),
             ):
-                nse_trade_graph.node_log(state)
+                adapter = SimpleNamespace(
+                    execute=lambda request: ScanExecution(
+                        record=nse_trade_graph.build_record(
+                            {**state, "scan_label": request.scan_label}
+                        )
+                    )
+                )
+                engine = ScanEngine(
+                    adapter,
+                    nse_trade_graph.ProductionDecisionStore(
+                        trade_log_path,
+                        evaluation_path,
+                    ),
+                )
+                result = engine.scan(
+                    ScanRequest(
+                        symbol="ACE",
+                        principal=100_000,
+                        scan_label="fixture",
+                        purpose=ScanPurpose.BATCH,
+                    )
+                )
 
             ledger = EvaluationLedger(evaluation_path)
+            self.assertIsNotNone(result.decision_id)
             self.assertEqual(ledger.status_counts(), {"aborted": 1})
             self.assertEqual(
                 ledger.calibration_report()["decisions"]["reason_codes"],
@@ -606,7 +625,7 @@ class RiskNodeTests(unittest.TestCase):
 
         route, result_state = nse_trade_graph.node_propose(state)
 
-        self.assertEqual(route, "log")
+        self.assertIsNone(route)
         self.assertIn("entry ~₹100.00", result_state["proposal"])
         self.assertIn("stop ₹90.00", result_state["proposal"])
         self.assertIn("target ₹120.00 (2.00R)", result_state["proposal"])

@@ -39,6 +39,17 @@ from llm import (
 )
 from logging_config import setup_logging
 from market_time import now_ist
+from scan_engine import (
+    ModelIdentity,
+    PersistenceReceipt,
+    PolicyIdentity,
+    ScanEngine,
+    ScanExecution,
+    ScanExecutionError,
+    ScanPurpose,
+    ScanRequest,
+    StageTiming,
+)
 from shareholding import get_shareholding_history
 
 TRADE_LOG_PATH = os.environ.get("TRADE_LOG_PATH", "trade_log.jsonl")
@@ -516,7 +527,7 @@ def node_propose(state):
         f"of ₹{state['principal']:.0f} principal). "
         "Confirm manually before placing any order."
     )
-    return "log", state
+    return None, state
 
 
 def node_flag_review(state):
@@ -534,7 +545,7 @@ def node_flag_review(state):
         f"FLAGGED FOR MANUAL REVIEW: {check} check requires inspection for "
         f"{state['symbol']} — {verdict!r}"
     )
-    return "log", state
+    return None, state
 
 
 def node_abort(state):
@@ -543,20 +554,18 @@ def node_abort(state):
     if not state.get("decision_reason"):
         _set_decision_reason(state, "decision", "UNCLASSIFIED_REJECTION")
     state["proposal"] = None
-    return "log", state
+    return None, state
 
 
 def build_record(state):
-    """The one place a state dict becomes a log/email record -- used by node_log and by
-    intraday_recheck.py (which re-runs the graph outside the normal fetch->...->log path
-    and used to hand-rebuild a near-copy of this, which is exactly the kind of drift that
-    lets a field show up in the digest but silently render as None in an intraday alert).
-    Uses this module's NSE_SCAN_LABEL constant -- intraday_recheck.py relies on getting
-    its own label here, which is why it sets os.environ["NSE_SCAN_LABEL"] *before*
-    importing this module (module-level constants are computed once, at import time)."""
+    """The production adapter's one mutable-state to durable-record conversion.
+
+    Callers receive the typed ScanResult; mutable workflow state stays behind that seam.
+    The scan label is request state, not import-order configuration.
+    """
     return {
         "timestamp": now_ist().isoformat(),
-        "scan_label": NSE_SCAN_LABEL,
+        "scan_label": state.get("scan_label", NSE_SCAN_LABEL),
         "symbol": state["symbol"],
         "company_name": (state.get("quote") or {}).get("name"),
         "principal": state["principal"],
@@ -590,22 +599,7 @@ def build_record(state):
     }
 
 
-def node_log(state):
-    record = build_record(state)
-    with open(TRADE_LOG_PATH, "a") as f:
-        f.write(json.dumps(record) + "\n")
-    try:
-        receipt = EvaluationLedger(EVALUATION_DB_PATH).record_decision(record)
-        state["decision_id"] = receipt.decision_id
-    except Exception:
-        # JSONL remains the durable fallback and can be imported later. Evaluation
-        # telemetry must not turn an otherwise completed scan into a failed scan.
-        log.warning("evaluation ledger write failed", exc_info=True)
-    log.info("status=%s proposal=%r", state["status"], state["proposal"])
-    return None, state
-
-
-GRAPH = {
+_STAGES = {
     "fetch": node_fetch,
     "technical": node_technical,
     "fundamental": node_fundamental,
@@ -614,25 +608,118 @@ GRAPH = {
     "propose": node_propose,
     "flag_review": node_flag_review,
     "abort": node_abort,
-    "log": node_log,
 }
 
 
-def run(
-    symbol,
-    principal,
-    max_allocation_pct=10.0,
-    max_loss_pct=1.0,
-    atr_stop_multiple=2.0,
-    reward_risk_ratio=2.0,
+class ProductionScanAdapter:
+    """Keep mutable stage implementation behind the typed Scan Engine seam."""
+
+    def execute(self, request):
+        state = _initial_scan_state(request)
+        node = "fetch"
+        timings = []
+
+        while node is not None:
+            log.debug("node=%s", node)
+            stage_started = time.perf_counter()
+            try:
+                next_node, state = _STAGES[node](state)
+            except Exception as error:
+                timings.append(
+                    StageTiming(
+                        _timing_stage(node),
+                        (time.perf_counter() - stage_started) * 1000,
+                    )
+                )
+                raise ScanExecutionError(
+                    node,
+                    error,
+                    tuple(timings),
+                ) from error
+            timings.append(
+                StageTiming(
+                    _timing_stage(node),
+                    (time.perf_counter() - stage_started) * 1000,
+                )
+            )
+            if next_node is None and not state.get("disposition"):
+                raise ScanExecutionError(
+                    node,
+                    RuntimeError("scan ended before disposition persistence"),
+                    tuple(timings),
+                )
+            node = next_node
+
+        return ScanExecution(
+            record=build_record(state),
+            timings=tuple(timings),
+        )
+
+
+class ProductionDecisionStore:
+    def __init__(self, trade_log_path, evaluation_db_path):
+        self._trade_log_path = trade_log_path
+        self._evaluation_db_path = evaluation_db_path
+
+    def persist(self, record):
+        with open(self._trade_log_path, "a") as trade_log:
+            trade_log.write(json.dumps(record) + "\n")
+        decision_id = None
+        try:
+            receipt = EvaluationLedger(self._evaluation_db_path).record_decision(record)
+            decision_id = receipt.decision_id
+        except Exception:
+            log.warning(
+                "evaluation ledger write failed; JSONL decision remains durable",
+                exc_info=True,
+            )
+        return PersistenceReceipt(decision_id=decision_id, durable=True)
+
+
+def create_scan_engine(
+    *,
+    trade_log_path=None,
+    evaluation_db_path=None,
 ):
-    state = {
-        "symbol": symbol,
-        "principal": principal,
-        "max_loss_pct": max_loss_pct,
-        "max_allocation_pct": max_allocation_pct,
-        "atr_stop_multiple": atr_stop_multiple,
-        "reward_risk_ratio": reward_risk_ratio,
+    trade_log_path = trade_log_path or TRADE_LOG_PATH
+    evaluation_db_path = evaluation_db_path or EVALUATION_DB_PATH
+    model = active_model_config()
+    return ScanEngine(
+        ProductionScanAdapter(),
+        ProductionDecisionStore(trade_log_path, evaluation_db_path),
+        fallback_policy=PolicyIdentity(
+            version=NSE_POLICY_VERSION,
+            technical_policy_id=NSE_TECHNICAL_POLICY_ID,
+            technical_policy_fingerprint=TECHNICAL_POLICY.fingerprint,
+            fundamental_policy_version=FUNDAMENTAL_POLICY_VERSION,
+        ),
+        fallback_model=ModelIdentity(
+            backend=str(model.get("backend") or "unknown"),
+            name=model.get("name"),
+            max_tokens=model.get("max_tokens"),
+            fundamental_max_tokens=model.get(
+                "fundamental_max_tokens",
+                model.get("max_tokens"),
+            ),
+        ),
+    )
+
+
+def run(request: ScanRequest):
+    """Compatibility entry point returning the typed result, not mutable workflow state."""
+    return create_scan_engine().scan(request)
+
+
+def _initial_scan_state(request):
+    return {
+        "symbol": request.symbol,
+        "principal": request.principal,
+        "scan_label": request.scan_label,
+        "scan_purpose": request.purpose.value,
+        "max_loss_pct": request.max_loss_pct,
+        "max_allocation_pct": request.max_allocation_pct,
+        "atr_stop_multiple": request.atr_stop_multiple,
+        "reward_risk_ratio": request.reward_risk_ratio,
         "iters": 0,
         "quote": None,
         "hist": None,
@@ -659,14 +746,14 @@ def run(
         "proposal": None,
         "decision_id": None,
     }
-    node = "fetch"
 
-    while node is not None:
-        log.debug("node=%s", node)
-        fn = GRAPH[node]
-        node, state = fn(state)
 
-    return state
+def _timing_stage(node):
+    return (
+        "disposition"
+        if node in {"propose", "flag_review", "abort"}
+        else node
+    )
 
 
 if __name__ == "__main__":
@@ -732,22 +819,26 @@ if __name__ == "__main__":
         }
     )
     pending_symbols = set(symbols)
+    scan_engine = create_scan_engine()
 
     try:
         for i, symbol in enumerate(symbols):
             if i > 0:
                 time.sleep(scan_delay_seconds)
-            try:
-                final_state = run(
-                    symbol,
-                    principal,
-                    max_allocation_pct,
-                    max_loss_pct,
-                    atr_stop_multiple,
-                    reward_risk_ratio,
-                )
-                log.info("final[%s]: %s", symbol, final_state["proposal"])
-            except Exception as error:
+            request = ScanRequest(
+                symbol=symbol,
+                principal=principal,
+                scan_label=NSE_SCAN_LABEL,
+                purpose=ScanPurpose.BATCH,
+                max_allocation_pct=max_allocation_pct,
+                max_loss_pct=max_loss_pct,
+                atr_stop_multiple=atr_stop_multiple,
+                reward_risk_ratio=reward_risk_ratio,
+                run_id=scan_journal_id,
+            )
+            result = scan_engine.scan(request)
+            if result.failure is not None:
+                error = RuntimeError(result.failure.message)
                 if evaluation_ledger is not None and scan_run is not None:
                     try:
                         evaluation_ledger.record_scan_symbol(
@@ -774,18 +865,21 @@ if __name__ == "__main__":
                             scan_run.run_id if scan_run is not None else None
                         ),
                         "symbol": symbol,
-                        "error_type": type(error).__name__,
-                        "reason": str(error)[:500],
+                        "error_type": result.failure.error_type,
+                        "reason": result.failure.message,
+                        "failure_stage": result.failure.stage,
+                        "failure_durable": result.failure.durable,
                     }
                 )
                 pending_symbols.discard(symbol)
                 continue
+            log.info("final[%s]: %s", symbol, result.record.get("proposal"))
             if evaluation_ledger is not None and scan_run is not None:
                 try:
                     evaluation_ledger.record_scan_symbol(
                         scan_run.run_id,
                         symbol,
-                        decision_id=final_state.get("decision_id"),
+                        decision_id=result.decision_id,
                     )
                 except Exception:
                     log.warning(
@@ -801,7 +895,8 @@ if __name__ == "__main__":
                         scan_run.run_id if scan_run is not None else None
                     ),
                     "symbol": symbol,
-                    "decision_id": final_state.get("decision_id"),
+                    "decision_id": result.decision_id,
+                    "elapsed_ms": round(result.elapsed_ms, 3),
                 }
             )
             pending_symbols.discard(symbol)
