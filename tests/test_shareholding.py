@@ -1,6 +1,10 @@
 import unittest
 
-from shareholding import ShareholdingError, ShareholdingHistoryService
+from shareholding import (
+    ShareholdingError,
+    ShareholdingHistoryService,
+    select_due_universe_symbols,
+)
 
 
 def _xbrl(schema_date, period, fii, dii, government, other):
@@ -95,6 +99,68 @@ class _Store:
 
 
 class ShareholdingHistoryTests(unittest.TestCase):
+    def test_universe_backfill_prefers_never_warmed_then_stale_active_symbols(self):
+        records = [
+            {
+                "universe": "NIFTY TOTAL MKT",
+                "symbol": "NEW",
+                "active": 1,
+                "completed_at": 0,
+            },
+            {
+                "universe": "NIFTY TOTAL MKT",
+                "symbol": "STALE",
+                "active": 1,
+                "completed_at": 100,
+            },
+            {
+                "universe": "NIFTY TOTAL MKT",
+                "symbol": "FRESH",
+                "active": 1,
+                "completed_at": 950,
+            },
+            {
+                "universe": "NIFTY TOTAL MKT",
+                "symbol": "INCOMPLETE_RECENT",
+                "active": 1,
+                "completed_at": 0,
+                "last_status": "incomplete",
+                "last_attempt": 900,
+            },
+            {
+                "universe": "NIFTY TOTAL MKT",
+                "symbol": "INCOMPLETE_STALE",
+                "active": 1,
+                "completed_at": 0,
+                "last_status": "incomplete",
+                "last_attempt": 400,
+            },
+            {
+                "universe": "NIFTY TOTAL MKT",
+                "symbol": "REMOVED",
+                "active": 0,
+                "completed_at": 0,
+            },
+            {
+                "universe": "OTHER",
+                "symbol": "OTHER",
+                "active": 1,
+                "completed_at": 0,
+            },
+        ]
+
+        self.assertEqual(
+            select_due_universe_symbols(
+                records,
+                universe="NIFTY TOTAL MKT",
+                now_epoch=1_000,
+                refresh_after_seconds=500,
+                incomplete_retry_seconds=500,
+                limit=3,
+            ),
+            ["NEW", "STALE", "INCOMPLETE_STALE"],
+        )
+
     def test_parses_both_validated_taxonomies_and_reconciles_public_shares(self):
         filings = [
             {

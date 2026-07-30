@@ -24,6 +24,7 @@ _IST = ZoneInfo("Asia/Kolkata")
 PARSER_VERSION = "nse-shp-xbrl-v3"
 _live_service = None
 _warm_service = None
+_registry_store = None
 _MEMBERS = {
     "InstitutionsForeignMember": "fii",
     "InstitutionsDomesticMember": "dii",
@@ -103,6 +104,41 @@ class ShareholdingHistory:
     complete: bool = False
     changes_bps: dict | None = None
     trend_labels: dict | None = None
+
+
+def select_due_universe_symbols(
+    records: list[dict],
+    *,
+    universe: str,
+    now_epoch: int,
+    refresh_after_seconds: int,
+    incomplete_retry_seconds: int,
+    limit: int,
+) -> list[str]:
+    """Select active never-warmed/stale members in stable oldest-first order."""
+    if limit <= 0:
+        raise ValueError("limit must be greater than zero")
+    cutoff = now_epoch - refresh_after_seconds
+    due = []
+    for record in records:
+        if (
+            record.get("universe") != universe
+            or not record.get("active")
+            or not record.get("symbol")
+        ):
+            continue
+        completed_at = int(record.get("completed_at") or 0)
+        last_attempted_at = int(record.get("last_attempt") or 0)
+        if (
+            record.get("last_status") == "incomplete"
+            and last_attempted_at > now_epoch - incomplete_retry_seconds
+        ):
+            continue
+        if completed_at == 0 or completed_at <= cutoff:
+            priority_time = completed_at or last_attempted_at
+            due.append((priority_time, str(record["symbol"])))
+    due.sort()
+    return [symbol for _, symbol in due[:limit]]
 
 
 class NseShareholdingSource:
@@ -205,6 +241,10 @@ class AerospikeFilingStore:
         self._namespace = os.environ.get("AEROSPIKE_NAMESPACE", "nse")
         self._set = os.environ.get("AEROSPIKE_SHAREHOLDING_SET", "shareholding")
         self._queue_set = f"{self._set}_warm"
+        self._universe_set = os.environ.get(
+            "AEROSPIKE_SHAREHOLDING_UNIVERSE_SET",
+            f"{self._set}_universe",
+        )
         self._manifest_ttl = int(
             os.environ.get("NSE_XBRL_MANIFEST_TTL_SECONDS", "21600")
         )
@@ -336,6 +376,117 @@ class AerospikeFilingStore:
         except self._aerospike.exception.RecordNotFound:
             return
 
+    def seed_universe(self, universe: str, symbols: list[str]) -> int:
+        now_epoch = int(time.time())
+        normalized = sorted(
+            {symbol.strip().upper() for symbol in symbols if symbol.strip()}
+        )
+        records = self._client.scan(
+            self._namespace,
+            self._universe_set,
+        ).results()
+        existing = {
+            str(bins["symbol"]): bins
+            for _, _, bins in records
+            if isinstance(bins, dict)
+            and bins.get("universe") == universe
+            and bins.get("symbol")
+        }
+        active_symbols = set(normalized)
+        previously_active = {
+            symbol for symbol, bins in existing.items() if bins.get("active")
+        }
+        membership_is_complete = (
+            not previously_active
+            or len(active_symbols) >= len(previously_active) * 0.95
+        )
+        for symbol, bins in existing.items():
+            if (
+                not membership_is_complete
+                or symbol in active_symbols
+                or not bins.get("active")
+            ):
+                continue
+            self._client.put(
+                self._key(
+                    f"{universe}:{symbol}",
+                    set_name=self._universe_set,
+                ),
+                {"active": 0, "seeded_at": now_epoch},
+            )
+        for symbol in normalized:
+            prior = existing.get(symbol, {})
+            self._client.put(
+                self._key(
+                    f"{universe}:{symbol}",
+                    set_name=self._universe_set,
+                ),
+                {
+                    "universe": universe,
+                    "symbol": symbol,
+                    "active": 1,
+                    "seeded_at": now_epoch,
+                    "completed_at": int(prior.get("completed_at") or 0),
+                    "last_attempt": int(prior.get("last_attempt") or 0),
+                    "last_status": str(prior.get("last_status") or "pending"),
+                    "periods": int(prior.get("periods") or 0),
+                },
+            )
+        return len(normalized)
+
+    def due_universe_symbols(
+        self,
+        universe: str,
+        *,
+        limit: int,
+        refresh_after_seconds: int,
+        incomplete_retry_seconds: int,
+    ) -> list[str]:
+        records = self._client.scan(
+            self._namespace,
+            self._universe_set,
+        ).results()
+        bins = [
+            record_bins
+            for _, _, record_bins in records
+            if isinstance(record_bins, dict)
+        ]
+        return select_due_universe_symbols(
+            bins,
+            universe=universe,
+            now_epoch=int(time.time()),
+            refresh_after_seconds=refresh_after_seconds,
+            incomplete_retry_seconds=incomplete_retry_seconds,
+            limit=limit,
+        )
+
+    def record_universe_attempt(
+        self,
+        universe: str,
+        symbol: str,
+        *,
+        complete: bool,
+        periods_available: int,
+    ) -> None:
+        now_epoch = int(time.time())
+        bins = {
+            "universe": universe,
+            "symbol": symbol,
+            "active": 1,
+            "last_attempt": now_epoch,
+            "last_status": "complete" if complete else "incomplete",
+            "periods": periods_available,
+        }
+        if complete:
+            bins["completed_at"] = now_epoch
+        self._client.put(
+            self._key(
+                f"{universe}:{symbol}",
+                set_name=self._universe_set,
+            ),
+            bins,
+        )
+
     def _key(
         self, user_key: str, *, set_name: str | None = None
     ) -> tuple[str, str, str]:
@@ -464,6 +615,47 @@ def warm_shareholding_history(symbol: str, periods: int = 5) -> ShareholdingHist
 
 def queued_shareholding_symbols() -> list[str]:
     return AerospikeFilingStore().queued_symbols()
+
+
+def _universe_store() -> AerospikeFilingStore:
+    global _registry_store
+    if _registry_store is None:
+        _registry_store = AerospikeFilingStore()
+    return _registry_store
+
+
+def seed_shareholding_universe(universe: str, symbols: list[str]) -> int:
+    return _universe_store().seed_universe(universe, symbols)
+
+
+def due_shareholding_universe_symbols(
+    universe: str,
+    *,
+    limit: int,
+    refresh_after_days: int,
+    incomplete_retry_days: int,
+) -> list[str]:
+    return _universe_store().due_universe_symbols(
+        universe,
+        limit=limit,
+        refresh_after_seconds=refresh_after_days * 24 * 3600,
+        incomplete_retry_seconds=incomplete_retry_days * 24 * 3600,
+    )
+
+
+def record_shareholding_universe_attempt(
+    universe: str,
+    symbol: str,
+    *,
+    complete: bool,
+    periods_available: int,
+) -> None:
+    _universe_store().record_universe_attempt(
+        universe,
+        symbol,
+        complete=complete,
+        periods_available=periods_available,
+    )
 
 
 def _cache_record(period: ShareholdingPeriod, payload: bytes) -> dict:

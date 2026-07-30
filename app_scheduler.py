@@ -39,6 +39,13 @@ RETRY_DELAY = timedelta(
 )
 BHAVCOPY_BACKFILL_DAYS = int(os.environ.get("BHAVCOPY_BACKFILL_DAYS", "30"))
 XBRL_WARM_LIMIT = int(os.environ.get("APP_XBRL_WARM_LIMIT", "10"))
+XBRL_UNIVERSE_INDEX = os.environ.get(
+    "APP_XBRL_UNIVERSE_INDEX",
+    "NIFTY TOTAL MKT",
+).strip()
+XBRL_UNIVERSE_BATCH_SIZE = int(
+    os.environ.get("APP_XBRL_UNIVERSE_BATCH_SIZE", "25")
+)
 
 _stop_requested = False
 
@@ -292,6 +299,27 @@ def configured_jobs() -> tuple[Job, ...]:
                 publish_minute=bhavcopy_minute,
             ),
             verify=_verify_bhavcopy,
+        ),
+        Job(
+            name="shareholding_universe",
+            command=(
+                python,
+                "warm_shareholding.py",
+                "--universe-index",
+                XBRL_UNIVERSE_INDEX,
+                "--limit",
+                str(XBRL_UNIVERSE_BATCH_SIZE),
+            ),
+            occurrence=_daily_occurrence(
+                "APP_XBRL_UNIVERSE_TIME_IST",
+                "16:00",
+                max_lateness_hours=6,
+                weekdays_only=True,
+            ),
+            enabled=(
+                _env_flag("APP_ENABLE_XBRL_UNIVERSE_BACKFILL")
+                and bool(XBRL_UNIVERSE_INDEX)
+            ),
         ),
         Job(
             name="shareholding_warm",

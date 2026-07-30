@@ -173,6 +173,7 @@ Jobs execute one at a time to preserve slow NSE access:
 | Job | Default schedule |
 |---|---|
 | Bhavcopy catch-up | At startup, then at 19:00 IST after the nominal publication cutoff |
+| NIFTY TOTAL MKT XBRL backfill | 16:00 IST weekdays, 25 due symbols |
 | Queued XBRL shareholding warm | 17:00 IST weekdays, up to 10 symbols |
 | Paper-outcome update | 18:30 IST weekdays |
 | Overnight scan and digest | 22:00 IST weekdays |
@@ -213,6 +214,23 @@ uv run warm_shareholding.py FEDERALBNK
 uv run warm_shareholding.py --index "NIFTY NEXT 50"
 uv run warm_shareholding.py --queued
 ```
+
+The automated scheduler also maintains a durable `NIFTY TOTAL MKT` registry:
+
+```bash
+uv run warm_shareholding.py \
+  --universe-index "NIFTY TOTAL MKT" \
+  --limit 25
+```
+
+This refreshes current index membership, resumes with the oldest never-warmed
+or stale members, and marks successful symbols complete. Removed constituents
+become inactive in the registry, but their historical filing records are not
+deleted. With 25 symbols per weekday, the initial 750-symbol pass takes about
+30 scan days. Completed symbols become eligible for a new-filing check after
+30 days, so new quarterly filings are incorporated without discarding the raw
+history. Empty or incomplete five-quarter histories are recorded separately
+and retried after seven days; they are never reported as fully backfilled.
 
 The warmer deliberately paces NSE requests, stores immutable compressed source
 XML with checksums, and derives normalized quarterly records. A live scan never
@@ -277,6 +295,7 @@ and their credentials are configured in `.env`.
 | `bhavcopy.db` | Whole-market daily OHLCV and delivery history | Retained source data |
 | Aerospike `shareholding` set | Raw and normalized XBRL shareholding history | Retained source data |
 | Aerospike `shareholding_warm` set | Symbols queued for background warming | Disposable work queue |
+| Aerospike `shareholding_universe` set | Persistent index membership and per-symbol backfill progress | Durable scheduler state |
 | `evaluation.db` | Immutable scan decisions, run membership, and paper outcomes | Durable derived ledger |
 | `trade_log.jsonl` | Append-only recovery/digest feed | Retained for a bounded period |
 | `scan_runs.jsonl` | Batch crash-recovery journal | Retained for a bounded period |
@@ -360,6 +379,8 @@ Copy `.env.example`; it documents every setting. The important groups are:
   `NSE_OVERNIGHT_SCAN_LIMIT`
 - automation: `APP_ENABLE_*`, `APP_*_TIME_IST`,
   `APP_INTRADAY_INTERVAL_MINUTES`, `APP_XBRL_WARM_LIMIT`,
+  `APP_XBRL_UNIVERSE_INDEX`, `APP_XBRL_UNIVERSE_BATCH_SIZE`,
+  `APP_XBRL_UNIVERSE_REFRESH_DAYS`,
   `APP_SCHEDULER_RETRY_MINUTES`
 - policy: `NSE_TECHNICAL_POLICY_ID`, `NSE_POLICY_VERSION`
 - risk: `NSE_PRINCIPAL`, `NSE_MAX_ALLOCATION_PCT`,
