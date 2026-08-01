@@ -1,0 +1,4 @@
+interface:
+  display_name: "NSE TA Charts"
+  short_description: "Chart grounded NSE technical evidence clearly"
+  default_prompt: "Use $chart-nse-ta to visualize this symbol’s grounded technical-analysis evidence."

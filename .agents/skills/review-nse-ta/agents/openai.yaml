@@ -1,0 +1,4 @@
+interface:
+  display_name: "NSE TA Review"
+  short_description: "Audit deterministic NSE technical-analysis evidence"
+  default_prompt: "Use $review-nse-ta to audit this symbol or TA change against the project evidence contract."
