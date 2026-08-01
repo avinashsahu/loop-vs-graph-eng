@@ -3,6 +3,8 @@ import time
 
 import cache
 from financial_results import get_financial_history
+from document_research import get_document_research
+from governance_filings import get_governance_history
 from logging_config import setup_logging
 from material_disclosures import get_material_disclosures
 from market_time import now_ist_naive
@@ -137,6 +139,8 @@ def get_fundamental_snapshot(symbol: str) -> dict:
         # that local cache on every scan so a completed warm is visible immediately
         # without invalidating or refetching the slower fundamental snapshot.
         hit["material_disclosures"] = get_material_disclosures(symbol)
+        hit["governance_history"] = get_governance_history(symbol)
+        hit["document_research"] = get_document_research(symbol)
         return hit
 
     snapshot = {
@@ -144,6 +148,8 @@ def get_fundamental_snapshot(symbol: str) -> dict:
         "company_name": None,
         "corp_announcements": None,
         "material_disclosures": None,
+        "governance_history": None,
+        "document_research": None,
         "corp_actions": None,
         "shareholding_pattern": None,
         "yearwise_returns": None,
@@ -161,6 +167,14 @@ def get_fundamental_snapshot(symbol: str) -> dict:
         (
             "material_disclosures",
             lambda: get_material_disclosures(symbol),
+        ),
+        (
+            "governance_history",
+            lambda: get_governance_history(symbol),
+        ),
+        (
+            "document_research",
+            lambda: get_document_research(symbol),
         ),
         ("corp_actions", lambda: _get_corp_actions(symbol)),
         ("shareholding_pattern", lambda: _get_shareholding_pattern(symbol)),

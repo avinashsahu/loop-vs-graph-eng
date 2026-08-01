@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -86,8 +87,21 @@ class NseClient:
         self._sleep = sleep
         self._timeout = timeout_seconds
         self._max_attempts = max_attempts
+        # requests.Session is not thread-safe; serialize HTTP while allowing
+        # callers to overlap their own post-request pacing sleeps.
+        self._request_lock = threading.Lock()
 
     def request(
+        self,
+        url: str,
+        *,
+        headers: dict | None = None,
+        params: dict | None = None,
+    ) -> requests.Response | None:
+        with self._request_lock:
+            return self._request_locked(url, headers=headers, params=params)
+
+    def _request_locked(
         self,
         url: str,
         *,

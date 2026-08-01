@@ -194,6 +194,8 @@ Jobs execute one at a time to preserve slow NSE access:
 | NIFTY TOTAL MKT XBRL backfill | 16:00 IST weekdays, 25 due symbols |
 | Queued XBRL shareholding warm | 17:00 IST weekdays, up to 10 symbols |
 | Material disclosure/rating warm | 17:30 IST weekdays, 100 due symbols |
+| Integrated governance warm | 17:45 IST weekdays, 25 due symbols |
+| Document research warm | 18:00 IST weekdays, 10 due symbols |
 | Paper-outcome update | 18:30 IST weekdays |
 | Overnight scan and digest | 22:00 IST weekdays |
 | Intraday actionable-symbol recheck | Every 20 minutes during NSE market hours |
@@ -270,6 +272,35 @@ The feed uses a bounded lookback window, filters routine notices before they can
 displace material evidence, and keeps stable evidence IDs plus NSE source
 provenance. A live scan never calls either disclosure endpoint.
 
+Integrated Filing - Governance XBRL is warmed the same way. Ordinary director
+rotation is ignored; only structured exceptions such as committee non-compliance,
+pending investor grievances, disclosed violations, and cyber-security incidents
+become deterministic review evidence. Promoter pledge/encumbrance values from
+shareholding XBRL are retained with quarter-over-quarter and four-quarter changes.
+
+```bash
+uv run warm_governance.py RELIANCE
+uv run warm_governance.py \
+  --universe-index "NIFTY TOTAL MKT" \
+  --limit 25
+```
+
+A live scan never downloads governance filings inline. Missing optional
+governance coverage produces a compact Slack note, not a false `REJECT`.
+
+Annual reports, investor presentations, and earnings transcripts/concalls are
+warmed into a document-research cache with checksums and page provenance.
+Deterministic regex extraction builds the fact ledger; numeric values never
+enter the verdict from free-form LLM output alone. Live scans read only warmed
+facts.
+
+```bash
+uv run warm_document_research.py HDFCBANK
+uv run warm_document_research.py \
+  --universe-index "NIFTY NEXT 50" \
+  --limit 10
+```
+
 ## Run scans
 
 ```bash
@@ -324,7 +355,7 @@ and their credentials are configured in `.env`.
 
 | Store | Purpose | Lifecycle |
 |---|---|---|
-| `.cache/` | Short-lived market, fundamental and material-disclosure snapshots | Disposable; TTL cleanup |
+| `.cache/` | Short-lived market, fundamental, material-disclosure, governance, and document-research snapshots | Disposable; TTL cleanup |
 | `bhavcopy.db` | Whole-market daily OHLCV and delivery history | Retained source data |
 | Aerospike `shareholding` set | Raw and normalized XBRL shareholding history | Retained source data |
 | Aerospike `shareholding_warm` set | Symbols queued for background warming | Disposable work queue |
@@ -442,4 +473,6 @@ The original `loop_agent.py` and `graph_agent.py` remain as small control-flow
 examples. The production application is the typed scan engine described above.
 
 This software is experimental decision support, not investment advice.
+
+
 

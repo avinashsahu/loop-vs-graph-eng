@@ -8,7 +8,9 @@ from fundamental_evidence import FundamentalEvidence
 from llm import FundamentalAssessment
 from qualitative_policy import QUALITATIVE_REJECT_REASON_CODES
 
-FUNDAMENTAL_POLICY_VERSION = "fundamental-sector-policy-v3"
+FUNDAMENTAL_POLICY_VERSION = "fundamental-sector-policy-v4"
+PROMOTER_ENCUMBRANCE_QOQ_BPS = 200
+PROMOTER_ENCUMBRANCE_4Q_BPS = 500
 
 _NON_FINANCIAL_QUARTER_FIELDS = (
     "revenue",
@@ -178,6 +180,10 @@ def evaluate_fundamental_research(
             profile=profile,
             subtype=subtype,
         )
+
+    encumbrance_review = _encumbrance_policy(evidence)
+    if encumbrance_review is not None:
+        return encumbrance_review
 
     qualitative_ids = evidence.qualitative_ids
     if not qualitative_ids:
@@ -462,9 +468,55 @@ def _disclosure_policy_facts(
         for fact in evidence.payload.get("facts", [])
         if isinstance(fact, dict)
         and fact.get("kind")
-        in {"material_disclosure", "credit_rating_action"}
+        in {
+            "material_disclosure",
+            "credit_rating_action",
+            "governance_exception",
+            "document_research_fact",
+        }
         and fact.get("policy_verdict") == verdict
     ]
+
+
+def _encumbrance_policy(
+    evidence: FundamentalEvidence,
+) -> FundamentalDecision | None:
+    trend = next(
+        (
+            fact
+            for fact in evidence.payload.get("facts", [])
+            if fact.get("kind") == "calculated_shareholding_trend"
+        ),
+        None,
+    )
+    if not isinstance(trend, dict):
+        return None
+    changes = trend.get("changes_bps") or {}
+    qoq = changes.get("promoter_encumbered_qoq")
+    four_q = changes.get("promoter_encumbered_4q")
+    checks = []
+    if _number(qoq) and qoq >= PROMOTER_ENCUMBRANCE_QOQ_BPS:
+        checks.append("PROMOTER_ENCUMBRANCE_QOQ_ABOVE_POLICY")
+    if _number(four_q) and four_q >= PROMOTER_ENCUMBRANCE_4Q_BPS:
+        checks.append("PROMOTER_ENCUMBRANCE_4Q_ABOVE_POLICY")
+    if not checks:
+        return None
+    history = evidence.payload.get("financial_history")
+    profile = history.get("profile") if isinstance(history, dict) else None
+    subtype = history.get("subtype") if isinstance(history, dict) else None
+    return FundamentalDecision(
+        verdict="REVIEW",
+        reason_code="PROMOTER_ENCUMBRANCE_CAUTION",
+        reason=(
+            "Material promoter encumbrance increase requires review: "
+            + ", ".join(checks)
+            + "."
+        ),
+        evidence_ids=("SHAREHOLDING_TREND",),
+        checks=tuple(checks),
+        profile=profile,
+        subtype=subtype,
+    )
 
 
 def _disclosure_labels(facts: list[dict]) -> list[str]:
@@ -474,6 +526,7 @@ def _disclosure_labels(facts: list[dict]) -> list[str]:
 def _disclosure_label(fact: dict) -> str:
     return str(
         fact.get("event_type")
+        or fact.get("code")
         or fact.get("action_direction")
         or "material_event"
     ).replace("-", "_")

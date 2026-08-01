@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from qualitative_policy import render_qualitative_policy
 from shareholding import ShareholdingHistory
 
-EVIDENCE_VERSION = "fundamental-evidence-v6"
+EVIDENCE_VERSION = "fundamental-evidence-v8"
 PROMPT_VERSION = "fundamental-assessment-v7"
 PEER_MAX_AGE_DAYS = 200
 SHAREHOLDING_MAX_AGE_DAYS = 160
@@ -36,6 +36,7 @@ class FundamentalEvidence:
                 "announcement",
                 "material_disclosure",
                 "corporate_action",
+                "document_research_excerpt",
             }
         )
 
@@ -52,6 +53,7 @@ class FundamentalEvidence:
                     "announcement",
                     "material_disclosure",
                     "corporate_action",
+                    "document_research_excerpt",
                 }
             ],
         }
@@ -252,6 +254,14 @@ def build_fundamental_evidence(
                     "government_pct": period.government_pct,
                     "promoter_pct": period.promoter_pct,
                     "other_public_pct": period.other_public_pct,
+                    "promoter_encumbered_shares": period.promoter_encumbered_shares,
+                    "promoter_encumbered_pct_of_total": (
+                        period.promoter_encumbered_pct_of_total
+                    ),
+                    "promoter_encumbered_pct_of_promoter": (
+                        period.promoter_encumbered_pct_of_promoter
+                    ),
+                    "pledge_disclosed": period.pledge_disclosed,
                     "reconciled": period.reconciled,
                     "schema_version": period.schema_version,
                 }
@@ -266,6 +276,80 @@ def build_fundamental_evidence(
                 "periods_available": len(history.periods),
             }
         )
+
+    governance_history = snapshot.get("governance_history")
+    if isinstance(governance_history, dict):
+        facts.append(
+            {
+                "id": "GOVERNANCE_COVERAGE",
+                "kind": "governance_coverage",
+                "status": governance_history.get("status"),
+                "periods_available": governance_history.get(
+                    "periods_available", 0
+                ),
+                "optional": True,
+            }
+        )
+        for exception in governance_history.get("exceptions") or []:
+            if isinstance(exception, dict) and exception.get("id"):
+                facts.append(exception)
+        for period in governance_history.get("periods") or []:
+            if not isinstance(period, dict):
+                continue
+            facts.append(
+                {
+                    "id": f"GOVERNANCE_PERIOD_{period.get('period') or 'UNKNOWN'}",
+                    "kind": "governance_period",
+                    "period": period.get("period"),
+                    "record_id": period.get("record_id"),
+                    "source_url": period.get("source_url"),
+                    "checksum": period.get("checksum"),
+                    "revised": period.get("revised"),
+                    "published_at": period.get("published_at"),
+                    "parser_version": period.get("parser_version"),
+                    "coverage": period.get("coverage"),
+                    "investor_complaints_pending": period.get(
+                        "investor_complaints_pending"
+                    ),
+                    "optional": True,
+                }
+            )
+
+    document_research = snapshot.get("document_research")
+    if isinstance(document_research, dict):
+        facts.append(
+            {
+                "id": "DOCUMENT_RESEARCH_COVERAGE",
+                "kind": "document_research_coverage",
+                "status": document_research.get("status"),
+                "document_counts": document_research.get("document_counts"),
+                "optional": True,
+            }
+        )
+        research_facts = document_research.get("facts") or []
+        excerpt_budget = 5
+        for fact in research_facts:
+            if not isinstance(fact, dict) or not fact.get("id"):
+                continue
+            facts.append(fact)
+            include_excerpt = bool(fact.get("policy_verdict")) or not fact.get(
+                "numeric"
+            )
+            if include_excerpt and excerpt_budget > 0 and fact.get("excerpt"):
+                excerpt_budget -= 1
+                facts.append(
+                    {
+                        "id": f"{fact['id']}_EXCERPT",
+                        "kind": "document_research_excerpt",
+                        "code": fact.get("code"),
+                        "doc_type": fact.get("doc_type"),
+                        "document_id": fact.get("document_id"),
+                        "source_url": fact.get("source_url"),
+                        "page": fact.get("page"),
+                        "text": fact.get("excerpt"),
+                        "optional": True,
+                    }
+                )
 
     peer_period = _period_end(snapshot.get("peer_comparison_quarter"))
     shareholding_period = _period_end(history.latest_period)

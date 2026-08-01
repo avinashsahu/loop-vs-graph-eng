@@ -21,7 +21,7 @@ _XBRLDI = "http://xbrl.org/2006/xbrldi"
 _XLINK = "http://www.w3.org/1999/xlink"
 _MANIFEST_URL = "https://www.nseindia.com/api/corporate-share-holdings-master"
 _IST = ZoneInfo("Asia/Kolkata")
-PARSER_VERSION = "nse-shp-xbrl-v4"
+PARSER_VERSION = "nse-shp-xbrl-v5"
 _live_service = None
 _warm_service = None
 _registry_store = None
@@ -35,6 +35,27 @@ _MEMBERS = {
     "PromoterAndPromoterGroupMember": "promoter",
     "ShareholdingOfPromoterAndPromoterGroupMember": "promoter",
 }
+_PROMOTER_MEMBERS = frozenset(
+    {
+        "PromoterAndPromoterGroupMember",
+        "ShareholdingOfPromoterAndPromoterGroupMember",
+    }
+)
+_TOTAL_PATTERN_MEMBERS = frozenset({"ShareholdingPatternMember"})
+_ENCUMBERED_SHARES_FACTS = frozenset({"NumberOfSharesEncumbered"})
+_ENCUMBERED_PCT_FACTS = frozenset(
+    {"EncumberedSharesHeldAsPercentageOfTotalNumberOfShares"}
+)
+_PLEDGE_FLAG_FACTS = frozenset(
+    {
+        "WhetherAnySharesHeldByPromotersAreEncumberedUnderPledged",
+        "WhetherAnySharesHeldByPromotersAreEncumberedUnderPledgedForPromoterAndPromoterGroup",
+        "WhetherAnySharesHeldByPromotersAreEncumberedUnderNonDisposalUndertaking",
+        "WhetherAnySharesHeldByPromotersAreEncumberedUnderNonDisposalUndertakingForPromoterAndPromoterGroup",
+        "WhetherAnySharesHeldByPromotersAreEncumberedOtherThanByWayOfPledgeOrNDU",
+        "WhetherAnySharesHeldByPromotersAreEncumberedOtherThanByWayOfPledgeOrNDUForPromoterAndPromoterGroup",
+    }
+)
 
 
 class ShareholdingError(ValueError):
@@ -91,6 +112,10 @@ class ShareholdingPeriod:
     source_url: str | None = None
     parser_version: str = PARSER_VERSION
     validation_status: str = "reconciled"
+    promoter_encumbered_shares: int | None = None
+    promoter_encumbered_pct_of_total: float | None = None
+    promoter_encumbered_pct_of_promoter: float | None = None
+    pledge_disclosed: bool = False
 
 
 @dataclass(frozen=True)
@@ -583,8 +608,11 @@ class ShareholdingHistoryService:
             )
         if self._download_missing:
             self._store.complete_warm(symbol)
-        status = "ready" if self._download_missing or manifest_fresh else "pending"
-        return _history(symbol, normalized, status=status)
+        elif not manifest_fresh:
+            # Manifest TTL is only a refresh signal. Cached quarters remain usable
+            # for live scans; queue a background re-warm instead of REVIEW.
+            self._store.enqueue_warm(symbol, [])
+        return _history(symbol, normalized, status="ready")
 
     def _load(self, filing: dict) -> ShareholdingPeriod | None:
         record_id = str(filing["record_id"])
@@ -714,6 +742,9 @@ def _history(
             changes[f"{field.removesuffix('_pct')}_qoq"] = round(
                 (getattr(periods[0], field) - getattr(periods[1], field)) * 100
             )
+        encumbered_qoq = _encumbrance_delta_bps(periods[0], periods[1])
+        if encumbered_qoq is not None:
+            changes["promoter_encumbered_qoq"] = encumbered_qoq
     if len(periods) >= 5:
         for field in (
             "fii_pct",
@@ -728,6 +759,16 @@ def _history(
             )
             changes[f"{name}_4q"] = delta
             labels[name] = "rising" if delta > 0 else "falling" if delta < 0 else "flat"
+        encumbered_4q = _encumbrance_delta_bps(periods[0], periods[4])
+        if encumbered_4q is not None:
+            changes["promoter_encumbered_4q"] = encumbered_4q
+            labels["promoter_encumbered"] = (
+                "rising"
+                if encumbered_4q > 0
+                else "falling"
+                if encumbered_4q < 0
+                else "flat"
+            )
     return ShareholdingHistory(
         symbol=symbol,
         periods=tuple(periods),
@@ -740,6 +781,40 @@ def _history(
         changes_bps=changes,
         trend_labels=labels,
     )
+
+
+def _encumbrance_delta_bps(
+    newer: ShareholdingPeriod, older: ShareholdingPeriod
+) -> int | None:
+    left = newer.promoter_encumbered_pct_of_total
+    right = older.promoter_encumbered_pct_of_total
+    if left is None or right is None:
+        return None
+    return round((left - right) * 100)
+
+
+def _as_bool(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"true", "yes", "y", "1"}:
+        return True
+    if normalized in {"false", "no", "n", "0"}:
+        return False
+    return None
+
+
+def _as_ratio_pct(value: str | None) -> float | None:
+    if value is None or not value.strip():
+        return None
+    try:
+        number = float(Decimal(value.strip()))
+    except Exception:
+        return None
+    # SHP pure-unit percentages are ratios (0.05 == 5%).
+    if abs(number) <= 1.5:
+        number *= 100
+    return round(number, 4)
 
 
 def _has_consecutive_quarters(
@@ -861,19 +936,47 @@ def _parse_xbrl(
             contexts[context_id] = _local_name(category_members[0].text.strip())
 
     shares: dict[str, Decimal] = {}
+    promoter_encumbered_shares: int | None = None
+    promoter_encumbered_pct_of_total: float | None = None
+    promoter_encumbered_pct_of_promoter: float | None = None
+    pledge_flags: list[bool] = []
     for fact in root:
-        if _local_name(fact.tag) != "NumberOfShares":
+        local_name = _local_name(fact.tag)
+        member = contexts.get(fact.get("contextRef", ""))
+        text = fact.text.strip() if fact.text else None
+
+        if local_name in _PLEDGE_FLAG_FACTS:
+            flag = _as_bool(text)
+            if flag is not None:
+                pledge_flags.append(flag)
+            continue
+
+        if local_name in _ENCUMBERED_SHARES_FACTS and fact.get("unitRef") == "shares":
+            if member in _PROMOTER_MEMBERS and text:
+                promoter_encumbered_shares = int(Decimal(text))
+            continue
+
+        if local_name in _ENCUMBERED_PCT_FACTS and fact.get("unitRef") == "pure":
+            pct = _as_ratio_pct(text)
+            if pct is None:
+                continue
+            if member in _PROMOTER_MEMBERS:
+                promoter_encumbered_pct_of_promoter = pct
+            elif member in _TOTAL_PATTERN_MEMBERS:
+                promoter_encumbered_pct_of_total = pct
+            continue
+
+        if local_name != "NumberOfShares":
             continue
         if fact.get("unitRef") != "shares":
             continue
-        member = contexts.get(fact.get("contextRef", ""))
         bucket = _MEMBERS.get(member)
-        if bucket and fact.text:
+        if bucket and text:
             if bucket in shares:
                 raise ShareholdingError(
                     f"duplicate {bucket} share fact for record {record_id}"
                 )
-            shares[bucket] = Decimal(fact.text.strip())
+            shares[bucket] = Decimal(text)
 
     required = {"public"}
     missing = required - shares.keys()
@@ -902,6 +1005,30 @@ def _parse_xbrl(
     def percentage(bucket: str) -> float:
         return round(float(shares.get(bucket, Decimal(0)) / equity_shares * 100), 4)
 
+    if (
+        promoter_encumbered_pct_of_total is None
+        and promoter_encumbered_shares is not None
+        and equity_shares > 0
+    ):
+        promoter_encumbered_pct_of_total = round(
+            float(Decimal(promoter_encumbered_shares) / equity_shares * 100),
+            4,
+        )
+    if (
+        promoter_encumbered_pct_of_promoter is None
+        and promoter_encumbered_shares is not None
+        and promoter_shares > 0
+    ):
+        promoter_encumbered_pct_of_promoter = round(
+            float(Decimal(promoter_encumbered_shares) / promoter_shares * 100),
+            4,
+        )
+
+    pledge_disclosed = any(pledge_flags) or promoter_encumbered_shares not in (
+        None,
+        0,
+    )
+
     return ShareholdingPeriod(
         record_id=record_id,
         period=expected_period,
@@ -922,4 +1049,8 @@ def _parse_xbrl(
             if fact_period == expected_period
             else "reconciled_manifest_period_plus_1d"
         ),
+        promoter_encumbered_shares=promoter_encumbered_shares,
+        promoter_encumbered_pct_of_total=promoter_encumbered_pct_of_total,
+        promoter_encumbered_pct_of_promoter=promoter_encumbered_pct_of_promoter,
+        pledge_disclosed=pledge_disclosed,
     )

@@ -312,6 +312,75 @@ class FundamentalResearchTests(unittest.TestCase):
         self.assertEqual(rejected.verdict, "REJECT")
         self.assertEqual(rejected.evidence_ids, ("RATING_DEFAULT",))
 
+    def test_governance_exception_and_encumbrance_increase_require_review(self):
+        governance_evidence = _evidence(_banking_history())
+        governance_evidence.payload["facts"].append(
+            {
+                "id": "GOVERNANCE_BOARD",
+                "kind": "governance_exception",
+                "code": "board_composition_non_compliance",
+                "policy_verdict": "REVIEW",
+                "policy_reason_code": "GOVERNANCE_DISCLOSURE_CAUTION",
+            }
+        )
+        governance = evaluate_fundamental_research(
+            governance_evidence,
+            lambda *_args: self.fail(
+                "structured governance caution must bypass the model"
+            ),
+        )
+        self.assertEqual(governance.verdict, "REVIEW")
+        self.assertEqual(
+            governance.reason_code, "GOVERNANCE_DISCLOSURE_CAUTION"
+        )
+        self.assertEqual(governance.evidence_ids, ("GOVERNANCE_BOARD",))
+
+        encumbrance_evidence = _evidence(_banking_history())
+        encumbrance_evidence.payload["facts"].append(
+            {
+                "id": "SHAREHOLDING_TREND",
+                "kind": "calculated_shareholding_trend",
+                "changes_bps": {
+                    "promoter_encumbered_qoq": 250,
+                    "promoter_encumbered_4q": 600,
+                },
+            }
+        )
+        encumbrance = evaluate_fundamental_research(
+            encumbrance_evidence,
+            lambda *_args: self.fail(
+                "encumbrance caution must bypass the model"
+            ),
+        )
+        self.assertEqual(encumbrance.verdict, "REVIEW")
+        self.assertEqual(
+            encumbrance.reason_code, "PROMOTER_ENCUMBRANCE_CAUTION"
+        )
+        self.assertEqual(encumbrance.evidence_ids, ("SHAREHOLDING_TREND",))
+
+    def test_missing_optional_governance_does_not_reject(self):
+        evidence = _evidence(_banking_history())
+        evidence.payload["facts"].append(
+            {
+                "id": "GOVERNANCE_COVERAGE",
+                "kind": "governance_coverage",
+                "status": "pending",
+                "periods_available": 0,
+                "optional": True,
+            }
+        )
+        decision = evaluate_fundamental_research(
+            evidence,
+            lambda *_args: FundamentalAssessment(
+                verdict="PASS",
+                reason_code="NO_MATERIAL_RED_FLAG",
+                reason="No material qualitative red flag.",
+                evidence_ids=("ANNOUNCEMENT_TEST",),
+                missing=(),
+            ),
+        )
+        self.assertEqual(decision.verdict, "PASS")
+
 
 if __name__ == "__main__":
     unittest.main()

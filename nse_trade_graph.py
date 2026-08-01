@@ -11,10 +11,13 @@ import hashlib
 import json
 import math
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import bhavcopy
 import fundamentals
@@ -49,6 +52,7 @@ from scan_engine import (
     ScanEngine,
     ScanExecution,
     ScanExecutionError,
+    ScanFailure,
     ScanPurpose,
     ScanRequest,
     StageTiming,
@@ -70,10 +74,12 @@ TECHNICAL_POLICY = ta_analysis.select_technical_policy(NSE_TECHNICAL_POLICY_ID)
 NSE_POLICY_VERSION = os.environ.get(
     "NSE_POLICY_VERSION",
     f"{NSE_TECHNICAL_POLICY_ID}+risk-atr-target-v3"
-    "+sentiment-volatility-v1+fundamental-sector-v3+llm-prompts-v7",
+    "+sentiment-volatility-v1+fundamental-sector-v4+llm-prompts-v7",
 )
 
 log = setup_logging("nse")
+_SCAN_JOURNAL_LOCK = threading.Lock()
+NSE_SCAN_CONCURRENCY = max(1, int(os.environ.get("NSE_SCAN_CONCURRENCY", "2")))
 
 
 def _set_decision_reason(state, stage, code):
@@ -86,10 +92,23 @@ def _record_scan_event(event):
         **event,
     }
     try:
-        with open(SCAN_RUN_LOG_PATH, "a") as journal:
-            journal.write(json.dumps(record, sort_keys=True) + "\n")
+        with _SCAN_JOURNAL_LOCK:
+            with open(SCAN_RUN_LOG_PATH, "a") as journal:
+                journal.write(json.dumps(record, sort_keys=True) + "\n")
     except Exception:
         log.warning("scan-run JSONL write failed", exc_info=True)
+
+
+def _indicates_nse_pressure(result) -> bool:
+    """True when a scan failure looks like NSE throttling / transport pressure."""
+    failure = getattr(result, "failure", None)
+    if failure is None:
+        return False
+    text = f"{failure.error_type} {failure.message}".lower()
+    return any(
+        token in text
+        for token in ("429", "403", "401", "rate", "timeout", "timed out", "unavailable")
+    )
 
 
 def _recover_stale_scan_events():
@@ -155,8 +174,33 @@ def _recover_stale_scan_events():
 
 def node_fetch(state):
     state["iters"] += 1
-    state["quote"] = get_stock_live_quotes(state["symbol"])
-    time.sleep(nse_data.NSE_CALL_DELAY_SECONDS)  # was the one unthrottled call in the pipeline
+    symbol = state["symbol"]
+
+    def _fetch_quote():
+        quote = get_stock_live_quotes(symbol)
+        # Pace the quote the same way hist misses pace; overlaps with D/5 sleeps.
+        time.sleep(nse_data.NSE_CALL_DELAY_SECONDS)
+        return quote
+
+    def _fetch_quote_and_snapshot_sequential():
+        quote = _fetch_quote()
+        snapshot = nse_data.get_market_snapshot(symbol)
+        return quote, snapshot
+
+    # Quote and hist are independent NSE calls; overlap within one symbol only.
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            quote_future = pool.submit(_fetch_quote)
+            snapshot_future = pool.submit(nse_data.get_market_snapshot, symbol)
+            state["quote"] = quote_future.result()
+            market_snapshot = snapshot_future.result()
+    except Exception:
+        log.warning(
+            "parallel quote/hist fetch failed for %s; falling back to sequential",
+            symbol,
+            exc_info=True,
+        )
+        state["quote"], market_snapshot = _fetch_quote_and_snapshot_sequential()
 
     # A failed response can be None or malformed. Checking here once avoids a raw crash
     # (and a missing log record) deeper in node_risk/node_sentiment.
@@ -171,7 +215,6 @@ def node_fetch(state):
         log.warning(state["risk_verdict"])
         return "abort", state
 
-    market_snapshot = nse_data.get_market_snapshot(state["symbol"])
     state["market_snapshot"] = market_snapshot.metadata()
     state["hist_multi"] = market_snapshot.histories
     state["hist"] = state["hist_multi"]["D"]
@@ -184,12 +227,17 @@ def node_fetch(state):
         log.warning("bhavcopy delivery trend unavailable for %s", state["symbol"], exc_info=True)
         state["delivery_trend"] = None
 
-    benchmark_snapshot = nse_data.get_market_snapshot(
-        TECHNICAL_POLICY.benchmark_symbol,
-        timeframes=("D",),
-    )
-    state["benchmark_daily"] = benchmark_snapshot.histories["D"]
-    state["market_snapshot"]["benchmark"] = benchmark_snapshot.metadata()
+    # Batch scans preload benchmark_daily once on ProductionScanAdapter.
+    benchmark_meta = state.pop("_benchmark_metadata", None)
+    if state.get("benchmark_daily") is not None and benchmark_meta is not None:
+        state["market_snapshot"]["benchmark"] = benchmark_meta
+    else:
+        benchmark_snapshot = nse_data.get_market_snapshot(
+            TECHNICAL_POLICY.benchmark_symbol,
+            timeframes=("D",),
+        )
+        state["benchmark_daily"] = benchmark_snapshot.histories["D"]
+        state["market_snapshot"]["benchmark"] = benchmark_snapshot.metadata()
 
     return "technical", state
 
@@ -698,8 +746,28 @@ _STAGES = {
 class ProductionScanAdapter:
     """Keep mutable stage implementation behind the typed Scan Engine seam."""
 
+    def __init__(self):
+        # One NSE daily fetch per adapter lifetime (one batch / scan engine).
+        self._benchmark_snapshot = None
+        self._benchmark_lock = threading.Lock()
+
+    def _cached_benchmark(self):
+        with self._benchmark_lock:
+            reused = self._benchmark_snapshot is not None
+            if not reused:
+                self._benchmark_snapshot = nse_data.get_market_snapshot(
+                    TECHNICAL_POLICY.benchmark_symbol,
+                    timeframes=("D",),
+                )
+            metadata = self._benchmark_snapshot.metadata()
+            metadata["batch_reused"] = reused
+            return self._benchmark_snapshot.histories["D"], metadata
+
     def execute(self, request):
         state = _initial_scan_state(request)
+        benchmark_daily, benchmark_metadata = self._cached_benchmark()
+        state["benchmark_daily"] = benchmark_daily
+        state["_benchmark_metadata"] = benchmark_metadata
         node = "fetch"
         timings = []
 
@@ -769,20 +837,190 @@ class ProductionDecisionStore:
     def __init__(self, trade_log_path, evaluation_db_path):
         self._trade_log_path = trade_log_path
         self._evaluation_db_path = evaluation_db_path
+        self._persist_lock = threading.Lock()
 
     def persist(self, record):
-        with open(self._trade_log_path, "a") as trade_log:
-            trade_log.write(json.dumps(record) + "\n")
-        decision_id = None
+        with self._persist_lock:
+            with open(self._trade_log_path, "a") as trade_log:
+                trade_log.write(json.dumps(record) + "\n")
+            decision_id = None
+            try:
+                receipt = EvaluationLedger(self._evaluation_db_path).record_decision(
+                    record
+                )
+                decision_id = receipt.decision_id
+            except Exception:
+                log.warning(
+                    "evaluation ledger write failed; JSONL decision remains durable",
+                    exc_info=True,
+                )
+            return PersistenceReceipt(decision_id=decision_id, durable=True)
+
+
+def _handle_symbol_scan_result(
+    *,
+    symbol,
+    result,
+    pending_symbols,
+    evaluation_ledger,
+    scan_run,
+    scan_journal_id,
+):
+    if result.failure is not None:
+        error = RuntimeError(result.failure.message)
+        if evaluation_ledger is not None and scan_run is not None:
+            try:
+                evaluation_ledger.record_scan_symbol(
+                    scan_run.run_id,
+                    symbol,
+                    error=error,
+                )
+            except Exception:
+                log.warning(
+                    "failed to record scan failure for %s",
+                    symbol,
+                    exc_info=True,
+                )
+        log.warning(
+            "run failed for %s, continuing batch",
+            symbol,
+            exc_info=True,
+        )
+        _record_scan_event(
+            {
+                "event": "symbol_failed",
+                "run_id": scan_journal_id,
+                "ledger_run_id": (
+                    scan_run.run_id if scan_run is not None else None
+                ),
+                "symbol": symbol,
+                "error_type": result.failure.error_type,
+                "reason": result.failure.message,
+                "failure_stage": result.failure.stage,
+                "failure_durable": result.failure.durable,
+            }
+        )
+        pending_symbols.discard(symbol)
+        return
+
+    log.info("final[%s]: %s", symbol, result.record.get("proposal"))
+    if evaluation_ledger is not None and scan_run is not None:
         try:
-            receipt = EvaluationLedger(self._evaluation_db_path).record_decision(record)
-            decision_id = receipt.decision_id
+            evaluation_ledger.record_scan_symbol(
+                scan_run.run_id,
+                symbol,
+                decision_id=result.decision_id,
+            )
         except Exception:
             log.warning(
-                "evaluation ledger write failed; JSONL decision remains durable",
+                "failed to record scan completion for %s",
+                symbol,
                 exc_info=True,
             )
-        return PersistenceReceipt(decision_id=decision_id, durable=True)
+    _record_scan_event(
+        {
+            "event": "symbol_completed",
+            "run_id": scan_journal_id,
+            "ledger_run_id": (
+                scan_run.run_id if scan_run is not None else None
+            ),
+            "symbol": symbol,
+            "decision_id": result.decision_id,
+            "elapsed_ms": round(result.elapsed_ms, 3),
+        }
+    )
+    pending_symbols.discard(symbol)
+
+
+def run_batch_symbol_scans(
+    symbols,
+    *,
+    scan_engine,
+    make_request,
+    pending_symbols,
+    evaluation_ledger,
+    scan_run,
+    scan_journal_id,
+    concurrency=None,
+    scan_delay_seconds=1.0,
+):
+    """Scan symbols with bounded concurrency; fall back to serial on NSE pressure."""
+    workers = NSE_SCAN_CONCURRENCY if concurrency is None else max(1, int(concurrency))
+    force_serial = workers <= 1
+    remaining = list(symbols)
+    first = True
+
+    while remaining:
+        if force_serial:
+            chunk = [remaining.pop(0)]
+            if not first:
+                time.sleep(scan_delay_seconds)
+            first = False
+            symbol = chunk[0]
+            result = scan_engine.scan(make_request(symbol))
+            _handle_symbol_scan_result(
+                symbol=symbol,
+                result=result,
+                pending_symbols=pending_symbols,
+                evaluation_ledger=evaluation_ledger,
+                scan_run=scan_run,
+                scan_journal_id=scan_journal_id,
+            )
+            continue
+
+        if not first:
+            time.sleep(scan_delay_seconds)
+        first = False
+        chunk = remaining[:workers]
+        remaining = remaining[workers:]
+        with ThreadPoolExecutor(max_workers=len(chunk)) as pool:
+            futures = {
+                pool.submit(scan_engine.scan, make_request(symbol)): symbol
+                for symbol in chunk
+            }
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    result = future.result()
+                except Exception as error:
+                    log.warning(
+                        "parallel scan worker crashed for %s; continuing",
+                        symbol,
+                        exc_info=True,
+                    )
+                    result = SimpleNamespace(
+                        failure=ScanFailure(
+                            stage="scan_engine",
+                            error_type=type(error).__name__,
+                            message=str(error)[:500],
+                            durable=False,
+                        ),
+                        record={},
+                        decision_id=None,
+                        elapsed_ms=0.0,
+                    )
+                    force_serial = True
+                else:
+                    if _indicates_nse_pressure(result):
+                        force_serial = True
+                        log.warning(
+                            "NSE pressure while scanning %s; "
+                            "falling back to serial for remaining symbols",
+                            symbol,
+                        )
+                _handle_symbol_scan_result(
+                    symbol=symbol,
+                    result=result,
+                    pending_symbols=pending_symbols,
+                    evaluation_ledger=evaluation_ledger,
+                    scan_run=scan_run,
+                    scan_journal_id=scan_journal_id,
+                )
+        if force_serial and remaining:
+            log.info(
+                "batch concurrency disabled; %d symbol(s) left on serial path",
+                len(remaining),
+            )
 
 
 def create_scan_engine(
@@ -933,85 +1171,31 @@ if __name__ == "__main__":
     pending_symbols = set(symbols)
     scan_engine = create_scan_engine()
 
+    def make_request(symbol):
+        return ScanRequest(
+            symbol=symbol,
+            principal=principal,
+            scan_label=NSE_SCAN_LABEL,
+            purpose=ScanPurpose.BATCH,
+            max_allocation_pct=max_allocation_pct,
+            max_loss_pct=max_loss_pct,
+            atr_stop_multiple=atr_stop_multiple,
+            reward_risk_ratio=reward_risk_ratio,
+            run_id=scan_journal_id,
+        )
+
     try:
-        for i, symbol in enumerate(symbols):
-            if i > 0:
-                time.sleep(scan_delay_seconds)
-            request = ScanRequest(
-                symbol=symbol,
-                principal=principal,
-                scan_label=NSE_SCAN_LABEL,
-                purpose=ScanPurpose.BATCH,
-                max_allocation_pct=max_allocation_pct,
-                max_loss_pct=max_loss_pct,
-                atr_stop_multiple=atr_stop_multiple,
-                reward_risk_ratio=reward_risk_ratio,
-                run_id=scan_journal_id,
-            )
-            result = scan_engine.scan(request)
-            if result.failure is not None:
-                error = RuntimeError(result.failure.message)
-                if evaluation_ledger is not None and scan_run is not None:
-                    try:
-                        evaluation_ledger.record_scan_symbol(
-                            scan_run.run_id,
-                            symbol,
-                            error=error,
-                        )
-                    except Exception:
-                        log.warning(
-                            "failed to record scan failure for %s",
-                            symbol,
-                            exc_info=True,
-                        )
-                log.warning(
-                    "run failed for %s, continuing batch",
-                    symbol,
-                    exc_info=True,
-                )
-                _record_scan_event(
-                    {
-                        "event": "symbol_failed",
-                        "run_id": scan_journal_id,
-                        "ledger_run_id": (
-                            scan_run.run_id if scan_run is not None else None
-                        ),
-                        "symbol": symbol,
-                        "error_type": result.failure.error_type,
-                        "reason": result.failure.message,
-                        "failure_stage": result.failure.stage,
-                        "failure_durable": result.failure.durable,
-                    }
-                )
-                pending_symbols.discard(symbol)
-                continue
-            log.info("final[%s]: %s", symbol, result.record.get("proposal"))
-            if evaluation_ledger is not None and scan_run is not None:
-                try:
-                    evaluation_ledger.record_scan_symbol(
-                        scan_run.run_id,
-                        symbol,
-                        decision_id=result.decision_id,
-                    )
-                except Exception:
-                    log.warning(
-                        "failed to record scan completion for %s",
-                        symbol,
-                        exc_info=True,
-                    )
-            _record_scan_event(
-                {
-                    "event": "symbol_completed",
-                    "run_id": scan_journal_id,
-                    "ledger_run_id": (
-                        scan_run.run_id if scan_run is not None else None
-                    ),
-                    "symbol": symbol,
-                    "decision_id": result.decision_id,
-                    "elapsed_ms": round(result.elapsed_ms, 3),
-                }
-            )
-            pending_symbols.discard(symbol)
+        run_batch_symbol_scans(
+            symbols,
+            scan_engine=scan_engine,
+            make_request=make_request,
+            pending_symbols=pending_symbols,
+            evaluation_ledger=evaluation_ledger,
+            scan_run=scan_run,
+            scan_journal_id=scan_journal_id,
+            concurrency=NSE_SCAN_CONCURRENCY,
+            scan_delay_seconds=scan_delay_seconds,
+        )
     finally:
         for symbol in sorted(pending_symbols):
             _record_scan_event(
@@ -1038,5 +1222,6 @@ if __name__ == "__main__":
                 "ledger_run_id": (
                     scan_run.run_id if scan_run is not None else None
                 ),
+                "scan_concurrency": NSE_SCAN_CONCURRENCY,
             }
         )

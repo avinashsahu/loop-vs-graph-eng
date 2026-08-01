@@ -49,6 +49,12 @@ XBRL_UNIVERSE_BATCH_SIZE = int(
 DISCLOSURE_WARM_LIMIT = int(
     os.environ.get("APP_DISCLOSURE_WARM_LIMIT", "100")
 )
+GOVERNANCE_WARM_LIMIT = int(
+    os.environ.get("APP_GOVERNANCE_WARM_LIMIT", "25")
+)
+DOCUMENT_RESEARCH_WARM_LIMIT = int(
+    os.environ.get("APP_DOCUMENT_RESEARCH_WARM_LIMIT", "10")
+)
 
 _stop_requested = False
 
@@ -358,6 +364,42 @@ def configured_jobs() -> tuple[Job, ...]:
                 weekdays_only=True,
             ),
             enabled=_env_flag("APP_ENABLE_DISCLOSURE_WARM"),
+        ),
+        Job(
+            name="governance_warm",
+            command=(
+                python,
+                "warm_governance.py",
+                "--universe-index",
+                XBRL_UNIVERSE_INDEX,
+                "--limit",
+                str(GOVERNANCE_WARM_LIMIT),
+            ),
+            occurrence=_daily_occurrence(
+                "APP_GOVERNANCE_WARM_TIME_IST",
+                "17:45",
+                max_lateness_hours=6,
+                weekdays_only=True,
+            ),
+            enabled=_env_flag("APP_ENABLE_GOVERNANCE_WARM"),
+        ),
+        Job(
+            name="document_research_warm",
+            command=(
+                python,
+                "warm_document_research.py",
+                "--universe-index",
+                XBRL_UNIVERSE_INDEX,
+                "--limit",
+                str(DOCUMENT_RESEARCH_WARM_LIMIT),
+            ),
+            occurrence=_daily_occurrence(
+                "APP_DOCUMENT_RESEARCH_WARM_TIME_IST",
+                "18:00",
+                max_lateness_hours=6,
+                weekdays_only=True,
+            ),
+            enabled=_env_flag("APP_ENABLE_DOCUMENT_RESEARCH_WARM"),
         ),
         Job(
             name="evaluation_update",

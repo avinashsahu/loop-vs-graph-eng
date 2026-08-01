@@ -20,6 +20,11 @@ def _xbrl(
     schema_family="in-bse-shp",
     instant_period=None,
     government_member="Governments",
+    promoter=0,
+    encumbered_shares=None,
+    encumbered_pct_of_total=None,
+    encumbered_pct_of_promoter=None,
+    pledge_flag=None,
 ):
     instant_period = instant_period or period
     public = fii + dii + government + other
@@ -30,6 +35,8 @@ def _xbrl(
         "NonInstitutions": other,
         "PublicShareholding": public,
     }
+    if promoter:
+        members["ShareholdingOfPromoterAndPromoterGroup"] = promoter
     contexts = "".join(
         f"""
         <xbrli:context id="{name}_ContextI">
@@ -44,6 +51,18 @@ def _xbrl(
         """
         for name in members
     )
+    if encumbered_pct_of_total is not None:
+        contexts += f"""
+        <xbrli:context id="ShareholdingPattern_ContextI">
+          <xbrli:entity><xbrli:identifier scheme="test">FEDERALBNK</xbrli:identifier></xbrli:entity>
+          <xbrli:period><xbrli:instant>{instant_period}</xbrli:instant></xbrli:period>
+          <xbrli:scenario>
+            <xbrldi:explicitMember dimension="shp:CategoryOfShareholdersAxis">
+              shp:ShareholdingPatternMember
+            </xbrldi:explicitMember>
+          </xbrli:scenario>
+        </xbrli:context>
+        """
     facts = "".join(
         f"""
         <shp:NumberOfShares contextRef="{name}_ContextI" unitRef="shares">{shares}</shp:NumberOfShares>
@@ -52,6 +71,33 @@ def _xbrl(
         """
         for name, shares in members.items()
     )
+    if encumbered_shares is not None:
+        facts += f"""
+        <shp:NumberOfSharesEncumbered
+          contextRef="ShareholdingOfPromoterAndPromoterGroup_ContextI"
+          unitRef="shares">{encumbered_shares}</shp:NumberOfSharesEncumbered>
+        """
+    if encumbered_pct_of_promoter is not None:
+        facts += f"""
+        <shp:EncumberedSharesHeldAsPercentageOfTotalNumberOfShares
+          contextRef="ShareholdingOfPromoterAndPromoterGroup_ContextI"
+          unitRef="pure">{encumbered_pct_of_promoter}</shp:EncumberedSharesHeldAsPercentageOfTotalNumberOfShares>
+        """
+    if encumbered_pct_of_total is not None:
+        facts += f"""
+        <shp:EncumberedSharesHeldAsPercentageOfTotalNumberOfShares
+          contextRef="ShareholdingPattern_ContextI"
+          unitRef="pure">{encumbered_pct_of_total}</shp:EncumberedSharesHeldAsPercentageOfTotalNumberOfShares>
+        """
+    if pledge_flag is not None:
+        facts += f"""
+        <xbrli:context id="MainI">
+          <xbrli:entity><xbrli:identifier scheme="test">FEDERALBNK</xbrli:identifier></xbrli:entity>
+          <xbrli:period><xbrli:instant>{instant_period}</xbrli:instant></xbrli:period>
+        </xbrli:context>
+        <shp:WhetherAnySharesHeldByPromotersAreEncumberedUnderPledged
+          contextRef="MainI">{str(pledge_flag).lower()}</shp:WhetherAnySharesHeldByPromotersAreEncumberedUnderPledged>
+        """
     return f"""<?xml version="1.0"?>
     <xbrli:xbrl
       xmlns:xbrli="http://www.xbrl.org/2003/instance"
@@ -91,6 +137,7 @@ class _Store:
         self.records = {}
         self.manifests = {}
         self.fresh = True
+        self.enqueued = []
 
     def get(self, record_id):
         return self.records.get(record_id)
@@ -111,7 +158,7 @@ class _Store:
         self.manifests[symbol] = filings
 
     def enqueue_warm(self, symbol, record_ids):
-        pass
+        self.enqueued.append((symbol, list(record_ids)))
 
     def queued_symbols(self):
         return []
@@ -471,8 +518,9 @@ class ShareholdingHistoryTests(unittest.TestCase):
         stale = ShareholdingHistoryService(
             source, store, download_missing=False
         ).get("FEDERALBNK")
-        self.assertEqual(stale.status, "pending")
-        self.assertFalse(stale.complete)
+        self.assertEqual(stale.status, "ready")
+        self.assertEqual(len(stale.periods), 1)
+        self.assertEqual(store.enqueued, [("FEDERALBNK", [])])
 
     def test_incomplete_xbrl_is_retryable_and_never_successfully_cached(self):
         incomplete = _xbrl(
@@ -497,6 +545,80 @@ class ShareholdingHistoryTests(unittest.TestCase):
 
         self.assertEqual(source.downloads, ["205713", "205713"])
         self.assertEqual(store.records, {})
+
+    def test_retains_promoter_encumbrance_and_quarter_deltas(self):
+        filings = [
+            {
+                "record_id": "100001",
+                "period": "2025-12-31",
+                "xml": _xbrl(
+                    "2025-10-31",
+                    "2025-12-31",
+                    200,
+                    200,
+                    0,
+                    100,
+                    "in-capmkt",
+                    promoter=500,
+                    encumbered_shares=50,
+                    encumbered_pct_of_total=0.05,
+                    encumbered_pct_of_promoter=0.10,
+                    pledge_flag=True,
+                ),
+            },
+            {
+                "record_id": "100002",
+                "period": "2026-03-31",
+                "xml": _xbrl(
+                    "2025-10-31",
+                    "2026-03-31",
+                    200,
+                    200,
+                    0,
+                    100,
+                    "in-capmkt",
+                    promoter=500,
+                    encumbered_shares=150,
+                    encumbered_pct_of_total=0.15,
+                    encumbered_pct_of_promoter=0.30,
+                    pledge_flag=True,
+                ),
+            },
+        ]
+        history = ShareholdingHistoryService(_Source(filings), _Store()).get(
+            "FEDERALBNK", periods=2
+        )
+        latest = history.periods[0]
+        self.assertEqual(latest.promoter_encumbered_shares, 150)
+        self.assertEqual(latest.promoter_encumbered_pct_of_total, 15.0)
+        self.assertEqual(latest.promoter_encumbered_pct_of_promoter, 30.0)
+        self.assertTrue(latest.pledge_disclosed)
+        self.assertEqual(history.changes_bps["promoter_encumbered_qoq"], 1000)
+
+    def test_missing_optional_encumbrance_fields_do_not_fail_validation(self):
+        filings = [
+            {
+                "record_id": "100003",
+                "period": "2026-06-30",
+                "xml": _xbrl(
+                    "2025-10-31",
+                    "2026-06-30",
+                    277_134,
+                    492_796,
+                    25,
+                    230_045,
+                    "in-capmkt",
+                ),
+            }
+        ]
+        history = ShareholdingHistoryService(_Source(filings), _Store()).get(
+            "FEDERALBNK", periods=1
+        )
+        period = history.periods[0]
+        self.assertIsNone(period.promoter_encumbered_shares)
+        self.assertIsNone(period.promoter_encumbered_pct_of_total)
+        self.assertFalse(period.pledge_disclosed)
+        self.assertNotIn("promoter_encumbered_qoq", history.changes_bps or {})
 
 
 if __name__ == "__main__":

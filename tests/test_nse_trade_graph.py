@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -359,6 +360,248 @@ class FundamentalPromptTests(unittest.TestCase):
             "NSE chart API",
         )
         get_fundamentals.assert_not_called()
+
+    def test_fetch_stage_overlaps_quote_and_market_snapshot(self):
+        state = {
+            "symbol": "ACE",
+            "iters": 0,
+            "fundamental_snapshot": None,
+            "delivery_trend": None,
+            "benchmark_daily": _history(),
+            "_benchmark_metadata": {
+                "symbol": "JUNIORBEES",
+                "observed_at": "2026-07-29T13:08:00+05:30",
+                "batch_reused": True,
+            },
+        }
+        quote = {
+            "name": "Action Construction Equipment",
+            "sector": "Capital Goods",
+            "changepct": 1.0,
+            "previous_close": 100.0,
+            "change": 1.0,
+            "lower_circuit": 80.0,
+            "upper_circuit": 120.0,
+        }
+        histories = {timeframe: _history() for timeframe in ("D", "30", "15", "5")}
+        snapshot = nse_trade_graph.nse_data.MarketSnapshot(
+            symbol="ACE",
+            observed_at="2026-07-29T13:08:00+05:30",
+            histories=histories,
+            provenance={
+                timeframe: {"source": "NSE chart API"} for timeframe in histories
+            },
+        )
+        active = {"count": 0, "max": 0}
+        lock = threading.Lock()
+        barrier = threading.Barrier(2, timeout=2)
+
+        def quote_side_effect(symbol):
+            with lock:
+                active["count"] += 1
+                active["max"] = max(active["max"], active["count"])
+            barrier.wait()
+            with lock:
+                active["count"] -= 1
+            return quote
+
+        def snapshot_side_effect(symbol):
+            with lock:
+                active["count"] += 1
+                active["max"] = max(active["max"], active["count"])
+            barrier.wait()
+            with lock:
+                active["count"] -= 1
+            return snapshot
+
+        with (
+            patch.object(
+                nse_trade_graph,
+                "get_stock_live_quotes",
+                side_effect=quote_side_effect,
+            ),
+            patch.object(
+                nse_trade_graph.nse_data,
+                "get_market_snapshot",
+                side_effect=snapshot_side_effect,
+            ),
+            patch.object(
+                nse_trade_graph.bhavcopy,
+                "get_delivery_trend",
+                return_value={"status": "ready"},
+            ),
+            patch.object(nse_trade_graph.time, "sleep"),
+        ):
+            route, result_state = nse_trade_graph.node_fetch(state)
+
+        self.assertEqual(route, "technical")
+        self.assertGreaterEqual(active["max"], 2)
+        self.assertEqual(result_state["quote"]["name"], quote["name"])
+        self.assertEqual(result_state["market_snapshot"]["symbol"], "ACE")
+
+    def test_adapter_reuses_benchmark_snapshot_across_symbols(self):
+        histories = {"D": _history()}
+        snapshot = nse_trade_graph.nse_data.MarketSnapshot(
+            symbol=nse_trade_graph.TECHNICAL_POLICY.benchmark_symbol,
+            observed_at="2026-07-29T13:08:00+05:30",
+            histories=histories,
+            provenance={
+                "D": {
+                    "source": "NSE chart API",
+                    "elapsed_ms": 12.5,
+                    "latest_complete_bar": "2026-07-28T00:00:00",
+                }
+            },
+        )
+        adapter = nse_trade_graph.ProductionScanAdapter()
+        with patch.object(
+            nse_trade_graph.nse_data,
+            "get_market_snapshot",
+            return_value=snapshot,
+        ) as get_snapshot:
+            first_daily, first_meta = adapter._cached_benchmark()
+            second_daily, second_meta = adapter._cached_benchmark()
+
+        get_snapshot.assert_called_once_with(
+            nse_trade_graph.TECHNICAL_POLICY.benchmark_symbol,
+            timeframes=("D",),
+        )
+        self.assertIs(first_daily, second_daily)
+        self.assertFalse(first_meta["batch_reused"])
+        self.assertTrue(second_meta["batch_reused"])
+        self.assertEqual(first_meta["timing_ms"]["D"], 12.5)
+
+    def test_fetch_falls_back_to_sequential_when_parallel_quote_hist_fails(self):
+        state = {
+            "symbol": "ACE",
+            "iters": 0,
+            "fundamental_snapshot": None,
+            "delivery_trend": None,
+            "benchmark_daily": _history(),
+            "_benchmark_metadata": {
+                "symbol": "JUNIORBEES",
+                "observed_at": "2026-07-29T13:08:00+05:30",
+                "batch_reused": True,
+            },
+        }
+        quote = {
+            "name": "Action Construction Equipment",
+            "sector": "Capital Goods",
+            "changepct": 1.0,
+            "previous_close": 100.0,
+            "change": 1.0,
+            "lower_circuit": 80.0,
+            "upper_circuit": 120.0,
+        }
+        histories = {timeframe: _history() for timeframe in ("D", "30", "15", "5")}
+        snapshot = nse_trade_graph.nse_data.MarketSnapshot(
+            symbol="ACE",
+            observed_at="2026-07-29T13:08:00+05:30",
+            histories=histories,
+            provenance={
+                timeframe: {"source": "NSE chart API"} for timeframe in histories
+            },
+        )
+        calls = {"snapshot": 0}
+
+        def snapshot_side_effect(symbol):
+            calls["snapshot"] += 1
+            if calls["snapshot"] == 1:
+                raise ConnectionError("simulated parallel failure")
+            return snapshot
+
+        with (
+            patch.object(
+                nse_trade_graph,
+                "get_stock_live_quotes",
+                return_value=quote,
+            ),
+            patch.object(
+                nse_trade_graph.nse_data,
+                "get_market_snapshot",
+                side_effect=snapshot_side_effect,
+            ),
+            patch.object(
+                nse_trade_graph.bhavcopy,
+                "get_delivery_trend",
+                return_value={"status": "ready"},
+            ),
+            patch.object(nse_trade_graph.time, "sleep"),
+        ):
+            route, result_state = nse_trade_graph.node_fetch(state)
+
+        self.assertEqual(route, "technical")
+        self.assertGreaterEqual(calls["snapshot"], 2)
+        self.assertEqual(result_state["market_snapshot"]["symbol"], "ACE")
+
+    def test_batch_runner_falls_back_to_serial_after_nse_pressure(self):
+        pending = {"AAA", "BBB", "CCC"}
+        seen = []
+        results = {
+            "AAA": SimpleNamespace(
+                failure=nse_trade_graph.ScanFailure(
+                    stage="fetch",
+                    error_type="ConnectionError",
+                    message="HTTP 429 too many requests",
+                    durable=True,
+                ),
+                record={},
+                decision_id=None,
+                elapsed_ms=10.0,
+            ),
+            "BBB": SimpleNamespace(
+                failure=None,
+                record={"proposal": "ok-b"},
+                decision_id="d-b",
+                elapsed_ms=11.0,
+            ),
+            "CCC": SimpleNamespace(
+                failure=None,
+                record={"proposal": "ok-c"},
+                decision_id="d-c",
+                elapsed_ms=12.0,
+            ),
+        }
+
+        class FakeEngine:
+            def scan(self, request):
+                seen.append(request.symbol)
+                return results[request.symbol]
+
+        with (
+            patch.object(nse_trade_graph, "_record_scan_event"),
+            patch.object(nse_trade_graph.time, "sleep"),
+        ):
+            nse_trade_graph.run_batch_symbol_scans(
+                ["AAA", "BBB", "CCC"],
+                scan_engine=FakeEngine(),
+                make_request=lambda symbol: SimpleNamespace(symbol=symbol),
+                pending_symbols=pending,
+                evaluation_ledger=None,
+                scan_run=None,
+                scan_journal_id="run-1",
+                concurrency=2,
+                scan_delay_seconds=0,
+            )
+
+        self.assertEqual(pending, set())
+        self.assertEqual(seen[0], "AAA")
+        self.assertIn("BBB", seen)
+        # After pressure on the first chunk, remaining work is serial (CCC alone).
+        self.assertEqual(seen[-1], "CCC")
+
+    def test_indicates_nse_pressure_for_rate_limit_failures(self):
+        ok = SimpleNamespace(failure=None)
+        pressure = SimpleNamespace(
+            failure=nse_trade_graph.ScanFailure(
+                stage="fetch",
+                error_type="ConnectionError",
+                message="HTTP 429",
+                durable=True,
+            )
+        )
+        self.assertFalse(nse_trade_graph._indicates_nse_pressure(ok))
+        self.assertTrue(nse_trade_graph._indicates_nse_pressure(pressure))
 
 
 def _history(rows=60):

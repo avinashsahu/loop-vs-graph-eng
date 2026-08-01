@@ -202,6 +202,56 @@ class SlackDigestTests(unittest.TestCase):
         self.assertIn("funding leverage (FY2026)", summary)
         self.assertNotIn("revenue for FY2026", summary)
 
+    def test_actionable_governance_and_optional_coverage_notes(self):
+        actionable = digest._fundamental_summary(
+            {
+                "fundamental_assessment": {
+                    "verdict": "REVIEW",
+                    "reason_code": "PROMOTER_ENCUMBRANCE_CAUTION",
+                    "summary": "Material promoter encumbrance increase requires review.",
+                    "evidence_ids": ["SHAREHOLDING_TREND"],
+                },
+                "fundamental_evidence": {
+                    "facts": [
+                        {
+                            "id": "SHAREHOLDING_TREND",
+                            "kind": "calculated_shareholding_trend",
+                            "changes_bps": {
+                                "promoter_encumbered_qoq": 250,
+                            },
+                        },
+                        {
+                            "id": "GOVERNANCE_COVERAGE",
+                            "kind": "governance_coverage",
+                            "status": "pending",
+                        },
+                    ]
+                },
+            }
+        )
+        self.assertIn("Actionable: promoter encumbrance QoQ 250 bps.", actionable)
+        self.assertIn("Governance coverage: pending (optional).", actionable)
+
+        clean = digest._fundamental_summary(
+            {
+                "fundamental_assessment": {
+                    "verdict": "PASS",
+                    "summary": "ok",
+                },
+                "fundamental_evidence": {
+                    "facts": [
+                        {
+                            "id": "GOVERNANCE_COVERAGE",
+                            "kind": "governance_coverage",
+                            "status": "ready",
+                        }
+                    ]
+                },
+            }
+        )
+        self.assertNotIn("Actionable:", clean)
+        self.assertNotIn("Governance coverage:", clean)
+
 
 if __name__ == "__main__":
     unittest.main()

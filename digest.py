@@ -316,10 +316,11 @@ def _fundamental_summary(record):
         record.get("fundamental_verdict")
     )
     scope_note = _fundamental_scope_note(record)
+    governance_note = _governance_coverage_note(record)
     if verdict == "PASS":
         return (
             "No policy red flag in the available required evidence "
-            f"(not an overall quality rating).{scope_note}"
+            f"(not an overall quality rating).{scope_note}{governance_note}"
         )
     missing = assessment.get("missing") or []
     if verdict == "REVIEW" and missing:
@@ -356,10 +357,88 @@ def _fundamental_summary(record):
                 label = f"{label} ({period_label})"
             if label not in descriptions:
                 descriptions.append(label)
-        return f"REVIEW — missing {', '.join(descriptions)}.{scope_note}"
+        return (
+            f"REVIEW — missing {', '.join(descriptions)}."
+            f"{scope_note}{governance_note}"
+        )
     summary = assessment.get("summary")
+    actionable = _actionable_governance_note(record, assessment)
     result = f"{verdict} — {summary}" if summary else str(verdict)
-    return f"{result}{scope_note}"
+    if actionable:
+        result = f"{result} {actionable}"
+    return f"{result}{scope_note}{governance_note}"
+
+
+def _actionable_governance_note(record, assessment):
+    reason = assessment.get("reason_code")
+    if reason not in {
+        "GOVERNANCE_DISCLOSURE_CAUTION",
+        "PROMOTER_ENCUMBRANCE_CAUTION",
+    }:
+        return ""
+    evidence_ids = assessment.get("evidence_ids") or []
+    facts = (
+        (record.get("fundamental_evidence") or {}).get("facts") or []
+    )
+    details = []
+    for fact in facts:
+        if not isinstance(fact, dict) or fact.get("id") not in evidence_ids:
+            continue
+        if fact.get("kind") == "governance_exception":
+            details.append(
+                str(fact.get("code") or fact.get("detail") or "governance exception")
+                .replace("_", " ")
+            )
+        elif fact.get("kind") == "calculated_shareholding_trend":
+            changes = fact.get("changes_bps") or {}
+            if changes.get("promoter_encumbered_qoq") is not None:
+                details.append(
+                    f"promoter encumbrance QoQ {changes['promoter_encumbered_qoq']} bps"
+                )
+            if changes.get("promoter_encumbered_4q") is not None:
+                details.append(
+                    f"promoter encumbrance 4Q {changes['promoter_encumbered_4q']} bps"
+                )
+    if not details:
+        return f"Actionable: {reason.replace('_', ' ').title()}."
+    return "Actionable: " + "; ".join(details[:3]) + "."
+
+
+def _governance_coverage_note(record):
+    facts = (record.get("fundamental_evidence") or {}).get("facts") or []
+    notes = []
+    coverage = next(
+        (
+            fact
+            for fact in facts
+            if isinstance(fact, dict) and fact.get("kind") == "governance_coverage"
+        ),
+        None,
+    )
+    if coverage is not None and coverage.get("status") != "ready":
+        notes.append(
+            f"Governance coverage: {coverage.get('status') or 'pending'} (optional)."
+        )
+    research = next(
+        (
+            fact
+            for fact in facts
+            if isinstance(fact, dict)
+            and fact.get("kind") == "document_research_coverage"
+        ),
+        None,
+    )
+    if research is not None and research.get("status") != "ready":
+        notes.append(
+            "Additional research: "
+            f"{research.get('status') or 'pending'} (optional)."
+        )
+    elif research is not None:
+        counts = research.get("document_counts") or {}
+        ready = counts.get("ready")
+        if ready:
+            notes.append(f"Additional research: {ready} warmed document(s).")
+    return (" " + " ".join(notes)) if notes else ""
 
 
 def _fundamental_scope_note(record):
