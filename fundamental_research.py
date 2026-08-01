@@ -8,7 +8,7 @@ from fundamental_evidence import FundamentalEvidence
 from llm import FundamentalAssessment
 from qualitative_policy import QUALITATIVE_REJECT_REASON_CODES
 
-FUNDAMENTAL_POLICY_VERSION = "fundamental-sector-policy-v1"
+FUNDAMENTAL_POLICY_VERSION = "fundamental-sector-policy-v3"
 
 _NON_FINANCIAL_QUARTER_FIELDS = (
     "revenue",
@@ -36,9 +36,7 @@ _BANK_FIELDS = (
 _NBFC_FIELDS = (
     "revenue",
     "finance_cost",
-    "impairment",
     "pat",
-    "debt_to_equity",
 )
 
 
@@ -128,6 +126,55 @@ def evaluate_fundamental_research(
                 + "."
             ),
             checks=failed_checks,
+            profile=profile,
+            subtype=subtype,
+        )
+
+    disclosure_rejects = _disclosure_policy_facts(evidence, "REJECT")
+    if disclosure_rejects:
+        reason_code = disclosure_rejects[0].get(
+            "policy_reason_code",
+            "ADVERSE_CORPORATE_EVENT",
+        )
+        return FundamentalDecision(
+            verdict="REJECT",
+            reason_code=reason_code,
+            reason=(
+                "Deterministic disclosure policy found a material red flag: "
+                + ", ".join(_disclosure_labels(disclosure_rejects))
+                + "."
+            ),
+            evidence_ids=tuple(
+                fact["id"] for fact in disclosure_rejects[:3]
+            ),
+            checks=tuple(
+                f"DISCLOSURE_{_disclosure_label(fact).upper()}"
+                for fact in disclosure_rejects[:3]
+            ),
+            profile=profile,
+            subtype=subtype,
+        )
+
+    disclosure_reviews = _disclosure_policy_facts(evidence, "REVIEW")
+    if disclosure_reviews:
+        return FundamentalDecision(
+            verdict="REVIEW",
+            reason_code=disclosure_reviews[0].get(
+                "policy_reason_code",
+                "MATERIAL_DISCLOSURE_CAUTION",
+            ),
+            reason=(
+                "Structured NSE disclosure requires manual review: "
+                + ", ".join(_disclosure_labels(disclosure_reviews))
+                + "."
+            ),
+            evidence_ids=tuple(
+                fact["id"] for fact in disclosure_reviews[:3]
+            ),
+            checks=tuple(
+                f"DISCLOSURE_{_disclosure_label(fact).upper()}"
+                for fact in disclosure_reviews[:3]
+            ),
             profile=profile,
             subtype=subtype,
         )
@@ -278,9 +325,28 @@ def _coverage_missing(
             _period_fields_missing(periods[:4], _BANK_FIELDS, minimum_periods=4)
         )
     if profile == "banking_nbfc" and subtype == "nbfc":
-        return tuple(
-            _period_fields_missing(periods[:4], _NBFC_FIELDS, minimum_periods=4)
+        missing = _period_fields_missing(
+            periods[:4],
+            _NBFC_FIELDS,
+            minimum_periods=4,
         )
+        for period in periods[:4]:
+            if not (
+                _number(period.get("impairment"))
+                or _number(period.get("credit_cost"))
+            ):
+                missing.append(
+                    "impairment_or_credit_cost:"
+                    f"{period.get('period_end') or 'unknown'}"
+                )
+        annual = _annual_periods(periods)
+        if not annual:
+            missing.append("funding_leverage:latest_annual")
+        elif not _valid_funding_leverage(annual[0].get("funding_leverage")):
+            missing.append(
+                f"funding_leverage:{annual[0].get('period_end') or 'latest_annual'}"
+            )
+        return tuple(dict.fromkeys(missing))
     return ("financial_profile",)
 
 
@@ -335,7 +401,14 @@ def _failed_numeric_checks(
         if _value(latest.get("return_on_assets_pct")) < 0:
             checks.append("NEGATIVE_RETURN_ON_ASSETS")
     elif subtype == "nbfc":
-        if _value(latest.get("debt_to_equity")) > 8:
+        annual = _annual_periods(periods)
+        latest_leverage = (
+            annual[0].get("funding_leverage") if annual else None
+        )
+        if (
+            isinstance(latest_leverage, dict)
+            and _value(latest_leverage.get("ratio")) > 8
+        ):
             checks.append("LEVERAGE_ABOVE_POLICY")
         if _value(latest.get("impairment")) > _value(latest.get("revenue")) * 0.1:
             checks.append("IMPAIRMENT_ABOVE_POLICY")
@@ -356,6 +429,54 @@ def _failed_numeric_checks(
 
 def _number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(value)
+
+
+def _annual_periods(periods: list[dict]) -> list[dict]:
+    return [
+        period
+        for period in periods
+        if str(period.get("period_end", "")).endswith("-03-31")
+    ][:2]
+
+
+def _valid_funding_leverage(value: object) -> bool:
+    return bool(
+        isinstance(value, dict)
+        and _number(value.get("ratio"))
+        and value.get("method")
+        in {
+            "reported_debt_to_equity",
+            "derived_funding_liabilities_to_equity",
+        }
+        and value.get("balance_sheet_reconciled") is True
+        and value.get("funding_components_reconciled") is True
+    )
+
+
+def _disclosure_policy_facts(
+    evidence: FundamentalEvidence,
+    verdict: str,
+) -> list[dict]:
+    return [
+        fact
+        for fact in evidence.payload.get("facts", [])
+        if isinstance(fact, dict)
+        and fact.get("kind")
+        in {"material_disclosure", "credit_rating_action"}
+        and fact.get("policy_verdict") == verdict
+    ]
+
+
+def _disclosure_labels(facts: list[dict]) -> list[str]:
+    return list(dict.fromkeys(_disclosure_label(fact) for fact in facts[:3]))
+
+
+def _disclosure_label(fact: dict) -> str:
+    return str(
+        fact.get("event_type")
+        or fact.get("action_direction")
+        or "material_event"
+    ).replace("-", "_")
 
 
 def _value(value: object) -> float:

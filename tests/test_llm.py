@@ -287,6 +287,113 @@ class LocalLlmTests(unittest.TestCase):
         self.assertEqual(assessment.evidence_ids, ("EARNINGS_2026-06",))
         self.assertEqual(len(completions.requests), 2)
 
+    def test_technical_explanation_preserves_locked_verdict_and_fact_ids(self):
+        ledger = {
+            "schema_version": "technical-explanation-input-v2",
+            "status": "ready",
+            "facts": {
+                "TA_DECISION": {"verdict": "GOOD"},
+                "TA_TREND": {
+                    "state": "positive",
+                    "role": "required_confirmation",
+                    "explanation": (
+                        "Weighted multi-timeframe trend evidence is positive."
+                    ),
+                },
+                "TA_MOMENTUM": {
+                    "state": "positive",
+                    "role": "required_confirmation",
+                    "explanation": (
+                        "Weighted multi-timeframe momentum evidence is positive."
+                    ),
+                },
+            },
+            "interpretation": {
+                "driver_fact_ids": ["TA_TREND", "TA_MOMENTUM"],
+                "conflicts": [
+                    {
+                        "id": "TA_TIMEFRAME_30_MOMENTUM_NEGATIVE",
+                        "statement": "30-minute momentum is negative.",
+                    }
+                ],
+                "neutral_context": [
+                    {
+                        "id": "TA_RSI_NEUTRAL",
+                        "statement": "RSI is neutral.",
+                    }
+                ],
+                "data_notes": [],
+            },
+        }
+        self.completions.content = (
+            '{"verdict":"GOOD","summary":"Required weighted trend and momentum '
+            'confirm the locked decision.",'
+            '"drivers":["TA_TREND","TA_MOMENTUM"],'
+            '"conflicts":["TA_TIMEFRAME_30_MOMENTUM_NEGATIVE"],'
+            '"neutral_context":["TA_RSI_NEUTRAL"],"data_notes":[]}'
+        )
+
+        with patch.multiple(
+            llm,
+            USE_LOCAL_LLM=True,
+            USE_REAL_LLM=False,
+            TECHNICAL_LLM_SUMMARY_ENABLED=True,
+        ):
+            run = llm.summarize_technical_run(ledger)
+
+        self.assertTrue(run.output_valid)
+        self.assertEqual(run.explanation.verdict, "GOOD")
+        self.assertEqual(
+            [driver.fact_id for driver in run.explanation.drivers],
+            ["TA_TREND", "TA_MOMENTUM"],
+        )
+        self.assertEqual(
+            self.completions.request["max_tokens"],
+            llm.TECHNICAL_LLM_MAX_TOKENS,
+        )
+        self.assertIn(
+            "policy-family sum, not probability",
+            self.completions.request["messages"][0]["content"],
+        )
+
+    def test_technical_explanation_rejects_a_changed_verdict(self):
+        ledger = {
+            "status": "ready",
+            "facts": {
+                "TA_DECISION": {"verdict": "GOOD"},
+                "TA_TREND": {
+                    "state": "positive",
+                    "role": "required_confirmation",
+                    "explanation": (
+                        "Weighted multi-timeframe trend evidence is positive."
+                    ),
+                },
+            },
+            "interpretation": {
+                "driver_fact_ids": ["TA_TREND"],
+                "conflicts": [],
+                "neutral_context": [],
+                "data_notes": [],
+            },
+        }
+        self.completions.content = (
+            '{"verdict":"BAD","summary":"The verdict changed.",'
+            '"drivers":["TA_TREND"],'
+            '"conflicts":[],"neutral_context":[],"data_notes":[]}'
+        )
+
+        with patch.multiple(
+            llm,
+            USE_LOCAL_LLM=True,
+            USE_REAL_LLM=False,
+            TECHNICAL_LLM_SUMMARY_ENABLED=True,
+        ):
+            run = llm.summarize_technical_run(ledger)
+
+        self.assertFalse(run.output_valid)
+        self.assertEqual(run.status, "invalid_response")
+        self.assertIsNone(run.explanation)
+
     def test_active_model_config_describes_the_backend_that_will_run(self):
         with patch.multiple(llm, USE_LOCAL_LLM=True, USE_REAL_LLM=False):
             self.assertEqual(
@@ -296,6 +403,16 @@ class LocalLlmTests(unittest.TestCase):
                     "name": llm.LOCAL_LLM_MODEL,
                     "max_tokens": llm.LOCAL_LLM_MAX_TOKENS,
                     "fundamental_max_tokens": llm.FUNDAMENTAL_LLM_MAX_TOKENS,
+                    "technical_summary_enabled": (
+                        llm.TECHNICAL_LLM_SUMMARY_ENABLED
+                    ),
+                    "technical_max_tokens": llm.TECHNICAL_LLM_MAX_TOKENS,
+                    "technical_prompt_version": (
+                        llm.TECHNICAL_EXPLANATION_PROMPT_VERSION
+                    ),
+                    "technical_schema_version": (
+                        llm.TECHNICAL_EXPLANATION_SCHEMA_VERSION
+                    ),
                 },
             )
         with patch.multiple(llm, USE_LOCAL_LLM=False, USE_REAL_LLM=True):
@@ -306,6 +423,16 @@ class LocalLlmTests(unittest.TestCase):
                     "name": llm.ANTHROPIC_MODEL,
                     "max_tokens": llm.ANTHROPIC_MAX_TOKENS,
                     "fundamental_max_tokens": llm.FUNDAMENTAL_LLM_MAX_TOKENS,
+                    "technical_summary_enabled": (
+                        llm.TECHNICAL_LLM_SUMMARY_ENABLED
+                    ),
+                    "technical_max_tokens": llm.TECHNICAL_LLM_MAX_TOKENS,
+                    "technical_prompt_version": (
+                        llm.TECHNICAL_EXPLANATION_PROMPT_VERSION
+                    ),
+                    "technical_schema_version": (
+                        llm.TECHNICAL_EXPLANATION_SCHEMA_VERSION
+                    ),
                 },
             )
         with patch.multiple(llm, USE_LOCAL_LLM=False, USE_REAL_LLM=False):
@@ -316,6 +443,14 @@ class LocalLlmTests(unittest.TestCase):
                     "name": "deterministic-stub",
                     "max_tokens": None,
                     "fundamental_max_tokens": None,
+                    "technical_summary_enabled": False,
+                    "technical_max_tokens": None,
+                    "technical_prompt_version": (
+                        llm.TECHNICAL_EXPLANATION_PROMPT_VERSION
+                    ),
+                    "technical_schema_version": (
+                        llm.TECHNICAL_EXPLANATION_SCHEMA_VERSION
+                    ),
                 },
             )
 

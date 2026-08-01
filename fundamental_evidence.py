@@ -10,8 +10,8 @@ from zoneinfo import ZoneInfo
 from qualitative_policy import render_qualitative_policy
 from shareholding import ShareholdingHistory
 
-EVIDENCE_VERSION = "fundamental-evidence-v3"
-PROMPT_VERSION = "fundamental-assessment-v6"
+EVIDENCE_VERSION = "fundamental-evidence-v6"
+PROMPT_VERSION = "fundamental-assessment-v7"
 PEER_MAX_AGE_DAYS = 200
 SHAREHOLDING_MAX_AGE_DAYS = 160
 FINANCIAL_MAX_AGE_DAYS = 200
@@ -31,7 +31,12 @@ class FundamentalEvidence:
         return tuple(
             fact["id"]
             for fact in self.payload["facts"]
-            if fact.get("kind") in {"announcement", "corporate_action"}
+            if fact.get("kind")
+            in {
+                "announcement",
+                "material_disclosure",
+                "corporate_action",
+            }
         )
 
     def prompt(self) -> str:
@@ -42,7 +47,12 @@ class FundamentalEvidence:
             "facts": [
                 fact
                 for fact in self.payload.get("facts", [])
-                if fact.get("kind") in {"announcement", "corporate_action"}
+                if fact.get("kind")
+                in {
+                    "announcement",
+                    "material_disclosure",
+                    "corporate_action",
+                }
             ],
         }
         evidence_json = json.dumps(
@@ -137,10 +147,33 @@ def build_fundamental_evidence(
                 }
             )
 
+    material_feed = snapshot.get("material_disclosures")
     announcements = snapshot.get("corp_announcements")
-    if announcements is None:
-        missing.append("announcements")
+    latest_material_date = None
+    if isinstance(material_feed, dict):
+        if material_feed.get("status") != "ready":
+            missing.append("material_disclosures_cache")
+        material_events = material_feed.get("events", [])
+        material_events = (
+            material_events if isinstance(material_events, list) else []
+        )
+        rating_events = material_feed.get("credit_ratings", [])
+        rating_events = (
+            rating_events if isinstance(rating_events, list) else []
+        )
+        for fact in (*material_events, *rating_events):
+            if isinstance(fact, dict) and fact.get("id"):
+                facts.append(fact)
+        dated = [
+            fact.get("date")
+            for fact in (*material_events, *rating_events)
+            if isinstance(fact, dict) and fact.get("date")
+        ]
+        latest_material_date = max(dated) if dated else None
+    elif announcements is None:
+        missing.append("material_disclosures_cache")
     else:
+        # Backward compatibility for old cached snapshots and replay fixtures.
         for announcement in announcements[:3]:
             facts.append(
                 {
@@ -158,6 +191,12 @@ def build_fundamental_evidence(
                     "text": _text(announcement.get("attchmntText"), 220),
                 }
             )
+        latest_material_date = (
+            announcements[0].get("an_dt")
+            or announcements[0].get("sort_date")
+            if announcements
+            else None
+        )
 
     financial_history = snapshot.get("financial_history")
     if (
@@ -167,6 +206,20 @@ def build_fundamental_evidence(
         missing.append("financial_history")
         financial_history = financial_history if isinstance(financial_history, dict) else {}
     else:
+        facts.append(
+            {
+                "id": "FINANCIAL_SCOPE",
+                "kind": "financial_scope_selection",
+                "entity_profile": financial_history.get("entity_profile"),
+                "selected_scope": financial_history.get("selected_scope"),
+                "selection_reason": financial_history.get(
+                    "scope_selection_reason"
+                ),
+                "available_scopes": financial_history.get(
+                    "available_scopes", []
+                ),
+            }
+        )
         for period in financial_history.get("periods", []):
             if not isinstance(period, dict):
                 continue
@@ -176,9 +229,13 @@ def build_fundamental_evidence(
                     "kind": "financial_period",
                     "profile": financial_history.get("profile"),
                     "subtype": financial_history.get("subtype"),
+                    "scope": financial_history.get("selected_scope"),
                     **period,
                 }
             )
+        leverage_trend = _funding_leverage_trend(financial_history)
+        if leverage_trend:
+            facts.append(leverage_trend)
 
     if history.status != "ready" or not history.complete:
         missing.append("shareholding_history_5_periods")
@@ -266,12 +323,7 @@ def build_fundamental_evidence(
                 "financial_age_days": financial_age_days,
                 "financial_stale": financial_stale,
                 "financial_max_age_days": FINANCIAL_MAX_AGE_DAYS,
-                "latest_announcement": (
-                    announcements[0].get("an_dt")
-                    or announcements[0].get("sort_date")
-                    if announcements
-                    else None
-                ),
+                "latest_announcement": latest_material_date,
                 "latest_corporate_action": (
                     actions[0].get("exDate") if actions else None
                 ),
@@ -316,3 +368,37 @@ def _text(value, limit=160):
 def _stable_id(prefix, *values):
     source = "|".join("" if value is None else str(value) for value in values)
     return f"{prefix}_{hashlib.sha256(source.encode()).hexdigest()[:12].upper()}"
+
+
+def _funding_leverage_trend(financial_history: dict) -> dict | None:
+    annual = [
+        period
+        for period in financial_history.get("periods", [])
+        if isinstance(period, dict)
+        and str(period.get("period_end", "")).endswith("-03-31")
+        and isinstance(period.get("funding_leverage"), dict)
+        and _number(period["funding_leverage"].get("ratio")) is not None
+    ][:2]
+    if not annual:
+        return None
+    latest = annual[0]
+    prior = annual[1] if len(annual) > 1 else None
+    latest_ratio = latest["funding_leverage"]["ratio"]
+    prior_ratio = (
+        prior["funding_leverage"]["ratio"] if prior is not None else None
+    )
+    return {
+        "id": "FUNDING_LEVERAGE_TREND",
+        "kind": "calculated_funding_leverage_trend",
+        "scope": financial_history.get("selected_scope"),
+        "latest_period": latest.get("period_end"),
+        "latest_ratio": latest_ratio,
+        "latest_method": latest["funding_leverage"].get("method"),
+        "prior_period": prior.get("period_end") if prior else None,
+        "prior_ratio": prior_ratio,
+        "change": (
+            round(latest_ratio - prior_ratio, 4)
+            if prior_ratio is not None
+            else None
+        ),
+    }

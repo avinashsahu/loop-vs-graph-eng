@@ -31,8 +31,9 @@ flowchart LR
     VOL -->|GOOD| PROPOSE[PROPOSE]
     VOL -->|REVIEW| REVIEW
 
-    PROPOSE --> LEDGER[SQLite decision ledger]
-    REVIEW --> LEDGER
+    PROPOSE --> EXPLAIN[Optional Phi-4 TA explanation]
+    REVIEW --> EXPLAIN
+    EXPLAIN --> LEDGER[SQLite decision ledger]
     STOP --> LEDGER
 ```
 
@@ -47,7 +48,9 @@ production adapter in `nse_trade_graph.py` runs these stages:
 4. Size a possible position using allocation, maximum-loss, ATR-stop, target,
    and circuit constraints.
 5. Reject unusually volatile entries or produce a manual trade proposal.
-6. Persist the typed decision, policy/model identity, timings, evidence, and
+6. Optionally summarize the already locked TA evidence for displayed
+   `PROPOSE`/`REVIEW` results; model failure retains the deterministic text.
+7. Persist the typed decision, policy/model identity, timings, evidence, and
    scan accounting.
 
 A failed symbol does not stop an index scan.
@@ -74,21 +77,34 @@ cannot vote.
 Policy parameters live in `technical_policies.json`, and every decision stores
 the selected policy ID and configuration fingerprint.
 
+For proposed or manually reviewed results, Phi-4 may summarize the immutable
+`technical-explanation-input-v2` ledger after all decision routing has
+finished. The ledger supplies preclassified family roles, timeframe conflicts,
+daily price/volatility context, benchmark alignment, and delivery freshness.
+The model cannot change the verdict, calculate thresholds, or add targets,
+stops, chart patterns, or recommendations. Strict-output failure falls back to
+the deterministic technical verdict.
+
 ### Fundamental analysis and the LLM
 
-Fundamental processing fetches corporate actions, announcements, peer data,
-integrated-financial XBRL, and shareholding history. Deterministic,
-sector-specific code evaluates:
+Fundamental processing reads a warmed material-disclosure and credit-rating
+feed, then fetches corporate actions, peer data and integrated-financial XBRL;
+shareholding history is read from Aerospike. Deterministic, sector-specific
+code evaluates:
 
 - multi-period coverage and earnings
 - margins and leverage/cash conversion for non-financial companies
 - asset quality and relevant banking/NBFC fields
+- rating defaults, downgrades, negative watch and non-cooperation
+- material defaults, fraud, insolvency, regulatory, auditor, litigation,
+  management-exit and equity-dilution disclosures
 - five-category shareholding trends across consecutive quarters
 - evidence age and required-field coverage
 
 Phi-4 is **not** asked to calculate ratios, score technical indicators, size
-positions, or decide the final trade. It receives only bounded qualitative
-announcement and corporate-action evidence with stable IDs. Its structured
+positions, or decide the final trade. Structured disclosure and rating actions
+are evaluated before the model. It receives only bounded qualitative material
+disclosures and corporate-action evidence with stable IDs. Its structured
 response contains:
 
 - `PASS`, `REVIEW`, or `REJECT`
@@ -136,6 +152,8 @@ USE_LOCAL_LLM=1
 LOCAL_LLM_URL=http://localhost:11434/v1
 LOCAL_LLM_MODEL=phi4:14b-q4_K_M
 LOCAL_LLM_REASONING_EFFORT=none
+TECHNICAL_LLM_SUMMARY_ENABLED=1
+TECHNICAL_LLM_MAX_TOKENS=600
 ```
 
 The stub backend is used when neither local nor Anthropic execution is enabled.
@@ -175,6 +193,7 @@ Jobs execute one at a time to preserve slow NSE access:
 | Bhavcopy catch-up | At startup, then at 19:00 IST after the nominal publication cutoff |
 | NIFTY TOTAL MKT XBRL backfill | 16:00 IST weekdays, 25 due symbols |
 | Queued XBRL shareholding warm | 17:00 IST weekdays, up to 10 symbols |
+| Material disclosure/rating warm | 17:30 IST weekdays, 100 due symbols |
 | Paper-outcome update | 18:30 IST weekdays |
 | Overnight scan and digest | 22:00 IST weekdays |
 | Intraday actionable-symbol recheck | Every 20 minutes during NSE market hours |
@@ -237,6 +256,20 @@ XML with checksums, and derives normalized quarterly records. A live scan never
 downloads missing shareholding history; it returns `REVIEW` and queues the
 symbol for later warming.
 
+Material announcements and structured credit-rating actions are also warmed
+outside scans:
+
+```bash
+uv run warm_disclosures.py BAJFINANCE
+uv run warm_disclosures.py \
+  --universe-index "NIFTY TOTAL MKT" \
+  --limit 100
+```
+
+The feed uses a bounded lookback window, filters routine notices before they can
+displace material evidence, and keeps stable evidence IDs plus NSE source
+provenance. A live scan never calls either disclosure endpoint.
+
 ## Run scans
 
 ```bash
@@ -291,7 +324,7 @@ and their credentials are configured in `.env`.
 
 | Store | Purpose | Lifecycle |
 |---|---|---|
-| `.cache/` | Short-lived market and fundamental API snapshots | Disposable; TTL cleanup |
+| `.cache/` | Short-lived market, fundamental and material-disclosure snapshots | Disposable; TTL cleanup |
 | `bhavcopy.db` | Whole-market daily OHLCV and delivery history | Retained source data |
 | Aerospike `shareholding` set | Raw and normalized XBRL shareholding history | Retained source data |
 | Aerospike `shareholding_warm` set | Symbols queued for background warming | Disposable work queue |
@@ -373,7 +406,8 @@ baseline, and inference benchmark.
 Copy `.env.example`; it documents every setting. The important groups are:
 
 - model: `USE_LOCAL_LLM`, `LOCAL_LLM_URL`, `LOCAL_LLM_MODEL`,
-  `FUNDAMENTAL_LLM_MAX_TOKENS`
+  `FUNDAMENTAL_LLM_MAX_TOKENS`, `TECHNICAL_LLM_SUMMARY_ENABLED`,
+  `TECHNICAL_LLM_MAX_TOKENS`
 - scan: `NSE_SYMBOL`, `NSE_INDEX`, `NSE_SCAN_LIMIT`,
   `NSE_SCAN_DELAY_SECONDS`, `NSE_OVERNIGHT_INDEX`,
   `NSE_OVERNIGHT_SCAN_LIMIT`
@@ -408,3 +442,4 @@ The original `loop_agent.py` and `graph_agent.py` remain as small control-flow
 examples. The production application is the typed scan engine described above.
 
 This software is experimental decision support, not investment advice.
+

@@ -14,32 +14,14 @@ def now_ist() -> datetime:
 
 def now_ist_naive() -> datetime:
     """now_ist() with tzinfo stripped -- safe for display/formatting (log timestamps,
-    cache-key dates) where the value is only ever strftime'd, never converted back to an
-    epoch. NOT safe to hand to nsemine.get_stock_historical_data (see now_host_local)."""
+    cache-key dates) where the value is only ever strftime'd."""
     return now_ist().replace(tzinfo=None)
-
-
-def now_host_local() -> datetime:
-    """The real current instant, expressed as a naive datetime in the HOST's own local
-    timezone -- equivalent to plain datetime.now(), spelled out explicitly.
-
-    Use this (not now_ist_naive()) for anything that gets passed to nsemine's
-    get_stock_historical_data: it converts datetimes to an epoch via .timestamp(),
-    which interprets a naive datetime as host-local time. Feeding it now_ist_naive()'s
-    IST-wall-clock numbers on a non-IST host makes it misinterpret them as host-local,
-    producing a wrong epoch -- confirmed via nsemine's source (historical.py calls
-    `int(start_datetime.timestamp())`). now_ist().astimezone() converts the correct
-    absolute instant to whatever the host's local timezone actually is, which is exactly
-    what .timestamp() needs to round-trip correctly regardless of host timezone.
-    """
-    return now_ist().astimezone().replace(tzinfo=None)
 
 
 def is_market_hours(dt: datetime = None) -> bool:
     """NSE regular trading session: 9:15-15:30 IST, Monday-Friday.
 
-    Doesn't account for exchange holidays -- see nsemine.nse.get_holiday_lists if that's
-    ever needed.
+    Exchange holidays are not currently accounted for.
     """
     dt = dt if dt is not None else now_ist()
     if dt.weekday() >= 5:

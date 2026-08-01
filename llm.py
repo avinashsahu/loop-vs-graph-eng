@@ -16,6 +16,12 @@ USE_LOCAL_LLM = os.environ.get("USE_LOCAL_LLM") == "1"
 LOCAL_LLM_URL = os.environ.get("LOCAL_LLM_URL", "http://localhost:11434/v1")
 LOCAL_LLM_MODEL = os.environ.get("LOCAL_LLM_MODEL", "phi4:14b-q4_K_M")
 LOCAL_LLM_MAX_TOKENS = int(os.environ.get("LOCAL_LLM_MAX_TOKENS", "800"))
+TECHNICAL_LLM_MAX_TOKENS = int(
+    os.environ.get("TECHNICAL_LLM_MAX_TOKENS", "600")
+)
+TECHNICAL_LLM_SUMMARY_ENABLED = (
+    os.environ.get("TECHNICAL_LLM_SUMMARY_ENABLED", "1") == "1"
+)
 LOCAL_LLM_REASONING_EFFORT = os.environ.get("LOCAL_LLM_REASONING_EFFORT", "none")
 LOCAL_LLM_NO_THINK_DIRECTIVE = os.environ.get(
     "LOCAL_LLM_NO_THINK_DIRECTIVE", ""
@@ -52,6 +58,8 @@ FUNDAMENTAL_LLM_MAX_TOKENS = int(
     os.environ.get("FUNDAMENTAL_LLM_MAX_TOKENS", "2048")
 )
 FUNDAMENTAL_SCHEMA_VERSION = "fundamental-assessment-schema-v4"
+TECHNICAL_EXPLANATION_SCHEMA_VERSION = "technical-explanation-schema-v1"
+TECHNICAL_EXPLANATION_PROMPT_VERSION = "technical-explanation-prompt-v1"
 FUNDAMENTAL_RESPONSE_FORMAT = {
     "type": "json_schema",
     "json_schema": {
@@ -105,6 +113,59 @@ FUNDAMENTAL_RESPONSE_FORMAT = {
         },
     },
 }
+TECHNICAL_EXPLANATION_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "technical_explanation",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "verdict": {
+                    "type": "string",
+                    "enum": ["GOOD", "BAD"],
+                },
+                "summary": {
+                    "type": "string",
+                    "maxLength": 500,
+                },
+                "drivers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 3,
+                    "uniqueItems": True,
+                },
+                "conflicts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 3,
+                    "uniqueItems": True,
+                },
+                "neutral_context": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 3,
+                    "uniqueItems": True,
+                },
+                "data_notes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 3,
+                    "uniqueItems": True,
+                },
+            },
+            "required": [
+                "verdict",
+                "summary",
+                "drivers",
+                "conflicts",
+                "neutral_context",
+                "data_notes",
+            ],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -142,9 +203,54 @@ class FundamentalAssessmentRun:
 
 
 @dataclass(frozen=True)
+class TechnicalExplanationDriver:
+    fact_id: str
+    statement: str
+
+    def to_dict(self):
+        return {
+            "fact_id": self.fact_id,
+            "statement": self.statement,
+        }
+
+
+@dataclass(frozen=True)
+class TechnicalExplanation:
+    verdict: str
+    summary: str
+    drivers: tuple[TechnicalExplanationDriver, ...]
+    conflicts: tuple[str, ...]
+    neutral_context: tuple[str, ...]
+    data_notes: tuple[str, ...]
+
+    def to_dict(self):
+        return {
+            "verdict": self.verdict,
+            "summary": self.summary,
+            "drivers": [driver.to_dict() for driver in self.drivers],
+            "conflicts": list(self.conflicts),
+            "neutral_context": list(self.neutral_context),
+            "data_notes": list(self.data_notes),
+        }
+
+
+@dataclass(frozen=True)
+class TechnicalExplanationRun:
+    explanation: TechnicalExplanation | None
+    output_valid: bool
+    status: str
+    response_chars: int
+    reasoning: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    reasoning_tokens: int | None = None
+
+
+@dataclass(frozen=True)
 class _LocalStructuredResponse:
     content: str
     reasoning: str
+    prompt_tokens: int
     completion_tokens: int
     reasoning_tokens: int | None
 
@@ -156,6 +262,10 @@ def active_model_config():
             "name": LOCAL_LLM_MODEL,
             "max_tokens": LOCAL_LLM_MAX_TOKENS,
             "fundamental_max_tokens": FUNDAMENTAL_LLM_MAX_TOKENS,
+            "technical_summary_enabled": TECHNICAL_LLM_SUMMARY_ENABLED,
+            "technical_max_tokens": TECHNICAL_LLM_MAX_TOKENS,
+            "technical_prompt_version": TECHNICAL_EXPLANATION_PROMPT_VERSION,
+            "technical_schema_version": TECHNICAL_EXPLANATION_SCHEMA_VERSION,
         }
     if USE_REAL_LLM:
         return {
@@ -163,12 +273,20 @@ def active_model_config():
             "name": ANTHROPIC_MODEL,
             "max_tokens": ANTHROPIC_MAX_TOKENS,
             "fundamental_max_tokens": FUNDAMENTAL_LLM_MAX_TOKENS,
+            "technical_summary_enabled": TECHNICAL_LLM_SUMMARY_ENABLED,
+            "technical_max_tokens": TECHNICAL_LLM_MAX_TOKENS,
+            "technical_prompt_version": TECHNICAL_EXPLANATION_PROMPT_VERSION,
+            "technical_schema_version": TECHNICAL_EXPLANATION_SCHEMA_VERSION,
         }
     return {
         "backend": "stub",
         "name": "deterministic-stub",
         "max_tokens": None,
         "fundamental_max_tokens": None,
+        "technical_summary_enabled": False,
+        "technical_max_tokens": None,
+        "technical_prompt_version": TECHNICAL_EXPLANATION_PROMPT_VERSION,
+        "technical_schema_version": TECHNICAL_EXPLANATION_SCHEMA_VERSION,
     }
 
 
@@ -284,6 +402,7 @@ def _call_local_structured(prompt, response_format, *, max_tokens=None):
     return _LocalStructuredResponse(
         content=content,
         reasoning=reasoning,
+        prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
         completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
         reasoning_tokens=getattr(completion_details, "reasoning_tokens", None),
     )
@@ -344,6 +463,282 @@ def _parse_fundamental_assessment(text, available_evidence_ids=()):
         reason=reason,
         evidence_ids=evidence_ids,
         missing=missing,
+    )
+
+
+def _parse_technical_explanation(text, fact_ledger):
+    try:
+        payload = json.loads(text)
+        verdict_value = payload["verdict"]
+        summary_value = payload["summary"]
+        drivers_value = payload["drivers"]
+        conflicts_value = payload["conflicts"]
+        neutral_value = payload["neutral_context"]
+        data_notes_value = payload["data_notes"]
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid technical explanation JSON") from exc
+
+    if (
+        not isinstance(payload, dict)
+        or set(payload)
+        != {
+            "verdict",
+            "summary",
+            "drivers",
+            "conflicts",
+            "neutral_context",
+            "data_notes",
+        }
+        or not isinstance(verdict_value, str)
+        or not isinstance(summary_value, str)
+        or not isinstance(drivers_value, list)
+        or not isinstance(conflicts_value, list)
+        or not isinstance(neutral_value, list)
+        or not isinstance(data_notes_value, list)
+    ):
+        raise ValueError("invalid technical explanation field types")
+
+    expected_verdict = (
+        (fact_ledger.get("facts") or {})
+        .get("TA_DECISION", {})
+        .get("verdict")
+    )
+    verdict = verdict_value.upper()
+    summary = summary_value.strip()
+    if verdict != expected_verdict:
+        raise ValueError("technical explanation changed the locked verdict")
+    if not summary or len(summary) > 500:
+        raise ValueError("technical summary must contain 1-500 characters")
+    forbidden_summary_claims = (
+        "bullish",
+        "bearish",
+        "sentiment",
+        "outlook",
+        "forecast",
+        "probability",
+        "confidence",
+        "strong",
+        "correction",
+        "reliable",
+        "comprehensive",
+        "daily trend",
+        "daily momentum",
+        "buy ",
+        "sell ",
+        "target ",
+        "stop loss",
+        "stop-loss",
+        "support level",
+        "resistance level",
+        "likely to",
+        "price will",
+    )
+    if any(term in summary.lower() for term in forbidden_summary_claims):
+        raise ValueError("technical summary contains an unsupported claim")
+
+    facts = fact_ledger.get("facts") or {}
+    interpretation = fact_ledger.get("interpretation") or {}
+    expected_driver_ids = tuple(
+        interpretation.get("driver_fact_ids") or ()
+    )
+    allowed_driver_ids = set(expected_driver_ids)
+    required_driver_ids = {
+        fact_id
+        for fact_id, fact in facts.items()
+        if fact.get("role") == "required_confirmation"
+        and fact.get("state") == "positive"
+    }
+    if (
+        len(drivers_value) > 3
+        or any(not isinstance(item, str) for item in drivers_value)
+    ):
+        raise ValueError("invalid technical driver IDs")
+    supplied_driver_ids = tuple(
+        dict.fromkeys(item.strip() for item in drivers_value)
+    )
+    if (
+        len(supplied_driver_ids) != len(drivers_value)
+        or set(supplied_driver_ids) != allowed_driver_ids
+        or not required_driver_ids <= set(supplied_driver_ids)
+    ):
+        raise ValueError("technical explanation changed driver evidence")
+    drivers = []
+    for fact_id in expected_driver_ids:
+        fact = facts.get(fact_id) or {}
+        statement = fact.get("explanation")
+        if (
+            not isinstance(statement, str)
+            or not statement
+            or len(statement) > 180
+        ):
+            raise ValueError("technical ledger lacks driver explanation")
+        drivers.append(
+            TechnicalExplanationDriver(
+                fact_id=fact_id,
+                statement=statement,
+            )
+        )
+
+    def render_interpretation(value, key):
+        expected_items = tuple(interpretation.get(key) or ())
+        expected_ids = tuple(item["id"] for item in expected_items)
+        if (
+            len(value) > 3
+            or any(not isinstance(item, str) for item in value)
+        ):
+            raise ValueError(f"invalid technical {key} IDs")
+        supplied_ids = tuple(dict.fromkeys(item.strip() for item in value))
+        if (
+            len(supplied_ids) != len(value)
+            or set(supplied_ids) != set(expected_ids)
+        ):
+            raise ValueError(f"technical explanation changed {key}")
+        statements = tuple(item["statement"] for item in expected_items)
+        if any(
+            not isinstance(item, str)
+            or not item
+            or len(item) > 180
+            for item in statements
+        ):
+            raise ValueError(f"technical ledger has invalid {key}")
+        return statements
+
+    conflicts = render_interpretation(conflicts_value, "conflicts")
+    neutral_context = render_interpretation(
+        neutral_value,
+        "neutral_context",
+    )
+    data_notes = render_interpretation(data_notes_value, "data_notes")
+
+    return TechnicalExplanation(
+        verdict=verdict,
+        summary=summary,
+        drivers=tuple(drivers),
+        conflicts=conflicts,
+        neutral_context=neutral_context,
+        data_notes=data_notes,
+    )
+
+
+def build_technical_explanation_prompt(fact_ledger):
+    compact_ledger = json.dumps(
+        fact_ledger,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return (
+        "Explain the supplied deterministic technical-analysis fact ledger for "
+        "an NSE cash equity. The locked TA_DECISION verdict is final: copy it "
+        "exactly and never recalculate, upgrade, downgrade, or override it. Use "
+        "only supplied fields and their preclassified state/role labels; never "
+        "compare scores with thresholds yourself. The aggregate score is a "
+        "policy-family sum, not probability, confidence, or a cross-policy "
+        "strength scale. Required confirmations must appear in drivers. Keep "
+        "negative timeframe evidence under conflicts and neutral evidence under "
+        "neutral_context; neither overrides the verdict. "
+        "expected_prior_completed_session is operationally current, not stale. "
+        "calculation_inputs_ready certifies calculation prerequisites only, not "
+        "complete market-data quality. Do not invent chart patterns, support, "
+        "resistance, forecasts, probabilities, confidence, targets, stops, "
+        "trades, orders, recommendations, sentiment, or correction narratives. "
+        "The summary must be one or two concise sentences and must describe "
+        "trend and momentum as weighted multi-timeframe families, not daily-only "
+        "signals. In drivers return the exact IDs from "
+        "interpretation.driver_fact_ids. In conflicts, neutral_context, and "
+        "data_notes return the exact corresponding interpretation item IDs, not "
+        "free-written statements. Do not omit, add, or recategorize IDs. Use "
+        "plain language and return only JSON matching the response schema.\n\n"
+        f"TECHNICAL_FACT_LEDGER={compact_ledger}"
+    )
+
+
+def summarize_technical_run(fact_ledger):
+    """Summarize a locked TA decision without participating in decision routing."""
+    global _call_count
+
+    if not TECHNICAL_LLM_SUMMARY_ENABLED:
+        return TechnicalExplanationRun(
+            explanation=None,
+            output_valid=False,
+            status="disabled",
+            response_chars=0,
+        )
+    if fact_ledger.get("status") != "ready":
+        return TechnicalExplanationRun(
+            explanation=None,
+            output_valid=False,
+            status="ineligible",
+            response_chars=0,
+        )
+    if not USE_LOCAL_LLM and not USE_REAL_LLM:
+        return TechnicalExplanationRun(
+            explanation=None,
+            output_valid=False,
+            status="backend_disabled",
+            response_chars=0,
+        )
+
+    _call_count += 1
+    prompt = build_technical_explanation_prompt(fact_ledger)
+    reasoning = ""
+    prompt_tokens = 0
+    completion_tokens = 0
+    reasoning_tokens = None
+    if USE_LOCAL_LLM:
+        response = _call_local_structured(
+            prompt,
+            TECHNICAL_EXPLANATION_RESPONSE_FORMAT,
+            max_tokens=TECHNICAL_LLM_MAX_TOKENS,
+        )
+        text = response.content
+        reasoning = response.reasoning
+        prompt_tokens = response.prompt_tokens
+        completion_tokens = response.completion_tokens
+        reasoning_tokens = response.reasoning_tokens
+    else:
+        import anthropic
+
+        client = anthropic.Anthropic()
+        schema = TECHNICAL_EXPLANATION_RESPONSE_FORMAT["json_schema"][
+            "schema"
+        ]
+        response = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=TECHNICAL_LLM_MAX_TOKENS,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"{prompt}\nReturn only JSON matching this schema: "
+                        f"{json.dumps(schema, separators=(',', ':'))}"
+                    ),
+                }
+            ],
+        )
+        text = response.content[0].text
+
+    try:
+        explanation = _parse_technical_explanation(text, fact_ledger)
+    except ValueError:
+        return TechnicalExplanationRun(
+            explanation=None,
+            output_valid=False,
+            status="invalid_response",
+            response_chars=len(text),
+            reasoning=reasoning,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            reasoning_tokens=reasoning_tokens,
+        )
+    return TechnicalExplanationRun(
+        explanation=explanation,
+        output_valid=True,
+        status="ready",
+        response_chars=len(text),
+        reasoning=reasoning,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        reasoning_tokens=reasoning_tokens,
     )
 
 

@@ -5,11 +5,13 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import talib
 
 _REQUIRED_TIMEFRAMES = ("D", "30", "15", "5")
 _REQUIRED_COLUMNS = ("close", "high", "low")
 _MINIMUM_BARS = 50
+TECHNICAL_EVIDENCE_SCHEMA_VERSION = "technical-explanation-input-v2"
 BASELINE_TECHNICAL_POLICY_ID = "technical-confluence-v1"
 REVISED_TECHNICAL_POLICY_ID = "technical-relative-participation-v2"
 _POLICY_PATH = Path(__file__).with_name("technical_policies.json")
@@ -228,12 +230,29 @@ def evaluate_technical(observations, policy=None):
             )
         elif "close" not in benchmark.columns:
             reasons.append("MISSING_BENCHMARK_CLOSE")
+        elif "datetime" not in histories["D"].columns:
+            reasons.append("MISSING_STOCK_SESSION_DATES")
+        elif "datetime" not in benchmark.columns:
+            reasons.append("MISSING_BENCHMARK_SESSION_DATES")
         elif len(benchmark) < required_benchmark_bars:
             reasons.append("INSUFFICIENT_BENCHMARK_BARS")
         elif not np.isfinite(
             benchmark["close"].tail(required_benchmark_bars).to_numpy(dtype=float)
         ).all():
             reasons.append("NON_FINITE_BENCHMARK_BARS")
+        else:
+            stock_sessions = tuple(
+                pd.to_datetime(
+                    histories["D"]["datetime"].tail(required_benchmark_bars)
+                ).dt.date
+            )
+            benchmark_sessions = tuple(
+                pd.to_datetime(
+                    benchmark["datetime"].tail(required_benchmark_bars)
+                ).dt.date
+            )
+            if stock_sessions != benchmark_sessions:
+                reasons.append("MISALIGNED_BENCHMARK_SESSIONS")
 
     if reasons:
         return TechnicalAssessment(
@@ -380,10 +399,18 @@ def _relative_strength_score(observations, policy):
 
 def _participation_score(delivery_trend, policy):
     evidence = {
+        "data_status": (
+            delivery_trend.get("status")
+            if delivery_trend
+            else "unavailable"
+        ),
         "available": False,
         "liquid": None,
+        "participation_state": "unavailable",
         "delivery_volume_confirmation": False,
         "delivery_percentage_directional": False,
+        "delivery_pct_trend": None,
+        "delivery_volume_trend": None,
     }
     if not delivery_trend or delivery_trend.get("status") != "ready":
         return 0.0, evidence
@@ -399,28 +426,64 @@ def _participation_score(delivery_trend, policy):
     delivery_volume_rising = (
         delivery_trend.get("delivery_volume_trend") == "rising"
     )
+    delivery_pct_trend = delivery_trend.get("delivery_pct_trend")
     interpretation = delivery_trend.get("interpretation")
     evidence.update(
         {
+            "data_status": "ready",
             "available": True,
             "liquid": liquid,
+            "participation_state": "available_neutral",
+            "latest_date": delivery_trend.get("latest_date"),
+            "window": delivery_trend.get("window"),
+            "recent_avg_delivery_pct": delivery_trend.get(
+                "recent_avg_delivery_pct"
+            ),
+            "baseline_avg_delivery_pct": delivery_trend.get(
+                "baseline_avg_delivery_pct"
+            ),
+            "delivery_pct_trend": delivery_pct_trend,
+            "recent_avg_delivery_volume": delivery_trend.get(
+                "recent_avg_delivery_volume"
+            ),
+            "baseline_avg_delivery_volume": delivery_trend.get(
+                "baseline_avg_delivery_volume"
+            ),
+            "delivery_volume_trend": delivery_trend.get(
+                "delivery_volume_trend"
+            ),
+            "recent_avg_total_volume": delivery_trend.get(
+                "recent_avg_total_volume"
+            ),
+            "baseline_avg_total_volume": delivery_trend.get(
+                "baseline_avg_total_volume"
+            ),
+            "recent_price_change_pct": delivery_trend.get(
+                "recent_price_change_pct"
+            ),
             "recent_daily_turnover": round(turnover, 2),
             "minimum_daily_turnover": policy.minimum_daily_turnover,
             "total_volume_expanded": volume_expanded,
             "delivery_volume_confirmation": delivery_volume_rising,
+            "delivery_percentage_directional": (
+                delivery_pct_trend in {"rising", "falling"}
+            ),
             "interpretation": interpretation,
         }
     )
 
     if not liquid:
+        evidence["participation_state"] = "illiquid"
         return -policy.participation_score, evidence
     if (
         delivery_volume_rising
         and volume_expanded
         and interpretation == "possible_accumulation"
     ):
+        evidence["participation_state"] = "possible_accumulation"
         return policy.participation_score, evidence
     if delivery_volume_rising and interpretation == "possible_distribution":
+        evidence["participation_state"] = "possible_distribution"
         return -policy.participation_score, evidence
     # Delivery percentage describes the share of volume delivered, not whether buyers
     # or sellers initiated it. Without delivery-volume and price confirmation it stays
@@ -564,6 +627,8 @@ def score_technical(indicators, observations=None, policy=None):
         "required_positive_families": list(
             policy.required_positive_families
         ),
+        "family_engagement_threshold": policy.family_engagement_threshold,
+        "required_confirmation_satisfied": required_confirmation,
         "benchmark_symbol": policy.benchmark_symbol,
         "score": round(total_score, 3),
         "verdict": verdict,
@@ -577,6 +642,469 @@ def score_technical(indicators, observations=None, policy=None):
         "relative_strength": relative_strength,
         "participation": participation,
     }
+
+
+def _score_state(score, threshold):
+    if abs(score) <= threshold:
+        return "neutral"
+    return "positive" if score > 0 else "negative"
+
+
+def _session_label(timeframe):
+    return "daily" if timeframe == "D" else f"{timeframe}-minute"
+
+
+def _round_change(current, previous):
+    if previous is None or not np.isfinite(previous) or previous == 0:
+        return None
+    return round((current / previous - 1) * 100, 3)
+
+
+def _daily_context(indicators_by_timeframe, evidence, observations, policy):
+    if observations is None:
+        return None
+    histories = observations.histories
+    daily = histories.get("D")
+    if daily is None or len(daily) < 50:
+        return None
+
+    close = pd.to_numeric(daily["close"], errors="coerce")
+    high = pd.to_numeric(daily["high"], errors="coerce")
+    low = pd.to_numeric(daily["low"], errors="coerce")
+    if not np.isfinite(close.tail(50).to_numpy(dtype=float)).all():
+        return None
+
+    latest_close = float(close.iloc[-1])
+    indicators = indicators_by_timeframe["D"]
+    sma20 = float(indicators["sma20"])
+    sma50 = float(indicators["sma50"])
+    sma20_series = close.rolling(20).mean()
+    sma50_series = close.rolling(50).mean()
+    macd_hist = talib.MACD(
+        close.to_numpy(dtype=float),
+        fastperiod=12,
+        slowperiod=26,
+        signalperiod=9,
+    )[2]
+
+    atr_pct = float(indicators["atr_pct"])
+    low_atr, high_atr = policy.rsi_atr_thresholds
+    if atr_pct < low_atr:
+        volatility_regime = "low_by_policy"
+    elif atr_pct < high_atr:
+        volatility_regime = "normal_by_policy"
+    else:
+        volatility_regime = "high_by_policy"
+
+    latest_volume_ratio = None
+    if "volume" in daily.columns:
+        volume = pd.to_numeric(daily["volume"], errors="coerce")
+        recent_volume = volume.tail(20)
+        if (
+            np.isfinite(recent_volume.to_numpy(dtype=float)).all()
+            and float(recent_volume.mean()) > 0
+        ):
+            latest_volume_ratio = round(
+                float(volume.iloc[-1]) / float(recent_volume.mean()),
+                3,
+            )
+
+    return {
+        "close": latest_close,
+        "sma20": round(sma20, 3),
+        "sma50": round(sma50, 3),
+        "close_vs_sma20_pct": _round_change(latest_close, sma20),
+        "close_vs_sma50_pct": _round_change(latest_close, sma50),
+        "sma20_slope_5_sessions_pct": _round_change(
+            sma20,
+            float(sma20_series.iloc[-6]),
+        ),
+        "sma50_slope_5_sessions_pct": _round_change(
+            sma50,
+            float(sma50_series.iloc[-6]),
+        ),
+        "macd_hist": round(float(indicators["macd_hist"]), 3),
+        "macd_hist_change_1_session": round(
+            float(macd_hist[-1] - macd_hist[-2]),
+            3,
+        ),
+        "rsi14": round(float(indicators["rsi14"]), 2),
+        "adaptive_rsi_band": list(evidence["rsi_band"]),
+        "atr14": round(float(indicators["atr14"]), 3),
+        "atr_pct": round(atr_pct, 3),
+        "volatility_regime": volatility_regime,
+        "return_1_session_pct": _round_change(
+            latest_close,
+            float(close.iloc[-2]),
+        ),
+        "return_5_sessions_pct": _round_change(
+            latest_close,
+            float(close.iloc[-6]),
+        ),
+        "return_20_sessions_pct": _round_change(
+            latest_close,
+            float(close.iloc[-21]),
+        ),
+        "distance_from_20_session_high_pct": _round_change(
+            latest_close,
+            float(high.tail(20).max()),
+        ),
+        "distance_above_20_session_low_pct": _round_change(
+            latest_close,
+            float(low.tail(20).min()),
+        ),
+        "latest_volume_vs_20_session_average": latest_volume_ratio,
+    }
+
+
+def _delivery_freshness(observations, participation):
+    result = {
+        "status": (participation or {}).get("data_status", "unavailable"),
+        "latest_session": (participation or {}).get("latest_date"),
+        "lag_sessions": None,
+        "freshness": "unknown",
+    }
+    if observations is None or not result["latest_session"]:
+        return result
+    daily = observations.histories.get("D")
+    if daily is None or "datetime" not in daily.columns:
+        return result
+    try:
+        delivery_date = pd.Timestamp(result["latest_session"]).date()
+        sessions = tuple(pd.to_datetime(daily["datetime"]).dt.date)
+    except (TypeError, ValueError):
+        return result
+    lag = sum(1 for session in sessions if session > delivery_date)
+    result["lag_sessions"] = lag
+    if lag == 0:
+        result["freshness"] = "same_session"
+    elif lag == 1:
+        result["freshness"] = "expected_prior_completed_session"
+    else:
+        result["freshness"] = "stale"
+    return result
+
+
+def build_technical_fact_ledger(
+    symbol,
+    assessment,
+    market_snapshot=None,
+    observations=None,
+):
+    """Build the only TA payload that an explanatory LLM may summarize."""
+    if isinstance(assessment, TechnicalAssessment):
+        indicators_by_timeframe = assessment.indicators
+        assessment = assessment.to_dict()
+    else:
+        indicators_by_timeframe = assessment.get("indicators") or {}
+
+    status = assessment.get("status")
+    reason_codes = list(assessment.get("reason_codes") or [])
+    observed_at = (market_snapshot or {}).get("observed_at")
+    timeframe_metadata = (market_snapshot or {}).get("timeframes") or {}
+    compact_timeframes = {}
+    for timeframe in _REQUIRED_TIMEFRAMES:
+        metadata = timeframe_metadata.get(timeframe) or {}
+        compact_timeframes[timeframe] = {
+            key: metadata.get(key)
+            for key in (
+                "bars",
+                "latest_complete_bar",
+                "dropped_incomplete_bars",
+            )
+            if metadata.get(key) is not None
+        }
+
+    ledger = {
+        "schema_version": TECHNICAL_EVIDENCE_SCHEMA_VERSION,
+        "symbol": str(symbol).upper(),
+        "status": status,
+        "scope": {
+            "market": "NSE cash equity",
+            "purpose": "explain_locked_deterministic_decision",
+            "decision_immutable": True,
+            "trading_advice_allowed": False,
+        },
+        "facts": {
+            "TA_DATA_QUALITY": {
+                "status": (
+                    "calculation_inputs_ready"
+                    if status == "ready"
+                    else "invalid_data"
+                ),
+                "validation_scope": "calculation_prerequisites_only",
+                "reason_codes": reason_codes,
+            }
+        },
+    }
+    if market_snapshot:
+        ledger["facts"]["TA_DATA_QUALITY"].update(
+            {
+                "observed_at": observed_at,
+                "completion_policy_id": market_snapshot.get(
+                    "completion_policy_id"
+                ),
+                "timeframes": compact_timeframes,
+            }
+        )
+    if status != "ready":
+        return ledger
+
+    evidence = assessment["evidence"]
+    policy = select_technical_policy(evidence["policy_id"])
+    threshold = float(evidence["family_engagement_threshold"])
+    required = set(evidence["required_positive_families"])
+
+    def family_fact(name):
+        score = float(evidence["families"][name])
+        state = _score_state(score, threshold)
+        return {
+            "score": score,
+            "state": state,
+            "engaged": abs(score) > threshold,
+            "required_positive": name in required,
+        }
+
+    facts = ledger["facts"]
+    family_states = {
+        family: _score_state(float(score), threshold)
+        for family, score in evidence["families"].items()
+    }
+    engaged_count = int(evidence["engaged_families"])
+    facts["TA_DECISION"] = {
+        "verdict": evidence["verdict"],
+        "score": evidence["score"],
+        "score_semantics": (
+            "policy_family_sum_not_probability_or_confidence"
+        ),
+        "confluence_ratio": evidence["confluence_ratio"],
+        "enabled_families": len(evidence["families"]),
+        "engaged_families": engaged_count,
+        "neutral_families": len(evidence["families"]) - engaged_count,
+        "required_confirmation_satisfied": evidence[
+            "required_confirmation_satisfied"
+        ],
+        "policy_id": evidence["policy_id"],
+        "policy_fingerprint": evidence["policy_fingerprint"],
+    }
+    facts["TA_TREND"] = {
+        **family_fact("trend"),
+        "role": "required_confirmation",
+        "scope": "weighted_across_daily_and_intraday_timeframes",
+        "explanation": (
+            "Weighted multi-timeframe trend evidence is "
+            f"{family_states['trend']}."
+        ),
+    }
+    facts["TA_MOMENTUM"] = {
+        **family_fact("momentum"),
+        "role": "required_confirmation",
+        "scope": "weighted_across_daily_and_intraday_timeframes",
+        "explanation": (
+            "Weighted multi-timeframe momentum evidence is "
+            f"{family_states['momentum']}."
+        ),
+    }
+    facts["TA_RSI"] = {
+        **family_fact("rsi"),
+        "role": "caution_only",
+        "rsi14": evidence["daily_rsi"],
+        "adaptive_band": list(evidence["rsi_band"]),
+        "interpretation": evidence["rsi_note"],
+    }
+    if evidence.get("relative_strength") is not None:
+        facts["TA_RELATIVE_STRENGTH"] = {
+            **family_fact("relative_strength"),
+            "role": "supporting_confirmation",
+            "score_at_clip": (
+                abs(float(evidence["families"]["relative_strength"])) >= 1
+            ),
+            "benchmark_symbol": evidence["benchmark_symbol"],
+            **evidence["relative_strength"],
+        }
+        facts["TA_RELATIVE_STRENGTH"]["explanation"] = (
+            f"Over {facts['TA_RELATIVE_STRENGTH']['lookback_sessions']} "
+            "sessions, the stock outperformed "
+            f"{evidence['benchmark_symbol']} by "
+            f"{facts['TA_RELATIVE_STRENGTH']['relative_return_pct']} "
+            "percentage points."
+        )
+    if evidence.get("participation") is not None:
+        facts["TA_PARTICIPATION"] = {
+            **family_fact("participation"),
+            "role": "confirmation_context",
+            **evidence["participation"],
+        }
+        facts["TA_PARTICIPATION"]["explanation"] = (
+            "Delivery participation is "
+            f"{facts['TA_PARTICIPATION']['participation_state']}."
+        )
+    participation = evidence.get("participation") or {}
+    delivery_freshness = _delivery_freshness(
+        observations,
+        participation,
+    )
+    benchmark_snapshot = (market_snapshot or {}).get("benchmark") or {}
+    benchmark_daily_metadata = (
+        benchmark_snapshot.get("timeframes") or {}
+    ).get("D") or {}
+    facts["TA_DATA_QUALITY"].update(
+        {
+            "benchmark": {
+                "symbol": evidence.get("benchmark_symbol"),
+                "sessions_aligned": (
+                    True
+                    if "relative_strength" in evidence["families"]
+                    else None
+                ),
+                "latest_complete_bar": benchmark_daily_metadata.get(
+                    "latest_complete_bar"
+                ),
+            },
+            "delivery": delivery_freshness,
+        }
+    )
+
+    timeframe_evidence = {}
+    conflicts = []
+    for timeframe, scores in evidence["breakdown"].items():
+        trend_state = _score_state(
+            float(scores["trend_score"]),
+            threshold,
+        )
+        momentum_state = _score_state(
+            float(scores["momentum_score"]),
+            threshold,
+        )
+        timeframe_evidence[timeframe] = {
+            "weight": evidence["timeframe_weights"][timeframe],
+            **scores,
+            "trend_state": trend_state,
+            "momentum_state": momentum_state,
+        }
+        if trend_state == "negative":
+            conflicts.append(
+                {
+                    "id": f"TA_TIMEFRAME_{timeframe}_TREND_NEGATIVE",
+                    "statement": (
+                        f"{_session_label(timeframe)} trend is negative."
+                    ),
+                }
+            )
+        if momentum_state == "negative":
+            conflicts.append(
+                {
+                    "id": (
+                        f"TA_TIMEFRAME_{timeframe}_MOMENTUM_NEGATIVE"
+                    ),
+                    "statement": (
+                        f"{_session_label(timeframe)} momentum is negative."
+                    ),
+                }
+            )
+    facts["TA_TIMEFRAMES"] = {
+        "daily_anchor": True,
+        "families_are_collapsed_before_confluence": True,
+        "timeframes": timeframe_evidence,
+    }
+
+    daily_context = (
+        _daily_context(
+            indicators_by_timeframe,
+            evidence,
+            observations,
+            policy,
+        )
+        if indicators_by_timeframe
+        else None
+    )
+    if daily_context is not None:
+        facts["TA_DAILY_CONTEXT"] = daily_context
+        if (
+            daily_context["return_1_session_pct"] < 0
+            and daily_context["return_5_sessions_pct"] > 0
+        ):
+            conflicts.append(
+                {
+                    "id": "TA_DAILY_PULLBACK_WITH_POSITIVE_5_SESSION_RETURN",
+                    "statement": (
+                        "The latest daily return is negative while the "
+                        "five-session return remains positive."
+                    ),
+                }
+            )
+
+    driver_fact_ids = []
+    for fact_id, family in (
+        ("TA_TREND", "trend"),
+        ("TA_MOMENTUM", "momentum"),
+        ("TA_RELATIVE_STRENGTH", "relative_strength"),
+        ("TA_PARTICIPATION", "participation"),
+    ):
+        if family_states.get(family) == "positive":
+            driver_fact_ids.append(fact_id)
+
+    neutral_context = []
+    if family_states.get("rsi") == "neutral":
+        neutral_context.append(
+            {
+                "id": "TA_RSI_NEUTRAL",
+                "statement": "RSI is neutral within its adaptive band.",
+            }
+        )
+    if family_states.get("participation") == "neutral":
+        if participation.get("available"):
+            neutral_context.append(
+                {
+                    "id": "TA_PARTICIPATION_NEUTRAL",
+                    "statement": (
+                        "Delivery participation is available but "
+                        "unconfirmed."
+                    ),
+                }
+            )
+        else:
+            neutral_context.append(
+                {
+                    "id": "TA_PARTICIPATION_UNAVAILABLE",
+                    "statement": "Delivery participation is unavailable.",
+                }
+            )
+
+    data_notes = [
+        {
+            "id": "TA_VALIDATION_SCOPE",
+            "statement": (
+                "Input readiness covers calculation prerequisites, not "
+                "comprehensive market-data certification."
+            ),
+        }
+    ]
+    if delivery_freshness["freshness"] == "expected_prior_completed_session":
+        data_notes.append(
+            {
+                "id": "TA_DELIVERY_EXPECTED_PRIOR_SESSION",
+                "statement": (
+                    "Delivery evidence is from the expected prior completed "
+                    "session."
+                ),
+            }
+        )
+    elif delivery_freshness["freshness"] == "stale":
+        data_notes.append(
+            {
+                "id": "TA_DELIVERY_STALE",
+                "statement": "Delivery evidence is stale.",
+            }
+        )
+
+    ledger["interpretation"] = {
+        "driver_fact_ids": driver_fact_ids[:3],
+        "conflicts": conflicts[:3],
+        "neutral_context": neutral_context[:3],
+        "data_notes": data_notes[:3],
+    }
+    return ledger
 
 
 def replay_technical_policies(

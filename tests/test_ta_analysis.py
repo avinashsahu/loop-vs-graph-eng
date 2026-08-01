@@ -190,12 +190,137 @@ class TechnicalAssessmentTests(unittest.TestCase):
             percentage_only.evidence["families"]["participation"],
             0.0,
         )
+        self.assertEqual(
+            percentage_only.evidence["participation"][
+                "participation_state"
+            ],
+            "available_neutral",
+        )
+        self.assertTrue(
+            percentage_only.evidence["participation"][
+                "delivery_percentage_directional"
+            ]
+        )
         self.assertEqual(percentage_only.verdict, "BAD")
         self.assertGreater(
             volume_confirmed.evidence["families"]["participation"],
             0,
         )
+        self.assertEqual(
+            volume_confirmed.evidence["participation"][
+                "participation_state"
+            ],
+            "possible_accumulation",
+        )
         self.assertEqual(volume_confirmed.verdict, "GOOD")
+        ledger = ta_analysis.build_technical_fact_ledger(
+            "TEST",
+            volume_confirmed,
+        )
+        self.assertEqual(
+            ledger["facts"]["TA_PARTICIPATION"]["participation_state"],
+            "possible_accumulation",
+        )
+        self.assertEqual(
+            ledger["facts"]["TA_DECISION"]["verdict"],
+            "GOOD",
+        )
+
+    def test_explanation_ledger_preclassifies_context_and_freshness(self):
+        histories = {
+            timeframe: _bullish_history()
+            for timeframe in ("D", "30", "15", "5")
+        }
+        histories["D"]["volume"] = np.linspace(100_000, 200_000, 60)
+        observations = ta_analysis.TechnicalObservations(
+            histories=histories,
+            benchmark_daily=_bullish_history(),
+            benchmark_symbol="JUNIORBEES",
+            delivery_trend={
+                "status": "ready",
+                "delivery_pct_trend": "falling",
+                "delivery_volume_trend": "falling",
+                "recent_avg_total_volume": 200_000.0,
+                "baseline_avg_total_volume": 250_000.0,
+                "latest_vwap": 110.0,
+                "latest_date": "2026-02-28",
+                "interpretation": "mixed_or_neutral",
+            },
+        )
+        policy = ta_analysis.select_technical_policy(
+            "technical-relative-participation-v2"
+        )
+        assessment = ta_analysis.evaluate_technical(
+            observations,
+            policy,
+        )
+
+        ledger = ta_analysis.build_technical_fact_ledger(
+            "TEST",
+            assessment,
+            {
+                "observed_at": "2026-03-01T16:00:00+05:30",
+                "completion_policy_id": "nse-completed-bars-v1",
+            },
+            observations,
+        )
+
+        self.assertEqual(
+            ledger["schema_version"],
+            "technical-explanation-input-v2",
+        )
+        self.assertEqual(
+            ledger["facts"]["TA_DECISION"]["score_semantics"],
+            "policy_family_sum_not_probability_or_confidence",
+        )
+        self.assertEqual(
+            ledger["facts"]["TA_DATA_QUALITY"]["delivery"],
+            {
+                "status": "ready",
+                "latest_session": "2026-02-28",
+                "lag_sessions": 1,
+                "freshness": "expected_prior_completed_session",
+            },
+        )
+        self.assertIn("TA_TREND", ledger["interpretation"]["driver_fact_ids"])
+        self.assertIn(
+            "TA_PARTICIPATION_NEUTRAL",
+            {
+                item["id"]
+                for item in ledger["interpretation"]["neutral_context"]
+            },
+        )
+        self.assertIn("atr_pct", ledger["facts"]["TA_DAILY_CONTEXT"])
+        self.assertIn(
+            "trend_state",
+            ledger["facts"]["TA_TIMEFRAMES"]["timeframes"]["D"],
+        )
+
+    def test_relative_strength_rejects_misaligned_trading_sessions(self):
+        histories = {
+            timeframe: _bullish_history()
+            for timeframe in ("D", "30", "15", "5")
+        }
+        benchmark = _bullish_history()
+        benchmark["datetime"] += pd.Timedelta(days=1)
+        policy = ta_analysis.select_technical_policy(
+            "technical-relative-participation-v2"
+        )
+
+        assessment = ta_analysis.evaluate_technical(
+            ta_analysis.TechnicalObservations(
+                histories=histories,
+                benchmark_daily=benchmark,
+                benchmark_symbol="JUNIORBEES",
+            ),
+            policy,
+        )
+
+        self.assertEqual(assessment.status, "invalid_data")
+        self.assertIn(
+            "MISALIGNED_BENCHMARK_SESSIONS",
+            assessment.reason_codes,
+        )
 
     def test_insufficient_daily_history_is_rejected_before_scoring(self):
         histories = {

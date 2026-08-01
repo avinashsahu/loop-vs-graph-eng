@@ -46,6 +46,9 @@ XBRL_UNIVERSE_INDEX = os.environ.get(
 XBRL_UNIVERSE_BATCH_SIZE = int(
     os.environ.get("APP_XBRL_UNIVERSE_BATCH_SIZE", "25")
 )
+DISCLOSURE_WARM_LIMIT = int(
+    os.environ.get("APP_DISCLOSURE_WARM_LIMIT", "100")
+)
 
 _stop_requested = False
 
@@ -337,6 +340,24 @@ def configured_jobs() -> tuple[Job, ...]:
                 weekdays_only=True,
             ),
             enabled=_env_flag("APP_ENABLE_XBRL_WARM"),
+        ),
+        Job(
+            name="material_disclosures_warm",
+            command=(
+                python,
+                "warm_disclosures.py",
+                "--universe-index",
+                XBRL_UNIVERSE_INDEX,
+                "--limit",
+                str(DISCLOSURE_WARM_LIMIT),
+            ),
+            occurrence=_daily_occurrence(
+                "APP_DISCLOSURE_WARM_TIME_IST",
+                "17:30",
+                max_lateness_hours=6,
+                weekdays_only=True,
+            ),
+            enabled=_env_flag("APP_ENABLE_DISCLOSURE_WARM"),
         ),
         Job(
             name="evaluation_update",

@@ -1,12 +1,12 @@
 import os
 import time
 
-from nsemine.bin.scraper import get_request
-
 import cache
 from financial_results import get_financial_history
 from logging_config import setup_logging
+from material_disclosures import get_material_disclosures
 from market_time import now_ist_naive
+from nse_client import get_request
 
 log = setup_logging("fundamentals")
 
@@ -27,10 +27,13 @@ def _next_api_get(function_name, params):
     # get_fundamental_snapshot fires ~7 requests back to back for one symbol, on top of
     # NSE_SCAN_DELAY_SECONDS between symbols in a batch scan.
     time.sleep(FUNDAMENTALS_CALL_DELAY_SECONDS)
-    if resp is None:
-        # get_request already retried internally and gave up -- treat as a real failure,
-        # not "no data", so the caller doesn't cache a snapshot degraded by this field.
-        raise ConnectionError(f"NSE request failed for functionName={function_name}")
+    if resp is None or resp.status_code >= 400:
+        # Treat transport and HTTP failures as real failures, not "no data", so the
+        # caller doesn't cache a snapshot degraded by this field.
+        status = resp.status_code if resp is not None else "unavailable"
+        raise ConnectionError(
+            f"NSE request failed for functionName={function_name}: HTTP {status}"
+        )
     return resp.json()
 
 
@@ -125,17 +128,22 @@ def _extract_eps_pat(symbol, peer_data):
 
 
 def get_fundamental_snapshot(symbol: str) -> dict:
-    key = f"fundamentals_v2_{symbol}_{now_ist_naive():%Y%m%d}"
+    key = f"fundamentals_v5_{symbol}_{now_ist_naive():%Y%m%d}"
     ttl_seconds = FUNDAMENTALS_CACHE_TTL_HOURS * 3600
 
     hit = cache.read(key, ttl_seconds)
     if hit is not None:
+        # The disclosure feed has its own independently warmed lifecycle. Re-read
+        # that local cache on every scan so a completed warm is visible immediately
+        # without invalidating or refetching the slower fundamental snapshot.
+        hit["material_disclosures"] = get_material_disclosures(symbol)
         return hit
 
     snapshot = {
         "as_of": now_ist_naive().date().isoformat(),
         "company_name": None,
         "corp_announcements": None,
+        "material_disclosures": None,
         "corp_actions": None,
         "shareholding_pattern": None,
         "yearwise_returns": None,
@@ -150,11 +158,20 @@ def get_fundamental_snapshot(symbol: str) -> dict:
 
     for field, fetch in (
         ("company_name", lambda: _get_symbol_name(symbol)),
-        ("corp_announcements", lambda: _get_corp_announcements(symbol)),
+        (
+            "material_disclosures",
+            lambda: get_material_disclosures(symbol),
+        ),
         ("corp_actions", lambda: _get_corp_actions(symbol)),
         ("shareholding_pattern", lambda: _get_shareholding_pattern(symbol)),
         ("yearwise_returns", lambda: _get_yearwise_returns(symbol)),
-        ("financial_history", lambda: get_financial_history(symbol)),
+        (
+            "financial_history",
+            lambda: get_financial_history(
+                symbol,
+                company_name=snapshot.get("company_name"),
+            ),
+        ),
     ):
         try:
             snapshot[field] = fetch()

@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 # was silently ignored because `import fundamentals` (below) ran before load_dotenv().
 load_dotenv()
 
+import hashlib
 import json
 import math
 import os
@@ -14,8 +15,6 @@ import time
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
-
-from nsemine.live import get_stock_live_quotes
 
 import bhavcopy
 import fundamentals
@@ -32,10 +31,14 @@ from fundamental_research import (
     FUNDAMENTAL_POLICY_VERSION,
     evaluate_fundamental_research,
 )
+from nse_client import get_stock_live_quotes
 from llm import (
     FUNDAMENTAL_SCHEMA_VERSION,
+    TECHNICAL_EXPLANATION_PROMPT_VERSION,
+    TECHNICAL_EXPLANATION_SCHEMA_VERSION,
     active_model_config,
     assess_fundamentals,
+    summarize_technical_run,
 )
 from logging_config import setup_logging
 from market_time import now_ist
@@ -67,7 +70,7 @@ TECHNICAL_POLICY = ta_analysis.select_technical_policy(NSE_TECHNICAL_POLICY_ID)
 NSE_POLICY_VERSION = os.environ.get(
     "NSE_POLICY_VERSION",
     f"{NSE_TECHNICAL_POLICY_ID}+risk-atr-target-v3"
-    "+sentiment-volatility-v1+fundamental-sector-v1+llm-prompts-v6",
+    "+sentiment-volatility-v1+fundamental-sector-v3+llm-prompts-v7",
 )
 
 log = setup_logging("nse")
@@ -155,9 +158,8 @@ def node_fetch(state):
     state["quote"] = get_stock_live_quotes(state["symbol"])
     time.sleep(nse_data.NSE_CALL_DELAY_SECONDS)  # was the one unthrottled call in the pipeline
 
-    # get_stock_live_quotes returns None on error, and can occasionally return a raw
-    # dict missing expected keys on an internal nsemine exception -- checking here once
-    # avoids a raw crash (and a missing log record) deeper in node_risk/node_sentiment.
+    # A failed response can be None or malformed. Checking here once avoids a raw crash
+    # (and a missing log record) deeper in node_risk/node_sentiment.
     required_quote_keys = (
         "name", "sector", "changepct", "previous_close", "change", "upper_circuit", "lower_circuit",
     )
@@ -200,25 +202,32 @@ def node_technical(state):
     snapshot_metadata = state.get("market_snapshot") or {}
     benchmark_metadata = snapshot_metadata.get("benchmark") or {}
     completed_at = benchmark_metadata.get("observed_at")
-    assessment = ta_analysis.evaluate_technical(
-        ta_analysis.TechnicalObservations(
-            histories=state["hist_multi"],
-            benchmark_daily=state.get("benchmark_daily"),
-            benchmark_symbol=benchmark_metadata.get("symbol"),
-            delivery_trend=state.get("delivery_trend"),
-            completed_at=(
-                datetime.fromisoformat(completed_at)
-                if completed_at
-                else None
-            ),
-            completion_policy_id=snapshot_metadata.get(
-                "completion_policy_id"
-            ),
+    observations = ta_analysis.TechnicalObservations(
+        histories=state["hist_multi"],
+        benchmark_daily=state.get("benchmark_daily"),
+        benchmark_symbol=benchmark_metadata.get("symbol"),
+        delivery_trend=state.get("delivery_trend"),
+        completed_at=(
+            datetime.fromisoformat(completed_at)
+            if completed_at
+            else None
         ),
+        completion_policy_id=snapshot_metadata.get(
+            "completion_policy_id"
+        ),
+    )
+    assessment = ta_analysis.evaluate_technical(
+        observations,
         TECHNICAL_POLICY,
     )
     state["technical_indicators"] = assessment.indicators
     state["technical_assessment"] = assessment.to_dict()
+    state["technical_fact_ledger"] = ta_analysis.build_technical_fact_ledger(
+        state.get("symbol", "UNKNOWN"),
+        assessment,
+        state.get("market_snapshot"),
+        observations,
+    )
     log.info(
         "iter=%d technical_status=%s indicators=%s",
         state["iters"],
@@ -240,10 +249,24 @@ def node_technical(state):
 
     result = assessment.evidence
     verdict_label = "GOOD" if result["verdict"] == "GOOD" else "REJECT"
+    relative_strength = result.get("relative_strength") or {}
+    participation = result.get("participation") or {}
+    context = ""
+    if relative_strength:
+        context += (
+            f"relative strength={relative_strength['relative_return_pct']}% "
+            f"vs {result['benchmark_symbol']}; "
+        )
+    if participation:
+        context += (
+            f"participation={participation['participation_state']} "
+            f"(score={result['families']['participation']}); "
+        )
     state["technical_verdict"] = (
         f"{verdict_label} (score={result['score']}, confluence={result['confluence_ratio']} "
         f"of {result['engaged_families']} engaged families): families={result['families']}; "
         f"daily RSI14={result['daily_rsi']} {result['rsi_note']} (adaptive band={result['rsi_band']}); "
+        f"{context}"
         f"per-timeframe {result['breakdown']}"
     )
     log.info("iter=%d technical_verdict=%r", state["iters"], state["technical_verdict"])
@@ -252,6 +275,63 @@ def node_technical(state):
         return "fundamental", state
     _set_decision_reason(state, "technical", "TECHNICAL_CONFLUENCE_FAILED")
     return "abort", state
+
+
+def node_technical_explanation(state):
+    """Explain an already locked decision; failures always preserve the decision."""
+    ledger = state.get("technical_fact_ledger")
+    state["technical_explanation"] = None
+    state["technical_explanation_meta"] = {
+        "prompt_version": TECHNICAL_EXPLANATION_PROMPT_VERSION,
+        "schema_version": TECHNICAL_EXPLANATION_SCHEMA_VERSION,
+        "input_schema_version": (ledger or {}).get("schema_version"),
+        "input_hash": (
+            hashlib.sha256(
+                json.dumps(
+                    ledger,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()[:16]
+            if ledger
+            else None
+        ),
+        "status": "missing_input",
+        "output_valid": False,
+        "fallback_used": True,
+        "response_chars": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "reasoning_tokens": None,
+    }
+    if not ledger:
+        return None, state
+
+    try:
+        run = summarize_technical_run(ledger)
+    except Exception:
+        state["technical_explanation_meta"]["status"] = "backend_error"
+        log.warning(
+            "technical explanation failed for %s; deterministic fallback retained",
+            state.get("symbol"),
+            exc_info=True,
+        )
+        return None, state
+
+    state["technical_explanation_meta"].update(
+        {
+            "status": run.status,
+            "output_valid": run.output_valid,
+            "fallback_used": not run.output_valid,
+            "response_chars": run.response_chars,
+            "prompt_tokens": run.prompt_tokens,
+            "completion_tokens": run.completion_tokens,
+            "reasoning_tokens": run.reasoning_tokens,
+        }
+    )
+    if run.output_valid:
+        state["technical_explanation"] = run.explanation.to_dict()
+    return None, state
 
 
 def node_fundamental(state):
@@ -360,9 +440,8 @@ def node_fundamental(state):
 
 def node_risk(state):
     quote = state["quote"]
-    # nsemine's upper_circuit/lower_circuit fields are swapped — correct on read.
-    lower_circuit = quote["upper_circuit"]
-    upper_circuit = quote["lower_circuit"]
+    lower_circuit = quote["lower_circuit"]
+    upper_circuit = quote["upper_circuit"]
     price = quote["previous_close"] + quote["change"]
 
     # Compute today's low/high from the 5-minute bars (5 min TTL, refreshes through the
@@ -576,6 +655,11 @@ def build_record(state):
         "iters": state["iters"],
         "technical_indicators": state.get("technical_indicators"),
         "technical_assessment": state.get("technical_assessment"),
+        "technical_fact_ledger": state.get("technical_fact_ledger"),
+        "technical_explanation": state.get("technical_explanation"),
+        "technical_explanation_meta": state.get(
+            "technical_explanation_meta"
+        ),
         "market_snapshot": state.get("market_snapshot"),
         "technical_verdict": state.get("technical_verdict"),
         "fundamental_verdict": state.get("fundamental_verdict"),
@@ -649,6 +733,31 @@ class ProductionScanAdapter:
                     tuple(timings),
                 )
             node = next_node
+
+        if state.get("disposition") in {"PROPOSE", "REVIEW"}:
+            explanation_started = time.perf_counter()
+            try:
+                _, state = node_technical_explanation(state)
+            except Exception:
+                # The explanatory model is deliberately outside decision routing.
+                # Even an implementation defect here must not erase a completed
+                # deterministic disposition.
+                state["technical_explanation"] = None
+                state["technical_explanation_meta"] = {
+                    "status": "internal_error",
+                    "output_valid": False,
+                    "fallback_used": True,
+                }
+                log.warning(
+                    "technical explanation stage failed after disposition",
+                    exc_info=True,
+                )
+            timings.append(
+                StageTiming(
+                    "technical_explanation",
+                    (time.perf_counter() - explanation_started) * 1000,
+                )
+            )
 
         return ScanExecution(
             record=build_record(state),
@@ -731,6 +840,9 @@ def _initial_scan_state(request):
         "circuit_context": None,
         "technical_indicators": None,
         "technical_assessment": None,
+        "technical_fact_ledger": None,
+        "technical_explanation": None,
+        "technical_explanation_meta": None,
         "technical_verdict": None,
         "fundamental_verdict": None,
         "fundamental_assessment": None,

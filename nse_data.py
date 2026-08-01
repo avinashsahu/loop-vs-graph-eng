@@ -5,11 +5,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import pandas as pd
-from nsemine.historical import get_stock_historical_data
-from nsemine.live import get_index_constituents_live_snapshot
 
 import cache
-from market_time import MARKET_CLOSE, MARKET_OPEN, is_market_hours, now_host_local, now_ist
+from market_time import MARKET_CLOSE, MARKET_OPEN, is_market_hours, now_ist
+from nse_client import (
+    get_index_constituents_live_snapshot,
+    get_stock_historical_data,
+)
 
 INTRADAY_CACHE_TTL_MINUTES = float(os.environ.get("INTRADAY_CACHE_TTL_MINUTES", "5"))
 NSE_CALL_DELAY_SECONDS = float(os.environ.get("NSE_CALL_DELAY_SECONDS", "0.3"))
@@ -45,19 +47,14 @@ class MarketSnapshot:
 
 
 def get_index_symbols(index_name: str = "NIFTY 50") -> list[str]:
-    # nsemine's own docstring example calls this index_name=, but the real keyword is `index`.
     df = get_index_constituents_live_snapshot(index=index_name)
     return df["symbol"].tolist()
 
 
-def _fetch_history(symbol, interval, lookback_days):
-    # now_host_local(), NOT now_ist_naive() -- nsemine converts these to an epoch via
-    # .timestamp(), which interprets a naive datetime as host-local time. now_host_local()
-    # is the real current instant expressed in the host's own local time, which is exactly
-    # what .timestamp() needs to round-trip to the correct absolute instant regardless of
-    # what the host's timezone actually is. (now_ist_naive() would get misinterpreted as
-    # host-local on a non-IST host, silently shifting the whole fetch window.)
-    end = now_host_local()
+def _fetch_history(symbol, interval, lookback_days, observed_at):
+    # The project-owned client accepts timezone-aware datetimes and converts the actual
+    # instant to epoch seconds, so this remains correct regardless of the host timezone.
+    end = observed_at
     start = end - timedelta(days=lookback_days)
     result = get_stock_historical_data(symbol, start_datetime=start, end_datetime=end, interval=interval)
     # Only fires on an actual cache miss (fetch_fn only runs then) -- was previously the
@@ -131,7 +128,12 @@ def get_market_snapshot(
         key, ttl = _cache_key_and_ttl(symbol, interval, observed_at)
 
         def fetch_fn(interval=interval, lookback_days=lookback_days):
-            return _fetch_history(symbol, interval, lookback_days).to_json(orient="split", date_format="iso")
+            return _fetch_history(
+                symbol,
+                interval,
+                lookback_days,
+                observed_at,
+            ).to_json(orient="split", date_format="iso")
 
         cached_history = cache.cached_entry(key, ttl, fetch_fn)
         history = pd.read_json(io.StringIO(cached_history.data), orient="split")
@@ -139,7 +141,7 @@ def get_market_snapshot(
         interval_key = str(interval)
         histories[interval_key] = completed
         provenance[interval_key] = {
-            "source": "NSE via nsemine",
+            "source": "NSE chart API",
             "market_phase": phase,
             "cache_key": key,
             "cache_ttl_seconds": ttl,

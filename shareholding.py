@@ -14,14 +14,14 @@ from typing import Protocol
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
-from nsemine.bin.scraper import get_request
+from nse_client import get_request
 
 _XBRLI = "http://www.xbrl.org/2003/instance"
 _XBRLDI = "http://xbrl.org/2006/xbrldi"
 _XLINK = "http://www.w3.org/1999/xlink"
 _MANIFEST_URL = "https://www.nseindia.com/api/corporate-share-holdings-master"
 _IST = ZoneInfo("Asia/Kolkata")
-PARSER_VERSION = "nse-shp-xbrl-v3"
+PARSER_VERSION = "nse-shp-xbrl-v4"
 _live_service = None
 _warm_service = None
 _registry_store = None
@@ -29,6 +29,7 @@ _MEMBERS = {
     "InstitutionsForeignMember": "fii",
     "InstitutionsDomesticMember": "dii",
     "GovernmentsMember": "government",
+    "GovermentsMember": "government",
     "NonInstitutionsMember": "other_public",
     "PublicShareholdingMember": "public",
     "PromoterAndPromoterGroupMember": "promoter",
@@ -184,7 +185,11 @@ class NseShareholdingSource:
 
         filings = []
         for row in rows:
-            if not row.get("recordId") or not row.get("xbrl") or not row.get("date"):
+            if (
+                not row.get("recordId")
+                or not _is_usable_xbrl_url(row.get("xbrl"))
+                or not row.get("date")
+            ):
                 continue
             period = (
                 datetime.strptime(row["date"], "%d-%b-%Y")
@@ -196,7 +201,10 @@ class NseShareholdingSource:
                 "record_id": str(row["recordId"]),
                 "period": period,
                 "url": row["xbrl"],
-                "revised": row.get("revisedData") == "Y",
+                "revised": str(
+                    row.get("revisedData") or row.get("revisedStatus") or ""
+                ).strip().upper()
+                in {"Y", "YES", "REVISED"},
                 "published_at": row.get("revisionDate")
                 or row.get("systemDate")
                 or row.get("submissionDate"),
@@ -208,19 +216,16 @@ class NseShareholdingSource:
         return self._request(filing["url"]).content
 
     def _request(self, url: str, params: dict | None = None):
-        for attempt in range(3):
-            response = get_request(url, params=params)
-            time.sleep(self._delay + random.uniform(0, self._jitter))
-            if response is not None and response.status_code < 400:
-                return response
-            if response is not None and response.status_code in {401, 403, 429}:
-                raise NseShareholdingRequestError(
-                    f"NSE blocked shareholding request with HTTP {response.status_code}"
-                )
-            if attempt < 2:
-                time.sleep(self._delay * (2**attempt))
+        response = get_request(url, params=params)
+        time.sleep(self._delay + random.uniform(0, self._jitter))
+        if response is not None and response.status_code < 400:
+            return response
+        if response is not None and response.status_code in {401, 403, 429}:
+            raise NseShareholdingRequestError(
+                f"NSE blocked shareholding request with HTTP {response.status_code}"
+            )
         raise NseShareholdingRequestError(
-            "NSE shareholding request failed repeatedly; warmer stopped"
+            "NSE shareholding request failed repeatedly"
         )
 
 
@@ -467,6 +472,8 @@ class AerospikeFilingStore:
         *,
         complete: bool,
         periods_available: int,
+        reason_code: str | None = None,
+        error_detail: str | None = None,
     ) -> None:
         now_epoch = int(time.time())
         bins = {
@@ -476,6 +483,8 @@ class AerospikeFilingStore:
             "last_attempt": now_epoch,
             "last_status": "complete" if complete else "incomplete",
             "periods": periods_available,
+            "last_reason": reason_code or "",
+            "last_error": (error_detail or "")[:1024],
         }
         if complete:
             bins["completed_at"] = now_epoch
@@ -525,10 +534,16 @@ class ShareholdingHistoryService:
             manifest_fresh = True
         by_period: dict[str, list[dict]] = {}
         for filing in filings:
+            if (
+                not _is_canonical_quarter_end(filing.get("period"))
+                or not _is_usable_xbrl_url(filing.get("url"))
+            ):
+                continue
             by_period.setdefault(filing["period"], []).append(filing)
         selected_periods = sorted(by_period, reverse=True)[:periods]
         normalized = []
         pending = []
+        request_errors = []
         for filing_period in selected_periods:
             candidates = sorted(
                 by_period[filing_period], key=_revision_rank, reverse=True
@@ -542,15 +557,22 @@ class ShareholdingHistoryService:
                 continue
 
             last_parse_error = None
+            last_request_error = None
             for filing in candidates:
                 try:
                     normalized.append(self._load(filing))
                     break
                 except ShareholdingError as error:
                     last_parse_error = error
+                except NseShareholdingRequestError as error:
+                    last_request_error = error
             else:
                 if last_parse_error is not None:
                     raise last_parse_error
+                if last_request_error is not None:
+                    request_errors.append(last_request_error)
+        if not normalized and request_errors:
+            raise request_errors[-1]
         if pending:
             self._store.enqueue_warm(symbol, pending)
             return _history(
@@ -649,12 +671,16 @@ def record_shareholding_universe_attempt(
     *,
     complete: bool,
     periods_available: int,
+    reason_code: str | None = None,
+    error_detail: str | None = None,
 ) -> None:
     _universe_store().record_universe_attempt(
         universe,
         symbol,
         complete=complete,
         periods_available=periods_available,
+        reason_code=reason_code,
+        error_detail=error_detail,
     )
 
 
@@ -752,6 +778,26 @@ def _revision_rank(filing: dict) -> tuple[bool, str, int]:
     )
 
 
+def _is_canonical_quarter_end(period: object) -> bool:
+    value = str(period or "")
+    return value[4:] in {
+        "-03-31",
+        "-06-30",
+        "-09-30",
+        "-12-31",
+    }
+
+
+def _is_usable_xbrl_url(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower()
+    path = normalized.split("?", 1)[0].split("#", 1)[0]
+    return normalized.startswith(("https://", "http://")) and path.endswith(
+        ".xml"
+    )
+
+
 def _local_name(value: str) -> str:
     return value.rsplit("}", 1)[-1].split(":", 1)[-1]
 
@@ -766,10 +812,29 @@ def _parse_xbrl(
 
     schema_ref = root.find(".//{http://www.xbrl.org/2003/linkbase}schemaRef")
     href = schema_ref.get(f"{{{_XLINK}}}href", "") if schema_ref is not None else ""
-    match = re.search(r"in-bse-shp-(\d{4}-\d{2}-\d{2})\.xsd", href)
+    match = re.search(
+        r"(?:^|/)(?:in-bse-shp|in-capmkt)-(\d{4}-\d{2}-\d{2})\.xsd"
+        r"(?:[?#].*)?$",
+        href,
+    )
     if match is None:
         raise ShareholdingError(f"unknown shareholding schema for record {record_id}")
     schema_version = match.group(1)
+
+    fact_period = expected_period
+    instant_periods = {
+        instant.text.strip()
+        for instant in root.findall(f".//{{{_XBRLI}}}instant")
+        if instant.text and instant.text.strip()
+    }
+    if expected_period not in instant_periods and _is_canonical_quarter_end(
+        expected_period
+    ):
+        next_day = (
+            date.fromisoformat(expected_period) + timedelta(days=1)
+        ).isoformat()
+        if next_day in instant_periods:
+            fact_period = next_day
 
     contexts: dict[str, str] = {}
     for context in root.findall(f".//{{{_XBRLI}}}context"):
@@ -779,7 +844,7 @@ def _parse_xbrl(
             not context_id
             or instant is None
             or not instant.text
-            or instant.text.strip() != expected_period
+            or instant.text.strip() != fact_period
         ):
             continue
         category_members = [
@@ -852,5 +917,9 @@ def _parse_xbrl(
         checksum=hashlib.sha256(payload).hexdigest(),
         schema_ref=href,
         parser_version=PARSER_VERSION,
-        validation_status="reconciled",
+        validation_status=(
+            "reconciled"
+            if fact_period == expected_period
+            else "reconciled_manifest_period_plus_1d"
+        ),
     )

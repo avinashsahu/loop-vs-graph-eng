@@ -6,10 +6,10 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from dotenv import load_dotenv
-from nsemine import archives
 
 from logging_config import setup_logging
 from market_time import now_ist
+from nse_client import get_daily_bhavcopy_and_deliverables_data
 
 load_dotenv()
 
@@ -54,7 +54,7 @@ class _FetchedArchive:
 
 
 def _fetch_and_store_day(trade_date=None):
-    df = archives.get_daily_bhavcopy_and_deliverables_data(
+    df = get_daily_bhavcopy_and_deliverables_data(
         series="EQ",
         trade_date=trade_date,
     )
@@ -218,7 +218,13 @@ def get_delivery_trend(symbol, recent_days=5, baseline_days=20):
             "latest_date": rows[0][0] if rows else None,
         }
 
-    if any(value is None for row in rows for value in row[1:6]):
+    # The latest VWAP is required downstream to estimate recent turnover. Treat a
+    # missing value as unavailable evidence; coercing it to zero would incorrectly
+    # classify the symbol as illiquid and turn missing data into a negative score.
+    if (
+        any(value is None for row in rows for value in row[1:6])
+        or rows[0][6] is None
+    ):
         return {
             "status": "missing_values",
             "days_of_history": len(rows),

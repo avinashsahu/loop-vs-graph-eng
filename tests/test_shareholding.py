@@ -1,18 +1,32 @@
 import unittest
+from unittest.mock import patch
 
 from shareholding import (
+    NseShareholdingRequestError,
+    NseShareholdingSource,
     ShareholdingError,
     ShareholdingHistoryService,
     select_due_universe_symbols,
 )
 
 
-def _xbrl(schema_date, period, fii, dii, government, other):
+def _xbrl(
+    schema_date,
+    period,
+    fii,
+    dii,
+    government,
+    other,
+    schema_family="in-bse-shp",
+    instant_period=None,
+    government_member="Governments",
+):
+    instant_period = instant_period or period
     public = fii + dii + government + other
     members = {
         "InstitutionsForeign": fii,
         "InstitutionsDomestic": dii,
-        "Governments": government,
+        government_member: government,
         "NonInstitutions": other,
         "PublicShareholding": public,
     }
@@ -20,7 +34,7 @@ def _xbrl(schema_date, period, fii, dii, government, other):
         f"""
         <xbrli:context id="{name}_ContextI">
           <xbrli:entity><xbrli:identifier scheme="test">FEDERALBNK</xbrli:identifier></xbrli:entity>
-          <xbrli:period><xbrli:instant>{period}</xbrli:instant></xbrli:period>
+          <xbrli:period><xbrli:instant>{instant_period}</xbrli:instant></xbrli:period>
           <xbrli:scenario>
             <xbrldi:explicitMember dimension="shp:CategoryOfShareholdersAxis">
               shp:{name}Member
@@ -44,8 +58,8 @@ def _xbrl(schema_date, period, fii, dii, government, other):
       xmlns:xbrldi="http://xbrl.org/2006/xbrldi"
       xmlns:link="http://www.xbrl.org/2003/linkbase"
       xmlns:xlink="http://www.w3.org/1999/xlink"
-      xmlns:shp="http://www.bseindia.com/xbrl/shp/{schema_date}/in-bse-shp">
-      <link:schemaRef xlink:href="in-bse-shp-{schema_date}.xsd"/>
+      xmlns:shp="https://www.sebi.gov.in/xbrl/SHP_Exchange_Specific/{schema_date}/{schema_family}">
+      <link:schemaRef xlink:href="{schema_family}-{schema_date}.xsd"/>
       {contexts}
       {facts}
     </xbrli:xbrl>""".encode()
@@ -53,7 +67,13 @@ def _xbrl(schema_date, period, fii, dii, government, other):
 
 class _Source:
     def __init__(self, filings):
-        self.filings = filings
+        self.filings = [
+            {
+                "url": f"https://example.invalid/{filing['record_id']}.xml",
+                **filing,
+            }
+            for filing in filings
+        ]
         self.downloads = []
 
     def list_filings(self, symbol):
@@ -61,6 +81,8 @@ class _Source:
 
     def download(self, filing):
         self.downloads.append(filing["record_id"])
+        if filing.get("error"):
+            raise filing["error"]
         return filing["xml"]
 
 
@@ -99,6 +121,154 @@ class _Store:
 
 
 class ShareholdingHistoryTests(unittest.TestCase):
+    def test_one_missing_archive_keeps_other_verified_quarters(self):
+        filings = [
+            {
+                "record_id": str(index),
+                "period": period,
+                "xml": _xbrl(
+                    "2025-10-31",
+                    period,
+                    250_000,
+                    500_000,
+                    0,
+                    250_000,
+                ),
+            }
+            for index, period in enumerate(
+                (
+                    "2026-06-30",
+                    "2026-03-31",
+                    "2025-12-31",
+                    "2025-09-30",
+                ),
+                start=1,
+            )
+        ]
+        filings.append(
+            {
+                "record_id": "5",
+                "period": "2025-06-30",
+                "error": NseShareholdingRequestError("archive returned 404"),
+            }
+        )
+
+        history = ShareholdingHistoryService(
+            _Source(filings), _Store()
+        ).get("EXAMPLE", periods=5)
+
+        self.assertEqual(history.periods_available, 4)
+        self.assertFalse(history.complete)
+        self.assertEqual(
+            [period.period for period in history.periods],
+            [
+                "2026-06-30",
+                "2026-03-31",
+                "2025-12-31",
+                "2025-09-30",
+            ],
+        )
+
+    def test_maps_legacy_misspelled_government_member(self):
+        filing = {
+            "record_id": "196330",
+            "period": "2025-03-31",
+            "xml": _xbrl(
+                "2022-09-30",
+                "2025-03-31",
+                956_639_114,
+                1_074_860_351,
+                43_390,
+                1_330_560_015,
+                government_member="Goverments",
+            ),
+        }
+
+        history = ShareholdingHistoryService(
+            _Source([filing]), _Store()
+        ).get("CANBK", periods=1)
+
+        self.assertTrue(history.periods[0].reconciled)
+        self.assertEqual(history.periods[0].government_pct, 0.0013)
+
+    @patch("shareholding.time.sleep")
+    @patch("shareholding.get_request", return_value=None)
+    def test_source_does_not_multiply_the_scraper_retry_loop(
+        self, get_request, _sleep
+    ):
+        source = NseShareholdingSource(
+            request_delay_seconds=0,
+            jitter_seconds=0,
+        )
+
+        with self.assertRaises(NseShareholdingRequestError):
+            source.download({"url": "https://example.invalid/missing.xml"})
+
+        get_request.assert_called_once()
+
+    def test_nonquarter_and_missing_xbrl_filings_do_not_displace_history(self):
+        quarterly_filings = [
+            {
+                "record_id": str(record_id),
+                "period": period,
+                "xml": _xbrl(
+                    "2025-10-31",
+                    period,
+                    250_000,
+                    500_000,
+                    0,
+                    250_000,
+                ),
+            }
+            for record_id, period in enumerate(
+                (
+                    "2025-06-30",
+                    "2025-09-30",
+                    "2025-12-31",
+                    "2026-03-31",
+                    "2026-06-30",
+                ),
+                start=100,
+            )
+        ]
+        event_filing = {
+            "record_id": "999",
+            "period": "2026-06-18",
+            "xml": _xbrl(
+                "2025-10-31",
+                "2026-06-18",
+                250_000,
+                500_000,
+                0,
+                250_000,
+            ),
+        }
+        missing_xbrl_filing = {
+            "record_id": "1000",
+            "period": "2026-09-30",
+            "url": "https://nsearchives.nseindia.com/corporate/xbrl/-",
+        }
+        source = _Source(
+            [*quarterly_filings, event_filing, missing_xbrl_filing]
+        )
+
+        history = ShareholdingHistoryService(source, _Store()).get(
+            "EXAMPLE", periods=5
+        )
+
+        self.assertTrue(history.complete)
+        self.assertEqual(
+            [period.period for period in history.periods],
+            [
+                "2026-06-30",
+                "2026-03-31",
+                "2025-12-31",
+                "2025-09-30",
+                "2025-06-30",
+            ],
+        )
+        self.assertNotIn("999", source.downloads)
+
     def test_universe_backfill_prefers_never_warmed_then_stale_active_symbols(self):
         records = [
             {
@@ -171,12 +341,28 @@ class ShareholdingHistoryTests(unittest.TestCase):
             {
                 "record_id": "203018",
                 "period": "2025-09-30",
-                "xml": _xbrl("2025-05-31", "2025-09-30", 255_437, 497_117, 0, 247_446),
+                "xml": _xbrl(
+                    "2025-05-31",
+                    "2025-09-30",
+                    255_437,
+                    497_117,
+                    0,
+                    247_446,
+                    instant_period="2025-10-01",
+                ),
             },
             {
                 "record_id": "205713",
                 "period": "2025-12-31",
-                "xml": _xbrl("2025-10-31", "2025-12-31", 249_369, 511_054, 0, 239_577),
+                "xml": _xbrl(
+                    "2025-10-31",
+                    "2025-12-31",
+                    249_369,
+                    511_054,
+                    0,
+                    239_577,
+                    "in-capmkt",
+                ),
             },
             {
                 "record_id": "209992",
@@ -188,12 +374,21 @@ class ShareholdingHistoryTests(unittest.TestCase):
                     1_229_167_746,
                     69_754,
                     574_529_069,
+                    "in-capmkt",
                 ),
             },
             {
                 "record_id": "212913",
                 "period": "2026-06-30",
-                "xml": _xbrl("2025-10-31", "2026-06-30", 277_134, 492_796, 25, 230_045),
+                "xml": _xbrl(
+                    "2025-10-31",
+                    "2026-06-30",
+                    277_134,
+                    492_796,
+                    25,
+                    230_045,
+                    "in-capmkt",
+                ),
             },
         ]
 

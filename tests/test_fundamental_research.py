@@ -9,7 +9,7 @@ from llm import FundamentalAssessment
 def _evidence(financial_history):
     return FundamentalEvidence(
         {
-            "version": "fundamental-evidence-v3",
+            "version": "fundamental-evidence-v6",
             "symbol": "TEST",
             "company_name": "Test Limited",
             "coverage": {"complete": True, "missing": []},
@@ -139,6 +139,55 @@ def _banking_history():
     }
 
 
+def _nbfc_history():
+    quarterly = [
+        {
+            "period_end": period,
+            "revenue": 100.0 + index,
+            "finance_cost": 20.0,
+            "impairment": 4.0,
+            "pat": 15.0,
+        }
+        for index, period in enumerate(
+            (
+                "2026-06-30",
+                "2026-03-31",
+                "2025-12-31",
+                "2025-09-30",
+            )
+        )
+    ]
+    quarterly[1]["funding_leverage"] = {
+        "ratio": 3.5,
+        "method": "derived_funding_liabilities_to_equity",
+        "balance_sheet_reconciled": True,
+        "funding_components_reconciled": True,
+    }
+    quarterly[0]["credit_cost"] = quarterly[0].pop("impairment")
+    return {
+        "status": "ready",
+        "profile": "banking_nbfc",
+        "subtype": "nbfc",
+        "selected_scope": "standalone",
+        "periods": [
+            *quarterly,
+            {
+                "period_end": "2025-03-31",
+                "revenue": 95.0,
+                "finance_cost": 19.0,
+                "impairment": 4.0,
+                "pat": 14.0,
+                "funding_leverage": {
+                    "ratio": 3.2,
+                    "method": "derived_funding_liabilities_to_equity",
+                    "balance_sheet_reconciled": True,
+                    "funding_components_reconciled": True,
+                },
+            },
+        ],
+    }
+
+
 class FundamentalResearchTests(unittest.TestCase):
     def test_non_financial_profile_reviews_missing_cash_flow_without_model(self):
         history = _non_financial_history()
@@ -191,6 +240,77 @@ class FundamentalResearchTests(unittest.TestCase):
         self.assertIn("ANNOUNCEMENT_TEST", seen["prompt"])
         self.assertNotIn("gross_npa_pct", seen["prompt"])
         self.assertNotIn("net_interest_income", seen["prompt"])
+
+    def test_nbfc_quarters_do_not_require_debt_to_equity(self):
+        decision = evaluate_fundamental_research(
+            _evidence(_nbfc_history()),
+            lambda _prompt, _ids: FundamentalAssessment(
+                verdict="PASS",
+                reason_code="NO_MATERIAL_RED_FLAG",
+                reason="No qualitative red flag.",
+                evidence_ids=("ANNOUNCEMENT_TEST",),
+                missing=(),
+            ),
+        )
+
+        self.assertEqual(decision.verdict, "PASS")
+        self.assertNotIn(
+            "debt_to_equity:2026-06-30",
+            decision.missing,
+        )
+
+        inconsistent = copy.deepcopy(_nbfc_history())
+        inconsistent["periods"][1]["funding_leverage"][
+            "balance_sheet_reconciled"
+        ] = False
+        review = evaluate_fundamental_research(
+            _evidence(inconsistent),
+            lambda *_args: self.fail(
+                "qualitative model must not run with inconsistent annual leverage"
+            ),
+        )
+        self.assertEqual(review.verdict, "REVIEW")
+        self.assertIn("funding_leverage:2026-03-31", review.missing)
+
+    def test_structured_disclosure_policy_runs_without_the_model(self):
+        review_evidence = _evidence(_banking_history())
+        review_evidence.payload["facts"].append(
+            {
+                "id": "RATING_DOWNGRADE",
+                "kind": "credit_rating_action",
+                "action_direction": "downgrade",
+                "policy_verdict": "REVIEW",
+                "policy_reason_code": "CREDIT_RATING_CAUTION",
+            }
+        )
+        decision = evaluate_fundamental_research(
+            review_evidence,
+            lambda *_args: self.fail(
+                "structured rating caution must bypass the model"
+            ),
+        )
+        self.assertEqual(decision.verdict, "REVIEW")
+        self.assertEqual(decision.reason_code, "CREDIT_RATING_CAUTION")
+        self.assertEqual(decision.evidence_ids, ("RATING_DOWNGRADE",))
+
+        reject_evidence = _evidence(_banking_history())
+        reject_evidence.payload["facts"].append(
+            {
+                "id": "RATING_DEFAULT",
+                "kind": "credit_rating_action",
+                "action_direction": "default",
+                "policy_verdict": "REJECT",
+                "policy_reason_code": "ADVERSE_CORPORATE_EVENT",
+            }
+        )
+        rejected = evaluate_fundamental_research(
+            reject_evidence,
+            lambda *_args: self.fail(
+                "structured rating default must bypass the model"
+            ),
+        )
+        self.assertEqual(rejected.verdict, "REJECT")
+        self.assertEqual(rejected.evidence_ids, ("RATING_DEFAULT",))
 
 
 if __name__ == "__main__":

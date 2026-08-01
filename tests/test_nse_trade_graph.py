@@ -306,8 +306,8 @@ class FundamentalPromptTests(unittest.TestCase):
             "changepct": 1.0,
             "previous_close": 100.0,
             "change": 1.0,
-            "upper_circuit": 80.0,
-            "lower_circuit": 120.0,
+            "lower_circuit": 80.0,
+            "upper_circuit": 120.0,
         }
         histories = {timeframe: _history() for timeframe in ("D", "30", "15", "5")}
         snapshot = nse_trade_graph.nse_data.MarketSnapshot(
@@ -316,7 +316,7 @@ class FundamentalPromptTests(unittest.TestCase):
             histories=histories,
             provenance={
                 timeframe: {
-                    "source": "NSE via nsemine",
+                    "source": "NSE chart API",
                     "latest_complete_bar": "2026-07-29T13:00:00",
                 }
                 for timeframe in histories
@@ -356,7 +356,7 @@ class FundamentalPromptTests(unittest.TestCase):
         self.assertIsNone(result_state["fundamental_snapshot"])
         self.assertEqual(
             result_state["market_snapshot"]["timeframes"]["D"]["source"],
-            "NSE via nsemine",
+            "NSE chart API",
         )
         get_fundamentals.assert_not_called()
 
@@ -400,6 +400,38 @@ class TechnicalNodeTests(unittest.TestCase):
         )
         self.assertIn("invalid_data", result_state["technical_verdict"])
 
+    def test_explanation_failure_does_not_change_locked_disposition(self):
+        state = {
+            "symbol": "ACE",
+            "disposition": "PROPOSE",
+            "technical_verdict": "GOOD deterministic",
+            "technical_fact_ledger": {
+                "schema_version": "technical-explanation-input-v2",
+                "status": "ready",
+            },
+        }
+
+        with patch.object(
+            nse_trade_graph,
+            "summarize_technical_run",
+            side_effect=RuntimeError("backend unavailable"),
+        ):
+            route, result_state = (
+                nse_trade_graph.node_technical_explanation(state)
+            )
+
+        self.assertIsNone(route)
+        self.assertEqual(result_state["disposition"], "PROPOSE")
+        self.assertEqual(
+            result_state["technical_verdict"],
+            "GOOD deterministic",
+        )
+        self.assertIsNone(result_state["technical_explanation"])
+        self.assertEqual(
+            result_state["technical_explanation_meta"]["status"],
+            "backend_error",
+        )
+
 
 class MarketSnapshotRecordTests(unittest.TestCase):
     def test_trade_record_retains_market_snapshot_provenance(self):
@@ -408,7 +440,7 @@ class MarketSnapshotRecordTests(unittest.TestCase):
             "observed_at": "2026-07-29T13:08:00+05:30",
             "timeframes": {
                 "D": {
-                    "source": "NSE via nsemine",
+                    "source": "NSE chart API",
                     "fetched_at": "2026-07-29T13:07:59+05:30",
                     "cache_hit": False,
                     "latest_complete_bar": "2026-07-28T00:00:00",
@@ -431,11 +463,27 @@ class MarketSnapshotRecordTests(unittest.TestCase):
             },
             "proposal": None,
             "market_snapshot": snapshot_metadata,
+            "technical_fact_ledger": {"schema_version": "test-v2"},
+            "technical_explanation": {
+                "verdict": "GOOD",
+                "summary": "Deterministic evidence agrees.",
+            },
+            "technical_explanation_meta": {
+                "status": "ready",
+                "output_valid": True,
+            },
         }
 
         record = nse_trade_graph.build_record(state)
 
         self.assertEqual(record["market_snapshot"], snapshot_metadata)
+        self.assertEqual(
+            record["technical_fact_ledger"]["schema_version"],
+            "test-v2",
+        )
+        self.assertTrue(
+            record["technical_explanation_meta"]["output_valid"]
+        )
         self.assertEqual(record["reward_risk_ratio"], 2.0)
         self.assertEqual(
             record["model_config"],
@@ -519,9 +567,8 @@ class RiskNodeTests(unittest.TestCase):
             "quote": {
                 "previous_close": 100.0,
                 "change": 0.0,
-                # nsemine exposes these two fields under swapped names.
-                "upper_circuit": 80.0,
-                "lower_circuit": 120.0,
+                "lower_circuit": 80.0,
+                "upper_circuit": 120.0,
             },
             "technical_indicators": {"D": {"atr14": 5.0}},
             "hist_multi": {

@@ -13,6 +13,7 @@ def _bhavcopy_frame(
     *,
     previous_close=100.0,
     close=105.0,
+    vwap=103.0,
     volume=1_000.0,
     delivery_volume=500.0,
     delivery_pct=50.0,
@@ -27,7 +28,7 @@ def _bhavcopy_frame(
                 "high": 106.0,
                 "low": 99.0,
                 "close": close,
-                "vwap": 103.0,
+                "vwap": vwap,
                 "volume": volume,
                 "turnover": 103_000.0,
                 "delivery_volume": delivery_volume,
@@ -50,7 +51,7 @@ class BackfillTests(unittest.TestCase):
             with (
                 patch.object(bhavcopy, "BHAVCOPY_DB_PATH", database_path),
                 patch.object(
-                    bhavcopy.archives,
+                    bhavcopy,
                     "get_daily_bhavcopy_and_deliverables_data",
                     side_effect=fetch_archive,
                 ),
@@ -78,7 +79,7 @@ class BackfillTests(unittest.TestCase):
             with (
                 patch.object(bhavcopy, "BHAVCOPY_DB_PATH", database_path),
                 patch.object(
-                    bhavcopy.archives,
+                    bhavcopy,
                     "get_daily_bhavcopy_and_deliverables_data",
                     side_effect=fetch_archive,
                 ),
@@ -122,7 +123,7 @@ class BackfillTests(unittest.TestCase):
             with (
                 patch.object(bhavcopy, "BHAVCOPY_DB_PATH", database_path),
                 patch.object(
-                    bhavcopy.archives,
+                    bhavcopy,
                     "get_daily_bhavcopy_and_deliverables_data",
                     side_effect=fetch_archive,
                 ),
@@ -144,6 +145,39 @@ class BackfillTests(unittest.TestCase):
 
 
 class DeliveryTrendTests(unittest.TestCase):
+    def test_missing_latest_vwap_is_missing_evidence_not_zero_turnover(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = f"{temp_dir}/bhavcopy.db"
+            first_date = date(2026, 6, 1)
+
+            def fetch_archive(*, series, trade_date):
+                return _bhavcopy_frame(
+                    trade_date,
+                    vwap=(
+                        None
+                        if trade_date == first_date + timedelta(days=24)
+                        else 103.0
+                    ),
+                )
+
+            with (
+                patch.object(bhavcopy, "BHAVCOPY_DB_PATH", database_path),
+                patch.object(
+                    bhavcopy,
+                    "get_daily_bhavcopy_and_deliverables_data",
+                    side_effect=fetch_archive,
+                ),
+            ):
+                for offset in range(25):
+                    bhavcopy.fetch_and_store_day(
+                        first_date + timedelta(days=offset)
+                    )
+
+                trend = bhavcopy.get_delivery_trend("ACE")
+
+            self.assertEqual(trend["status"], "missing_values")
+            self.assertEqual(trend["latest_date"], "2026-06-25")
+
     def test_delivery_trend_requires_the_complete_recent_and_baseline_windows(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = f"{temp_dir}/bhavcopy.db"
@@ -154,7 +188,7 @@ class DeliveryTrendTests(unittest.TestCase):
             with (
                 patch.object(bhavcopy, "BHAVCOPY_DB_PATH", database_path),
                 patch.object(
-                    bhavcopy.archives,
+                    bhavcopy,
                     "get_daily_bhavcopy_and_deliverables_data",
                     side_effect=fetch_archive,
                 ),
@@ -195,7 +229,7 @@ class DeliveryTrendTests(unittest.TestCase):
             with (
                 patch.object(bhavcopy, "BHAVCOPY_DB_PATH", database_path),
                 patch.object(
-                    bhavcopy.archives,
+                    bhavcopy,
                     "get_daily_bhavcopy_and_deliverables_data",
                     side_effect=fetch_archive,
                 ),
@@ -236,7 +270,7 @@ class DeliveryTrendTests(unittest.TestCase):
             with (
                 patch.object(bhavcopy, "BHAVCOPY_DB_PATH", database_path),
                 patch.object(
-                    bhavcopy.archives,
+                    bhavcopy,
                     "get_daily_bhavcopy_and_deliverables_data",
                     side_effect=fetch_archive,
                 ),

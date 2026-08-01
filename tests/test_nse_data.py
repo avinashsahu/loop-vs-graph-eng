@@ -43,7 +43,6 @@ class MarketSnapshotTests(unittest.TestCase):
                 patch.object(nse_data.cache, "CACHE_DIR", cache_dir),
                 patch.object(nse_data, "get_stock_historical_data", side_effect=fetch_history),
                 patch.object(nse_data, "now_ist", return_value=observed_at),
-                patch.object(nse_data, "now_host_local", return_value=observed_at.replace(tzinfo=None)),
                 patch.object(nse_data.time, "sleep"),
             ):
                 snapshot = nse_data.get_market_snapshot("ACE")
@@ -77,7 +76,6 @@ class MarketSnapshotTests(unittest.TestCase):
                 patch.object(nse_data.cache, "CACHE_DIR", cache_dir),
                 patch.object(nse_data, "get_stock_historical_data", side_effect=fetch_history),
                 patch.object(nse_data, "now_ist", side_effect=[live_at, closed_at]),
-                patch.object(nse_data, "now_host_local", return_value=live_at.replace(tzinfo=None)),
                 patch.object(nse_data.time, "sleep"),
             ):
                 live_snapshot = nse_data.get_market_snapshot("ACE")
@@ -110,7 +108,6 @@ class MarketSnapshotTests(unittest.TestCase):
                 patch.object(nse_data.cache, "CACHE_DIR", cache_dir),
                 patch.object(nse_data, "get_stock_historical_data", side_effect=fetch_history),
                 patch.object(nse_data, "now_ist", return_value=observed_at),
-                patch.object(nse_data, "now_host_local", return_value=observed_at.replace(tzinfo=None)),
                 patch.object(nse_data.time, "sleep"),
             ):
                 snapshot = nse_data.get_market_snapshot("ACE")
@@ -136,7 +133,6 @@ class MarketSnapshotTests(unittest.TestCase):
                 patch.object(nse_data.cache, "CACHE_DIR", cache_dir),
                 patch.object(nse_data, "get_stock_historical_data", side_effect=fetch_history),
                 patch.object(nse_data, "now_ist", return_value=observed_at),
-                patch.object(nse_data, "now_host_local", return_value=observed_at.replace(tzinfo=None)),
                 patch.object(nse_data.time, "sleep"),
             ):
                 fetched = nse_data.get_market_snapshot("ACE")

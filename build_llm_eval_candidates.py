@@ -92,7 +92,7 @@ def _announcement_candidate(
             "source_url": item.get("attchmntFile"),
         },
         "evidence": {
-            "version": "fundamental-evidence-v3",
+            "version": "fundamental-evidence-v6",
             "symbol": item.get("symbol"),
             "company_name": company_name or item.get("sm_name"),
             "facts": [
@@ -130,7 +130,7 @@ def _action_candidate(
             "source_url": None,
         },
         "evidence": {
-            "version": "fundamental-evidence-v3",
+            "version": "fundamental-evidence-v6",
             "symbol": item.get("symbol"),
             "company_name": company_name or item.get("comp"),
             "facts": [

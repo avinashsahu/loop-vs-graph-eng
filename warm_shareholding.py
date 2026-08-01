@@ -52,7 +52,34 @@ def _arguments():
         action="store_true",
         help="Override the default guard that keeps this job out of NSE trading hours.",
     )
+    parser.add_argument(
+        "--retry-incomplete-now",
+        action="store_true",
+        help=(
+            "Explicitly retry recently incomplete universe members instead of "
+            "waiting for the normal retry interval."
+        ),
+    )
     return parser.parse_args()
+
+
+def _incomplete_history_reason(history):
+    if not history.periods_available:
+        return "NO_QUARTERLY_FILINGS"
+    if history.periods_available < 5:
+        return "LIMITED_QUARTERLY_HISTORY"
+    return "NONCONSECUTIVE_QUARTERLY_HISTORY"
+
+
+def _error_reason(error):
+    message = str(error)
+    if "unknown shareholding schema" in message:
+        return "UNSUPPORTED_XBRL_SCHEMA"
+    if "incomplete shareholding XBRL" in message:
+        return "INCOMPLETE_XBRL_FACTS"
+    if isinstance(error, NseShareholdingRequestError):
+        return "XBRL_DOWNLOAD_FAILED"
+    return "XBRL_WARM_FAILED"
 
 
 def main():
@@ -99,7 +126,9 @@ def main():
             index_name,
             limit=args.limit or active,
             refresh_after_days=refresh_after_days,
-            incomplete_retry_days=incomplete_retry_days,
+            incomplete_retry_days=(
+                0 if args.retry_incomplete_now else incomplete_retry_days
+            ),
         )
         log.info(
             "shareholding universe[%s]: %d active, %d due in this batch",
@@ -138,13 +167,45 @@ def main():
                     symbol,
                     complete=history.complete,
                     periods_available=len(history.periods),
+                    reason_code=(
+                        None
+                        if history.complete
+                        else _incomplete_history_reason(history)
+                    ),
                 )
         except NseShareholdingRequestError as error:
-            raise SystemExit(
-                f"Stopping warmer after repeated/blocked NSE request: {error}"
-            ) from error
-        except Exception:
+            if "NSE blocked" in str(error):
+                raise SystemExit(
+                    f"Stopping warmer after NSE blocked requests: {error}"
+                ) from error
+            for universe in universe_memberships.get(symbol, ()):
+                record_shareholding_universe_attempt(
+                    universe,
+                    symbol,
+                    complete=False,
+                    periods_available=0,
+                    reason_code=_error_reason(error),
+                    error_detail=str(error),
+                )
             if symbol not in universe_memberships:
+                failed.append(symbol)
+            log.warning(
+                "shareholding[%s]: request failed; continuing with remaining symbols: %s",
+                symbol,
+                error,
+            )
+        except Exception as error:
+            memberships = universe_memberships.get(symbol, ())
+            for universe in memberships:
+                record_shareholding_universe_attempt(
+                    universe,
+                    symbol,
+                    complete=False,
+                    periods_available=0,
+                    reason_code=_error_reason(error),
+                    error_detail=str(error),
+                )
+            if not memberships:
                 failed.append(symbol)
             log.warning("shareholding[%s]: warm failed", symbol, exc_info=True)
 
