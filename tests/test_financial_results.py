@@ -263,6 +263,111 @@ class FinancialScopeTests(unittest.TestCase):
             ],
         )
 
+    def test_life_and_general_insurance_profiles_parse_premium_and_surplus(self):
+        life_url = (
+            "https://nsearchives.nseindia.com/corporate/xbrl/"
+            "INTEGRATED_FILING_LI_1700867_24072026045312_WEB.xml"
+        )
+        general_url = (
+            "https://nsearchives.nseindia.com/corporate/xbrl/"
+            "INTEGRATED_FILING_GI_1693703_15072026091206_WEB.xml"
+        )
+        self.assertEqual(
+            financial_results._profile_for_url(life_url),
+            ("insurance", "life"),
+        )
+        self.assertEqual(
+            financial_results._profile_for_url(general_url),
+            ("insurance", "general"),
+        )
+        self.assertEqual(
+            financial_results._entity_profile(
+                "SBILIFE",
+                "SBI Life Insurance Company Limited",
+                "life",
+                ("standalone",),
+            ),
+            "regulated_insurer",
+        )
+        self.assertEqual(
+            financial_results._select_scope(
+                "regulated_insurer",
+                ("standalone",),
+            ),
+            ("standalone", "regulated_entity_metrics"),
+        )
+
+        life = financial_results._parse_period(
+            b"""
+            <xbrl>
+              <GrossPremiumIncome contextRef="OneD">210</GrossPremiumIncome>
+              <NetPremiumIncome contextRef="OneD">200</NetPremiumIncome>
+              <NetSurplusDeficit contextRef="OneD">12</NetSurplusDeficit>
+              <TransferredToShareholdersAccount contextRef="OneD">10</TransferredToShareholdersAccount>
+              <OperatingExpensesRelatedToInsuranceBusiness contextRef="OneD">40</OperatingExpensesRelatedToInsuranceBusiness>
+            </xbrl>
+            """,
+            "2026-06-30",
+            "life",
+        )
+        self.assertEqual(
+            life,
+            {
+                "period_end": "2026-06-30",
+                "revenue": 200.0,
+                "gross_premium": 210.0,
+                "net_premium": 200.0,
+                "operating_profit": 12.0,
+                "surplus": 12.0,
+                "operating_expenses": 40.0,
+                "pat": 10.0,
+            },
+        )
+
+        general = financial_results._parse_period(
+            b"""
+            <xbrl>
+              <GrossPremiumsWritten contextRef="OneD">90</GrossPremiumsWritten>
+              <NetPremiumWritten contextRef="OneD">70</NetPremiumWritten>
+              <PremiumEarned contextRef="OneD">60</PremiumEarned>
+              <OperatingProfitOrLoss contextRef="OneD">5</OperatingProfitOrLoss>
+              <IncurredClaims contextRef="OneD">40</IncurredClaims>
+              <ProfitLossAfterTax contextRef="OneD">4</ProfitLossAfterTax>
+            </xbrl>
+            """,
+            "2026-06-30",
+            "general",
+        )
+        self.assertEqual(general["revenue"], 60.0)
+        self.assertEqual(general["operating_profit"], 5.0)
+        self.assertEqual(general["pat"], 4.0)
+
+        insurance_rows = [
+            _filing(
+                scope="standalone",
+                period=period,
+                url=f"https://example.test/INTEGRATED_FILING_LI_{period}.xml",
+            )
+            for period in (
+                "30-JUN-2026",
+                "31-MAR-2026",
+                "31-DEC-2025",
+                "30-SEP-2025",
+                "30-JUN-2025",
+                "31-MAR-2025",
+            )
+        ]
+        selected = financial_results._select_filings(insurance_rows)["standalone"]
+        self.assertEqual(
+            [row["period_end"] for row in selected],
+            [
+                "2026-06-30",
+                "2026-03-31",
+                "2025-12-31",
+                "2025-09-30",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

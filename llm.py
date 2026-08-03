@@ -20,7 +20,7 @@ TECHNICAL_LLM_MAX_TOKENS = int(
     os.environ.get("TECHNICAL_LLM_MAX_TOKENS", "600")
 )
 TECHNICAL_LLM_SUMMARY_ENABLED = (
-    os.environ.get("TECHNICAL_LLM_SUMMARY_ENABLED", "1") == "1"
+    os.environ.get("TECHNICAL_LLM_SUMMARY_ENABLED", "0") == "1"
 )
 LOCAL_LLM_REASONING_EFFORT = os.environ.get("LOCAL_LLM_REASONING_EFFORT", "none")
 LOCAL_LLM_NO_THINK_DIRECTIVE = os.environ.get(

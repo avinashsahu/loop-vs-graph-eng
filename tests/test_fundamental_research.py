@@ -188,6 +188,31 @@ def _nbfc_history():
     }
 
 
+def _insurance_history(*, subtype="life"):
+    return {
+        "status": "ready",
+        "profile": "insurance",
+        "subtype": subtype,
+        "selected_scope": "standalone",
+        "periods": [
+            {
+                "period_end": period,
+                "revenue": 200.0 - index,
+                "operating_profit": 12.0 - index,
+                "pat": 10.0 - index,
+            }
+            for index, period in enumerate(
+                (
+                    "2026-06-30",
+                    "2026-03-31",
+                    "2025-12-31",
+                    "2025-09-30",
+                )
+            )
+        ],
+    }
+
+
 class FundamentalResearchTests(unittest.TestCase):
     def test_non_financial_profile_reviews_missing_cash_flow_without_model(self):
         history = _non_financial_history()
@@ -271,6 +296,39 @@ class FundamentalResearchTests(unittest.TestCase):
         )
         self.assertEqual(review.verdict, "REVIEW")
         self.assertIn("funding_leverage:2026-03-31", review.missing)
+
+    def test_insurance_profile_passes_with_premium_and_surplus_coverage(self):
+        decision = evaluate_fundamental_research(
+            _evidence(_insurance_history(subtype="life")),
+            lambda _prompt, _ids: FundamentalAssessment(
+                verdict="PASS",
+                reason_code="NO_MATERIAL_RED_FLAG",
+                reason="No qualitative red flag.",
+                evidence_ids=("ANNOUNCEMENT_TEST",),
+                missing=(),
+            ),
+        )
+        self.assertEqual(decision.verdict, "PASS")
+        self.assertEqual(decision.profile, "insurance")
+        self.assertEqual(decision.subtype, "life")
+
+        incomplete = copy.deepcopy(_insurance_history(subtype="general"))
+        incomplete["periods"][0].pop("pat")
+        review = evaluate_fundamental_research(
+            _evidence(incomplete),
+            lambda *_args: self.fail("model must not run without insurance PAT"),
+        )
+        self.assertEqual(review.verdict, "REVIEW")
+        self.assertIn("pat:2026-06-30", review.missing)
+
+        empty_premium = copy.deepcopy(_insurance_history())
+        empty_premium["periods"][0]["revenue"] = 0.0
+        rejected = evaluate_fundamental_research(
+            _evidence(empty_premium),
+            lambda *_args: self.fail("model must not run on non-positive premium"),
+        )
+        self.assertEqual(rejected.verdict, "REJECT")
+        self.assertIn("NON_POSITIVE_PREMIUM", rejected.checks)
 
     def test_structured_disclosure_policy_runs_without_the_model(self):
         review_evidence = _evidence(_banking_history())

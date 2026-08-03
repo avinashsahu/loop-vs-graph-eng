@@ -95,6 +95,8 @@ code evaluates:
 - multi-period coverage and earnings
 - margins and leverage/cash conversion for non-financial companies
 - asset quality and relevant banking/NBFC fields
+- premium, surplus/operating profit, and shareholders' profit for life and
+  general insurance XBRL taxonomies
 - rating defaults, downgrades, negative watch and non-cooperation
 - material defaults, fraud, insolvency, regulatory, auditor, litigation,
   management-exit and equity-dilution disclosures
@@ -152,7 +154,7 @@ USE_LOCAL_LLM=1
 LOCAL_LLM_URL=http://localhost:11434/v1
 LOCAL_LLM_MODEL=phi4:14b-q4_K_M
 LOCAL_LLM_REASONING_EFFORT=none
-TECHNICAL_LLM_SUMMARY_ENABLED=1
+TECHNICAL_LLM_SUMMARY_ENABLED=0
 TECHNICAL_LLM_MAX_TOKENS=600
 ```
 
@@ -192,7 +194,7 @@ Jobs execute one at a time to preserve slow NSE access:
 |---|---|
 | Bhavcopy catch-up | At startup, then at 19:00 IST after the nominal publication cutoff |
 | NIFTY TOTAL MKT XBRL backfill | 16:00 IST weekdays, 25 due symbols |
-| Queued XBRL shareholding warm | 17:00 IST weekdays, up to 10 symbols |
+| Queued XBRL shareholding warm | 17:00 IST weekdays, up to 100 symbols |
 | Material disclosure/rating warm | 17:30 IST weekdays, 100 due symbols |
 | Integrated governance warm | 17:45 IST weekdays, 25 due symbols |
 | Document research warm | 18:00 IST weekdays, 10 due symbols |

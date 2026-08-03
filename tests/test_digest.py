@@ -180,10 +180,13 @@ class SlackDigestTests(unittest.TestCase):
         self.assertIn("shareholding 5 quarters through Jun 2026 (complete)", message)
         self.assertIn("*Position plan — manual, not placed:*", message)
         self.assertIn(
-            "Scope: consolidated (group economics; standalone retained).",
+            "Financials: consolidated (group) figures; using the group view.",
             message,
         )
         self.assertIn("no order was placed", message.lower())
+        self.assertIn("disclosure screen only", message)
+        self.assertNotIn("ALL_GATES_PASSED", message)
+        self.assertNotIn("standalone retained", message)
 
     def test_quarterly_missing_fields_are_not_labelled_as_fiscal_years(self):
         summary = digest._fundamental_summary(
@@ -230,7 +233,9 @@ class SlackDigestTests(unittest.TestCase):
             }
         )
         self.assertIn("Actionable: promoter encumbrance QoQ 250 bps.", actionable)
-        self.assertIn("Governance coverage: pending (optional).", actionable)
+        self.assertNotIn("not yet refreshed", actionable)
+        self.assertNotIn("Governance coverage:", actionable)
+        self.assertNotIn("Additional research: pending", actionable)
 
         clean = digest._fundamental_summary(
             {
@@ -243,14 +248,42 @@ class SlackDigestTests(unittest.TestCase):
                         {
                             "id": "GOVERNANCE_COVERAGE",
                             "kind": "governance_coverage",
-                            "status": "ready",
-                        }
+                            "status": "pending",
+                        },
+                        {
+                            "id": "DOCUMENT_RESEARCH_COVERAGE",
+                            "kind": "document_research_coverage",
+                            "status": "pending",
+                        },
                     ]
                 },
             }
         )
         self.assertNotIn("Actionable:", clean)
+        self.assertNotIn("not yet refreshed", clean)
         self.assertNotIn("Governance coverage:", clean)
+        self.assertNotIn("Additional research:", clean)
+        self.assertIn("disclosure screen only", clean)
+
+        ready_note = digest._fundamental_summary(
+            {
+                "fundamental_assessment": {
+                    "verdict": "PASS",
+                    "summary": "ok",
+                },
+                "fundamental_evidence": {
+                    "facts": [
+                        {
+                            "id": "DOCUMENT_RESEARCH_COVERAGE",
+                            "kind": "document_research_coverage",
+                            "status": "ready",
+                            "document_counts": {"ready": 2},
+                        }
+                    ]
+                },
+            }
+        )
+        self.assertIn("2 long-form filing(s) available for reference.", ready_note)
 
 
 if __name__ == "__main__":

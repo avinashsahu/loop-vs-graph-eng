@@ -212,7 +212,7 @@ class DocumentResearchTests(unittest.TestCase):
                 "fundamental_evidence": bank_evidence.payload,
             }
         )
-        self.assertIn("Additional research: 1 warmed document(s).", bank_summary)
+        self.assertIn("1 long-form filing(s) available for reference.", bank_summary)
 
         nonfin_evidence = build_fundamental_evidence(
             "INFY",
@@ -273,7 +273,7 @@ class DocumentResearchTests(unittest.TestCase):
                 "fundamental_evidence": nonfin_evidence.payload,
             }
         )
-        self.assertIn("Additional research: 1 warmed document(s).", nonfin_summary)
+        self.assertIn("1 long-form filing(s) available for reference.", nonfin_summary)
 
     def test_missing_optional_research_is_coverage_note_not_reject(self):
         evidence = build_fundamental_evidence(
@@ -322,7 +322,9 @@ class DocumentResearchTests(unittest.TestCase):
                 "fundamental_evidence": evidence.payload,
             }
         )
-        self.assertIn("Additional research: pending (optional).", summary)
+        self.assertNotIn("Additional research:", summary)
+        self.assertNotIn("not yet refreshed", summary)
+        self.assertNotIn("Governance coverage:", summary)
 
 
 def _minimal_pdf() -> bytes:

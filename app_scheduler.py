@@ -38,7 +38,7 @@ RETRY_DELAY = timedelta(
     minutes=float(os.environ.get("APP_SCHEDULER_RETRY_MINUTES", "30"))
 )
 BHAVCOPY_BACKFILL_DAYS = int(os.environ.get("BHAVCOPY_BACKFILL_DAYS", "30"))
-XBRL_WARM_LIMIT = int(os.environ.get("APP_XBRL_WARM_LIMIT", "10"))
+XBRL_WARM_LIMIT = int(os.environ.get("APP_XBRL_WARM_LIMIT", "100"))
 XBRL_UNIVERSE_INDEX = os.environ.get(
     "APP_XBRL_UNIVERSE_INDEX",
     "NIFTY TOTAL MKT",

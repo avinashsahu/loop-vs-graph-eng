@@ -50,25 +50,15 @@ def _load_records(run_id):
     return list(latest_by_symbol.values())
 
 
-def _format_indicators(indicators):
-    if not indicators:
-        return "  (no indicators)"
-    return "\n".join(
-        f"  {tf}: close={ind['close']} SMA20={ind['sma20']} SMA50={ind['sma50']} "
-        f"RSI14={ind['rsi14']} MACD={ind['macd']} MACD_signal={ind['macd_signal']} MACD_hist={ind['macd_hist']}"
-        for tf, ind in indicators.items()
-    )
-
-
 def _format_technical_explanation(record):
     explanation = record.get("technical_explanation")
     if not explanation:
-        return "  (model explanation unavailable; deterministic verdict retained)"
+        return "  (plain-language TA note unavailable; locked technical screen retained)"
     lines = [
         f"  {explanation['verdict']}: {explanation['summary']}",
     ]
     for label, key in (
-        ("Drivers", "drivers"),
+        ("Supporting points", "drivers"),
         ("Conflicts", "conflicts"),
         ("Neutral context", "neutral_context"),
         ("Data notes", "data_notes"),
@@ -76,38 +66,77 @@ def _format_technical_explanation(record):
         values = explanation.get(key) or []
         if key == "drivers":
             values = [
-                f"{item['fact_id']}: {item['statement']}"
+                item.get("statement") or item.get("fact_id")
                 for item in values
+                if isinstance(item, dict)
             ]
+        values = [value for value in values if value]
         if values:
-            lines.append(f"  {label}: {'; '.join(values)}")
+            lines.append(f"  {label}: {' • '.join(values)}")
     return "\n".join(lines)
 
 
+def _human_disposition(record):
+    disposition = record.get("disposition")
+    if disposition == "PROPOSE":
+        return "CANDIDATE"
+    if disposition == "REVIEW":
+        return "NEEDS REVIEW"
+    if disposition == "REJECT":
+        return "REJECTED"
+    return disposition or record.get("status") or "unknown"
+
+
+def _human_action(record):
+    reason = record.get("decision_reason") or {}
+    code = reason.get("code") or ""
+    labels = {
+        "ALL_GATES_PASSED": "Passed all automated screens (manual confirmation still required).",
+        "INSUFFICIENT_EVIDENCE": "Needs review — required evidence is incomplete.",
+        "TECHNICAL_CONFLUENCE_FAILED": "Did not clear the technical screen.",
+        "INVALID_MARKET_DATA": "Market data was incomplete or invalid.",
+        "QUOTE_FETCH_FAILED": "Live quote was unavailable.",
+    }
+    if code in labels:
+        return labels[code]
+    if record.get("status") == "flagged_for_review":
+        return "Needs manual review before any action."
+    if code:
+        return "Needs manual review."
+    return ""
+
+
 def format_symbol_section(record):
-    return "\n".join(
+    action = _human_action(record)
+    lines = [
+        f"=== {record['symbol']} ({record.get('company_name') or 'unknown'}) — {_human_disposition(record)} ===",
+        f"As of: {record.get('timestamp') or 'unknown'}",
+        "",
+        "Technical screen:",
+        f"  {_slack_technical_summary(record) or record.get('technical_verdict') or 'n/a'}",
+        "Technical note:",
+        _format_technical_explanation(record),
+        f"Fundamentals: {_fundamental_summary(record)}",
+        f"Daily move check: {_verdict_label(record.get('sentiment_verdict'), 'not evaluated')}",
+    ]
+    if record.get("risk_plan") or record.get("risk_verdict"):
+        lines.append(
+            "Position sizing: "
+            + (
+                _verdict_label(record.get("risk_verdict"), "computed")
+                if record.get("risk_verdict")
+                else "computed"
+            )
+        )
+    lines.extend(
         [
-            f"=== {record['symbol']} ({record.get('company_name') or 'unknown'}) -- {record['status']} ===",
-            f"Timestamp: {record['timestamp']}",
-            (
-                "Decision: "
-                f"{record.get('disposition') or 'unknown'} "
-                f"({(record.get('decision_reason') or {}).get('stage') or 'unknown'}/"
-                f"{(record.get('decision_reason') or {}).get('code') or 'unknown'})"
-            ),
             "",
-            "Technical indicators:",
-            _format_indicators(record.get("technical_indicators")),
-            f"Technical verdict: {record.get('technical_verdict')}",
-            "Technical explanation:",
-            _format_technical_explanation(record),
-            f"Fundamental verdict: {record.get('fundamental_verdict')}",
-            f"Risk verdict: {record.get('risk_verdict')}",
-            f"Sentiment verdict: {record.get('sentiment_verdict')}",
-            "",
-            f"Proposal: {record.get('proposal')}",
+            f"Proposal: {record.get('proposal') or 'n/a'}",
         ]
     )
+    if action:
+        lines.extend(["", f"Operator note: {action}"])
+    return "\n".join(lines)
 
 
 _SLACK_STATUS_EMOJI = {
@@ -319,8 +348,9 @@ def _fundamental_summary(record):
     governance_note = _governance_coverage_note(record)
     if verdict == "PASS":
         return (
-            "No policy red flag in the available required evidence "
-            f"(not an overall quality rating).{scope_note}{governance_note}"
+            "No material red flag in the disclosures screened for this run "
+            "(disclosure screen only — not a company-quality or valuation rating)."
+            f"{scope_note}{governance_note}"
         )
     missing = assessment.get("missing") or []
     if verdict == "REVIEW" and missing:
@@ -405,20 +435,13 @@ def _actionable_governance_note(record, assessment):
 
 
 def _governance_coverage_note(record):
+    """Optional warmer coverage is not operator-actionable; omit pending noise.
+
+    Governance and long-form document research warm asynchronously. Pending
+    status must not appear on the digest as if it were a fundamental defect.
+    When long-form research is ready, surface a short availability note only.
+    """
     facts = (record.get("fundamental_evidence") or {}).get("facts") or []
-    notes = []
-    coverage = next(
-        (
-            fact
-            for fact in facts
-            if isinstance(fact, dict) and fact.get("kind") == "governance_coverage"
-        ),
-        None,
-    )
-    if coverage is not None and coverage.get("status") != "ready":
-        notes.append(
-            f"Governance coverage: {coverage.get('status') or 'pending'} (optional)."
-        )
     research = next(
         (
             fact
@@ -428,17 +451,13 @@ def _governance_coverage_note(record):
         ),
         None,
     )
-    if research is not None and research.get("status") != "ready":
-        notes.append(
-            "Additional research: "
-            f"{research.get('status') or 'pending'} (optional)."
-        )
-    elif research is not None:
-        counts = research.get("document_counts") or {}
-        ready = counts.get("ready")
-        if ready:
-            notes.append(f"Additional research: {ready} warmed document(s).")
-    return (" " + " ".join(notes)) if notes else ""
+    if research is None or research.get("status") != "ready":
+        return ""
+    counts = research.get("document_counts") or {}
+    ready = counts.get("ready")
+    if not ready:
+        return ""
+    return f" {ready} long-form filing(s) available for reference."
 
 
 def _fundamental_scope_note(record):
@@ -449,28 +468,26 @@ def _fundamental_scope_note(record):
     scope = history.get("selected_scope")
     if not scope:
         return ""
+    subtype = history.get("subtype")
+    if history.get("profile") == "insurance" and subtype in {"life", "general"}:
+        scope_label = f"{subtype}-insurance {scope} figures"
+    else:
+        scope_label = {
+            "consolidated": "consolidated (group) figures",
+            "standalone": "standalone figures",
+            "bank": "bank entity figures",
+            "nbfc": "NBFC entity figures",
+        }.get(scope, scope.replace("_", " "))
     reason = {
-        "regulated_entity_metrics": "regulated entity metrics",
-        "group_economics": "group economics",
-        "only_reported_scope": "only reported scope",
-        "standalone_unavailable_fallback": "standalone unavailable",
-        "consolidated_unavailable_fallback": "consolidated unavailable",
-    }.get(
-        history.get("scope_selection_reason"),
-        str(history.get("scope_selection_reason") or "explicit scope policy")
-        .replace("_", " "),
-    )
-    alternatives = [
-        item
-        for item in history.get("available_scopes", [])
-        if item != scope
-    ]
-    alternative_note = (
-        f"; {', '.join(alternatives)} retained"
-        if alternatives
-        else ""
-    )
-    return f" Scope: {scope} ({reason}{alternative_note})."
+        "regulated_entity_metrics": "using the regulated-entity view",
+        "group_economics": "using the group view",
+        "only_reported_scope": "only one reporting view was available",
+        "standalone_unavailable_fallback": "standalone view unavailable",
+        "consolidated_unavailable_fallback": "consolidated view unavailable",
+    }.get(history.get("scope_selection_reason"))
+    if reason:
+        return f" Financials: {scope_label}; {reason}."
+    return f" Financials: {scope_label}."
 
 
 def _risk_plan_lines(record):
@@ -514,7 +531,7 @@ def _screen_check_line(record):
         or record.get("fundamental_verdict")
     )
     fundamental_label = {
-        "PASS": "NO POLICY RED FLAG",
+        "PASS": "NO DISCLOSURE RED FLAG",
         "REVIEW": "REVIEW",
         "REJECT": "RED FLAG",
     }.get(fundamental, "NOT EVALUATED")
@@ -543,7 +560,6 @@ def _screen_check_line(record):
 
 def format_symbol_section_slack(record):
     emoji = _SLACK_STATUS_EMOJI.get(record["status"], "")
-    reason = record.get("decision_reason") or {}
     disposition = (
         "CANDIDATE"
         if record.get("disposition") == "PROPOSE"
@@ -569,8 +585,8 @@ def format_symbol_section_slack(record):
     lines.extend(_risk_plan_lines(record))
     if record["status"] == "flagged_for_review":
         lines.append(
-            "*Action:* Verify the missing evidence before considering this "
-            f"candidate ({reason.get('code') or 'manual review'})."
+            "*Action:* "
+            f"{_human_action(record) or 'Verify incomplete items before acting.'}"
         )
     return "\n".join(lines)
 

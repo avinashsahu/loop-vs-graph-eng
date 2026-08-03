@@ -67,6 +67,22 @@ scan results that:
 This layer must consume typed scan results; it must not reach into the Scan
 Engine's private mutable workflow state.
 
+## P2 — qualitative evidence pack (not RAG)
+
+Bounded Phi-4 interpretation should consume a curated evidence pack built from
+already-warmed disclosures and document-research excerpts, not a classic vector
+RAG retrieval loop:
+
+- assemble short, policy-relevant excerpts from corporate announcements,
+  governance exceptions, and long-form filings when those caches are ready;
+- keep deterministic numeric/coverage policy outside the model;
+- fail closed when the pack is empty, truncated, or citations are invalid;
+- add a deterministic digest Interpretation fallback when the optional TA LLM
+  note is disabled, so operator copy does not dump raw technical verdict IDs;
+- grow the labelled qualitative corpus before trusting live PASS rates.
+
+Do not introduce embedding indexes or open-ended retrieval as the next step.
+
 ## P2 — independent qualitative-model evaluation
 
 Trading returns alone cannot determine whether an LLM interpreted a disclosure
@@ -124,7 +140,8 @@ reproducibility.
 1. Operate the existing closed loop and inspect small scans.
 2. Make outcome data corporate-action and point-in-time safe.
 3. Add portfolio selection and operator/fill feedback.
-4. Establish the labelled qualitative-model benchmark.
+4. Establish the labelled qualitative-model benchmark and the curated
+   qualitative evidence pack (warmed excerpts, not RAG).
 5. Add regime, breadth, and liquidity evidence.
 6. Consolidate operational health and filing provenance.
 

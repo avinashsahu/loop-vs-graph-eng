@@ -8,7 +8,7 @@ from fundamental_evidence import FundamentalEvidence
 from llm import FundamentalAssessment
 from qualitative_policy import QUALITATIVE_REJECT_REASON_CODES
 
-FUNDAMENTAL_POLICY_VERSION = "fundamental-sector-policy-v4"
+FUNDAMENTAL_POLICY_VERSION = "fundamental-sector-policy-v5"
 PROMOTER_ENCUMBRANCE_QOQ_BPS = 200
 PROMOTER_ENCUMBRANCE_4Q_BPS = 500
 
@@ -38,6 +38,11 @@ _BANK_FIELDS = (
 _NBFC_FIELDS = (
     "revenue",
     "finance_cost",
+    "pat",
+)
+_INSURANCE_FIELDS = (
+    "revenue",
+    "operating_profit",
     "pat",
 )
 
@@ -353,6 +358,14 @@ def _coverage_missing(
                 f"funding_leverage:{annual[0].get('period_end') or 'latest_annual'}"
             )
         return tuple(dict.fromkeys(missing))
+    if profile == "insurance" and subtype in {"life", "general"}:
+        return tuple(
+            _period_fields_missing(
+                periods[:4],
+                _INSURANCE_FIELDS,
+                minimum_periods=4,
+            )
+        )
     return ("financial_profile",)
 
 
@@ -418,6 +431,9 @@ def _failed_numeric_checks(
             checks.append("LEVERAGE_ABOVE_POLICY")
         if _value(latest.get("impairment")) > _value(latest.get("revenue")) * 0.1:
             checks.append("IMPAIRMENT_ABOVE_POLICY")
+    elif profile == "insurance":
+        if _value(latest.get("revenue")) <= 0:
+            checks.append("NON_POSITIVE_PREMIUM")
 
     trend = next(
         (

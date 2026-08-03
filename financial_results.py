@@ -12,7 +12,7 @@ from nse_client import get_request
 
 log = setup_logging("financial_results")
 
-FINANCIAL_RESULTS_PARSER_VERSION = "nse-integrated-xbrl-v3"
+FINANCIAL_RESULTS_PARSER_VERSION = "nse-integrated-xbrl-v4"
 FINANCIAL_RESULTS_QUARTER_PERIODS = 4
 FINANCIAL_RESULTS_ANNUAL_PERIODS = 2
 FINANCIAL_RESULTS_CALL_DELAY_SECONDS = float(
@@ -230,6 +230,8 @@ def _entity_profile(
 ) -> str:
     if subtype == "bank":
         return "regulated_bank"
+    if subtype in {"life", "general"}:
+        return "regulated_insurer"
     if subtype == "nbfc":
         normalized_name = str(company_name or "").casefold()
         if (
@@ -252,6 +254,7 @@ def _select_scope(
 ) -> tuple[str, str]:
     preferred_scope, preferred_reason = {
         "regulated_bank": ("standalone", "regulated_entity_metrics"),
+        "regulated_insurer": ("standalone", "regulated_entity_metrics"),
         "operating_nbfc": ("standalone", "regulated_entity_metrics"),
         "financial_holding_group": ("consolidated", "group_economics"),
         "non_financial_group": ("consolidated", "group_economics"),
@@ -318,6 +321,34 @@ def _parse_period(xml: bytes, period_end: str, subtype: str) -> dict:
         if period_end.endswith("-03-31"):
             period["funding_leverage"] = _nbfc_funding_leverage(root)
         return period
+    if subtype == "life":
+        net_premium = _fact(root, "NetPremiumIncome", "OneD")
+        surplus = _fact(root, "NetSurplusDeficit", "OneD")
+        return {
+            "period_end": period_end,
+            "revenue": net_premium,
+            "gross_premium": _fact(root, "GrossPremiumIncome", "OneD"),
+            "net_premium": net_premium,
+            "operating_profit": surplus,
+            "surplus": surplus,
+            "operating_expenses": _fact(
+                root, "OperatingExpensesRelatedToInsuranceBusiness", "OneD"
+            ),
+            "pat": _fact(root, "TransferredToShareholdersAccount", "OneD"),
+        }
+    if subtype == "general":
+        premium_earned = _fact(root, "PremiumEarned", "OneD")
+        operating_profit = _fact(root, "OperatingProfitOrLoss", "OneD")
+        return {
+            "period_end": period_end,
+            "revenue": premium_earned,
+            "gross_premium": _fact(root, "GrossPremiumsWritten", "OneD"),
+            "net_premium": _fact(root, "NetPremiumWritten", "OneD"),
+            "premium_earned": premium_earned,
+            "operating_profit": operating_profit,
+            "incurred_claims": _fact(root, "IncurredClaims", "OneD"),
+            "pat": _fact(root, "ProfitLossAfterTax", "OneD"),
+        }
 
     revenue = _fact(root, "RevenueFromOperations", "OneD")
     income = _fact(root, "Income", "OneD")
@@ -563,6 +594,10 @@ def _profile_for_url(url: str) -> tuple[str, str]:
         return "banking_nbfc", "bank"
     if "NBFC" in upper:
         return "banking_nbfc", "nbfc"
+    if "INTEGRATED_FILING_LI_" in upper:
+        return "insurance", "life"
+    if "INTEGRATED_FILING_GI_" in upper:
+        return "insurance", "general"
     return "non_financial", "ind_as"
 
 
