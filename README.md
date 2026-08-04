@@ -236,9 +236,9 @@ plain file.
 ### Control website (new)
 
 `./nse_app.sh start` also launches a FastAPI + React control website at
-`http://127.0.0.1:8788/` (`APP_CONTROL_API_PORT`). It covers job control and
-an ad-hoc scan trigger (enter one or more symbols, see the resulting
-PROPOSE/REVIEW/REJECT decision once the scan completes) -- more modules are
+`http://127.0.0.1:8788/` (`APP_CONTROL_API_PORT`). It covers job control, an
+ad-hoc scan trigger, and a decisions browser (filter past scan decisions by
+symbol, inspect the full evidence bundle per decision) -- more modules are
 planned. Frontend development requires Node.js/npm (`webapp/frontend/`, built with
 Vite) -- run `npm run dev` there for hot reload against a running control API,
 or `npm run build` to produce the static files the API serves in normal use.
