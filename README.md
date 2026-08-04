@@ -471,9 +471,6 @@ risk semantics change so evaluation cohorts remain comparable.
 uv run python -m unittest discover -s tests
 ```
 
-The original `loop_agent.py` and `graph_agent.py` remain as small control-flow
-examples. The production application is the typed scan engine described above.
-
 This software is experimental decision support, not investment advice.
 
 
