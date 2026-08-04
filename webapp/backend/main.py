@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from pathlib import Path
@@ -96,6 +97,82 @@ def get_scan(request_id: str) -> dict:
         else []
     )
     return {**result, "decisions": decisions}
+
+
+DECISION_LIST_COLUMNS = (
+    "decision_id, decision_timestamp, decision_date, scan_label, symbol, "
+    "status, disposition, reason_stage, reason_code, entry_price, "
+    "stop_price, target_price, shares, technical_score, technical_verdict, "
+    "fundamental_verdict, risk_verdict, sentiment_verdict, model_backend, "
+    "model_name, policy_version, risk_plan_valid, created_at"
+)
+
+
+@app.get("/api/decisions")
+def list_decisions(
+    symbol: str | None = None,
+    disposition: str | None = None,
+    scan_label: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    filters = []
+    params: list[str] = []
+    if symbol:
+        filters.append("symbol = ?")
+        params.append(symbol.strip().upper())
+    if disposition:
+        filters.append("disposition = ?")
+        params.append(disposition.strip().upper())
+    if scan_label:
+        filters.append("scan_label = ?")
+        params.append(scan_label.strip())
+    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+
+    if not EVALUATION_DB_PATH.exists():
+        return {"total": 0, "results": []}
+    connection = sqlite3.connect(EVALUATION_DB_PATH)
+    connection.row_factory = sqlite3.Row
+    try:
+        total = connection.execute(
+            f"SELECT COUNT(*) FROM decisions {where_clause}", params
+        ).fetchone()[0]
+        rows = connection.execute(
+            f"""
+            SELECT {DECISION_LIST_COLUMNS} FROM decisions {where_clause}
+            ORDER BY decision_timestamp DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        ).fetchall()
+    finally:
+        connection.close()
+    return {"total": total, "results": [dict(row) for row in rows]}
+
+
+@app.get("/api/decisions/{decision_id}")
+def get_decision(decision_id: str) -> dict:
+    if not EVALUATION_DB_PATH.exists():
+        raise HTTPException(status_code=404, detail="unknown decision")
+    connection = sqlite3.connect(EVALUATION_DB_PATH)
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            "SELECT * FROM decisions WHERE decision_id = ?", (decision_id,)
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="unknown decision")
+    decision = dict(row)
+    raw_json = decision.pop("raw_record_json", None)
+    try:
+        decision["evidence"] = json.loads(raw_json) if raw_json else None
+    except ValueError:
+        decision["evidence"] = None
+    return decision
 
 
 _FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"

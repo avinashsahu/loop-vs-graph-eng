@@ -151,5 +151,87 @@ class ScanTriggerTests(unittest.TestCase):
                 self.assertEqual(body["decisions"][0]["disposition"], "PROPOSE")
 
 
+class DecisionsEndpointTests(unittest.TestCase):
+    def _seed_db(self, db_path):
+        connection = sqlite3.connect(db_path)
+        connection.execute(
+            """
+            CREATE TABLE decisions (
+                decision_id TEXT PRIMARY KEY, decision_timestamp TEXT,
+                decision_date TEXT, scan_label TEXT, symbol TEXT, status TEXT,
+                disposition TEXT, reason_stage TEXT, reason_code TEXT,
+                entry_price REAL, stop_price REAL, target_price REAL,
+                shares INTEGER, technical_score REAL, technical_verdict TEXT,
+                fundamental_verdict TEXT, risk_verdict TEXT,
+                sentiment_verdict TEXT, model_backend TEXT, model_name TEXT,
+                llm_max_tokens INTEGER, fundamental_llm_max_tokens INTEGER,
+                policy_version TEXT, risk_plan_valid INTEGER,
+                raw_record_json TEXT, created_at TEXT
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO decisions (
+                decision_id, decision_timestamp, decision_date, scan_label,
+                symbol, status, disposition, raw_record_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("id1", "2026-08-01T09:00:00+05:30", "2026-08-01", "overnight_1",
+                 "RELIANCE", "ok", "PROPOSE", '{"note": "first"}', "2026-08-01T09:00:01+05:30"),
+                ("id2", "2026-08-02T09:00:00+05:30", "2026-08-02", "overnight_2",
+                 "HDFCBANK", "ok", "REJECT", '{"note": "second"}', "2026-08-02T09:00:01+05:30"),
+            ],
+        )
+        connection.commit()
+        connection.close()
+
+    def test_list_decisions_returns_paginated_results(self):
+        with TemporaryDirectory() as temporary:
+            db_path = Path(temporary) / "evaluation.db"
+            self._seed_db(db_path)
+            with patch.object(main_module, "EVALUATION_DB_PATH", db_path):
+                client = TestClient(app)
+                response = client.get("/api/decisions")
+                self.assertEqual(response.status_code, 200)
+                body = response.json()
+                self.assertEqual(body["total"], 2)
+                self.assertEqual(len(body["results"]), 2)
+                self.assertNotIn("raw_record_json", body["results"][0])
+
+    def test_list_decisions_filters_by_symbol(self):
+        with TemporaryDirectory() as temporary:
+            db_path = Path(temporary) / "evaluation.db"
+            self._seed_db(db_path)
+            with patch.object(main_module, "EVALUATION_DB_PATH", db_path):
+                client = TestClient(app)
+                response = client.get("/api/decisions", params={"symbol": "RELIANCE"})
+                body = response.json()
+                self.assertEqual(body["total"], 1)
+                self.assertEqual(body["results"][0]["symbol"], "RELIANCE")
+
+    def test_get_decision_returns_parsed_evidence(self):
+        with TemporaryDirectory() as temporary:
+            db_path = Path(temporary) / "evaluation.db"
+            self._seed_db(db_path)
+            with patch.object(main_module, "EVALUATION_DB_PATH", db_path):
+                client = TestClient(app)
+                response = client.get("/api/decisions/id1")
+                self.assertEqual(response.status_code, 200)
+                body = response.json()
+                self.assertEqual(body["symbol"], "RELIANCE")
+                self.assertEqual(body["evidence"], {"note": "first"})
+
+    def test_get_decision_returns_404_for_unknown_id(self):
+        with TemporaryDirectory() as temporary:
+            db_path = Path(temporary) / "evaluation.db"
+            self._seed_db(db_path)
+            with patch.object(main_module, "EVALUATION_DB_PATH", db_path):
+                client = TestClient(app)
+                response = client.get("/api/decisions/not-a-real-id")
+                self.assertEqual(response.status_code, 404)
+
+
 if __name__ == "__main__":
     unittest.main()
