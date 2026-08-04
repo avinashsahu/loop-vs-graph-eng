@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import app_scheduler
@@ -48,3 +51,8 @@ def run_job_now(payload: RunNowRequest) -> None:
     overrides = app_scheduler.load_overrides()
     overrides["force_run"][payload.job] = now_ist().isoformat()
     app_scheduler.save_overrides(overrides)
+
+
+_FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+if _FRONTEND_DIST.exists():
+    app.mount("/", StaticFiles(directory=_FRONTEND_DIST, html=True), name="frontend")
