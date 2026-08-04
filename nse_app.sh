@@ -6,9 +6,11 @@ cd "$(dirname "$0")"
 PID_FILE=".app_scheduler.pid"
 OLLAMA_PID_FILE=".ollama.pid"
 DASHBOARD_PID_FILE=".dashboard_server.pid"
+CONTROL_API_PID_FILE=".control_api.pid"
 SCHEDULER_LOG="${APP_SCHEDULER_LOG_PATH:-cron.log}"
 OLLAMA_LOG="${APP_OLLAMA_LOG_PATH:-ollama.log}"
 DASHBOARD_LOG="${APP_DASHBOARD_LOG_PATH:-dashboard_server.log}"
+CONTROL_API_LOG="${APP_CONTROL_API_LOG_PATH:-control_api.log}"
 
 configured_value() {
     local name="$1"
@@ -121,6 +123,34 @@ start_dashboard_server() {
     echo "Dashboard: $(dashboard_url)"
 }
 
+control_api_url() {
+    local port
+    port="$(configured_value APP_CONTROL_API_PORT 8788)"
+    printf 'http://127.0.0.1:%s/' "$port"
+}
+
+start_control_api() {
+    if process_is_running "$CONTROL_API_PID_FILE" "webapp.backend.main:app"; then
+        echo "Control API is already running (PID $(<"$CONTROL_API_PID_FILE"))."
+        return
+    fi
+    unlink "$CONTROL_API_PID_FILE" 2>/dev/null || true
+    local port
+    port="$(configured_value APP_CONTROL_API_PORT 8788)"
+    echo "Starting control API..."
+    nohup setsid uv run uvicorn webapp.backend.main:app \
+        --host 127.0.0.1 --port "$port" \
+        >>"$CONTROL_API_LOG" 2>&1 </dev/null &
+    local pid="$!"
+    printf '%s\n' "$pid" >"$CONTROL_API_PID_FILE"
+    sleep 1
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "error: control API exited during startup; inspect $CONTROL_API_LOG" >&2
+        return 1
+    fi
+    echo "Control API: $(control_api_url)"
+}
+
 stop_pid_group() {
     local pid_file="$1"
     local label="$2"
@@ -155,6 +185,11 @@ show_status() {
         echo "Dashboard: running (PID $(<"$DASHBOARD_PID_FILE")) at $(dashboard_url)"
     else
         echo "Dashboard: stopped"
+    fi
+    if process_is_running "$CONTROL_API_PID_FILE" "webapp.backend.main:app"; then
+        echo "Control API: running (PID $(<"$CONTROL_API_PID_FILE")) at $(control_api_url)"
+    else
+        echo "Control API: stopped"
     fi
     if ollama_is_ready; then
         echo "Ollama: ready"
@@ -191,17 +226,21 @@ case "$command" in
         prepare_dependencies
         start_scheduler
         start_dashboard_server
+        start_control_api
         ;;
     stop)
         stop_pid_group "$PID_FILE" "scheduler" "app_scheduler.py"
         stop_pid_group "$DASHBOARD_PID_FILE" "dashboard server" "dashboard_server.py"
+        stop_pid_group "$CONTROL_API_PID_FILE" "control API" "webapp.backend.main:app"
         ;;
     restart)
         stop_pid_group "$PID_FILE" "scheduler" "app_scheduler.py"
         stop_pid_group "$DASHBOARD_PID_FILE" "dashboard server" "dashboard_server.py"
+        stop_pid_group "$CONTROL_API_PID_FILE" "control API" "webapp.backend.main:app"
         prepare_dependencies
         start_scheduler
         start_dashboard_server
+        start_control_api
         ;;
     status)
         show_status
@@ -225,6 +264,7 @@ case "$command" in
     down)
         stop_pid_group "$PID_FILE" "scheduler" "app_scheduler.py"
         stop_pid_group "$DASHBOARD_PID_FILE" "dashboard server" "dashboard_server.py"
+        stop_pid_group "$CONTROL_API_PID_FILE" "control API" "webapp.backend.main:app"
         docker compose down
         if [[ -f "$OLLAMA_PID_FILE" ]]; then
             stop_pid_group "$OLLAMA_PID_FILE" "managed Ollama" "ollama serve"
