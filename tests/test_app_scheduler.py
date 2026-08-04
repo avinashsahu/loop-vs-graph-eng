@@ -156,5 +156,42 @@ class SchedulerRetryTests(unittest.TestCase):
                 self.assertEqual(app_scheduler.main(["--once"]), 1)
 
 
+class AdHocScanTests(unittest.TestCase):
+    def test_submit_creates_a_pending_request_and_get_result_reports_it(self):
+        with TemporaryDirectory() as temporary:
+            overrides_path = Path(temporary) / "overrides.json"
+            with patch.object(app_scheduler, "OVERRIDES_PATH", overrides_path):
+                request_id = app_scheduler.submit_ad_hoc_scan(["RELIANCE"])
+                result = app_scheduler.get_ad_hoc_result(request_id)
+                self.assertEqual(result["status"], "queued")
+
+    def test_get_result_returns_none_for_unknown_id(self):
+        with TemporaryDirectory() as temporary:
+            overrides_path = Path(temporary) / "overrides.json"
+            with patch.object(app_scheduler, "OVERRIDES_PATH", overrides_path):
+                self.assertIsNone(app_scheduler.get_ad_hoc_result("not-a-real-id"))
+
+    def test_run_due_jobs_executes_a_queued_ad_hoc_scan(self):
+        with TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "state.json"
+            overrides_path = Path(temporary) / "overrides.json"
+            history_path = Path(temporary) / "history.jsonl"
+            with (
+                patch.object(app_scheduler, "STATE_PATH", state_path),
+                patch.object(app_scheduler, "OVERRIDES_PATH", overrides_path),
+                patch.object(app_scheduler, "HISTORY_PATH", history_path),
+                patch.object(app_scheduler, "configured_jobs", return_value=()),
+                patch.object(app_scheduler.subprocess, "run") as mock_run,
+            ):
+                mock_run.return_value.returncode = 0
+                request_id = app_scheduler.submit_ad_hoc_scan(["RELIANCE"])
+                app_scheduler.run_due_jobs({})
+                result = app_scheduler.get_ad_hoc_result(request_id)
+                self.assertEqual(result["status"], "done")
+                self.assertEqual(result["scan_label"], f"adhoc-{request_id}")
+                called_env = mock_run.call_args.kwargs["env"]
+                self.assertEqual(called_env["NSE_SCAN_LABEL"], f"adhoc-{request_id}")
+
+
 if __name__ == "__main__":
     unittest.main()

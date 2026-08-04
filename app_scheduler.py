@@ -16,6 +16,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time as wall_time, timedelta
 from pathlib import Path
@@ -256,14 +257,26 @@ def load_overrides(path: Path = OVERRIDES_PATH) -> dict:
     """
     target = _state_file(path)
     if not target.exists():
-        return {"enabled_overrides": {}, "force_run": {}}
+        return {
+            "enabled_overrides": {},
+            "force_run": {},
+            "ad_hoc_requests": {},
+            "ad_hoc_results": {},
+        }
     try:
         payload = json.loads(target.read_text())
     except (OSError, ValueError):
         log.exception("scheduler overrides file is invalid; ignoring it: %s", target)
-        return {"enabled_overrides": {}, "force_run": {}}
+        return {
+            "enabled_overrides": {},
+            "force_run": {},
+            "ad_hoc_requests": {},
+            "ad_hoc_results": {},
+        }
     payload.setdefault("enabled_overrides", {})
     payload.setdefault("force_run", {})
+    payload.setdefault("ad_hoc_requests", {})
+    payload.setdefault("ad_hoc_results", {})
     return payload
 
 
@@ -278,6 +291,86 @@ def save_overrides(overrides: dict, path: Path = OVERRIDES_PATH) -> None:
 def effective_enabled(job: "Job", overrides: dict) -> bool:
     override = overrides.get("enabled_overrides", {}).get(job.name)
     return job.enabled if override is None else bool(override)
+
+
+AD_HOC_RESULTS_LIMIT = 20
+
+
+def submit_ad_hoc_scan(symbols: list[str], *, overrides: dict | None = None) -> str:
+    """Queue a browser-triggered scan for one or more symbols. Executed by the
+    scheduler's own sequential loop (see _run_ad_hoc_requests), never spawned
+    directly, so it can never race a scheduled job for NSE access."""
+    overrides = overrides if overrides is not None else load_overrides()
+    request_id = uuid.uuid4().hex
+    overrides["ad_hoc_requests"][request_id] = {
+        "symbols": symbols,
+        "requested_at": now_ist().isoformat(),
+    }
+    save_overrides(overrides)
+    return request_id
+
+
+def get_ad_hoc_result(request_id: str, *, overrides: dict | None = None) -> dict | None:
+    overrides = overrides if overrides is not None else load_overrides()
+    if request_id in overrides.get("ad_hoc_requests", {}):
+        return {
+            "status": "queued",
+            "scan_label": f"adhoc-{request_id}",
+            "finished_at": None,
+        }
+    return overrides.get("ad_hoc_results", {}).get(request_id)
+
+
+def _run_ad_hoc_requests(overrides: dict) -> None:
+    pending = dict(overrides.get("ad_hoc_requests", {}))
+    for request_id, request in pending.items():
+        scan_label = f"adhoc-{request_id}"
+        env = os.environ.copy()
+        env["NSE_SCAN_LABEL"] = scan_label
+        log.info(
+            "ad-hoc scan[%s] starting symbols=%s", request_id, request["symbols"]
+        )
+        try:
+            result = subprocess.run(
+                (sys.executable, "nse_trade_graph.py", *request["symbols"]),
+                cwd=REPO_ROOT,
+                env=env,
+                check=False,
+                timeout=JOB_TIMEOUT.total_seconds(),
+            )
+            status = "done" if result.returncode == 0 else "failed"
+        except subprocess.TimeoutExpired:
+            log.error("ad-hoc scan[%s] exceeded timeout; killed", request_id)
+            status = "failed"
+        except OSError:
+            log.exception("ad-hoc scan[%s] could not start", request_id)
+            status = "failed"
+
+        finished_at = now_ist().isoformat()
+        overrides["ad_hoc_results"][request_id] = {
+            "status": status,
+            "scan_label": scan_label,
+            "finished_at": finished_at,
+        }
+        results = overrides["ad_hoc_results"]
+        if len(results) > AD_HOC_RESULTS_LIMIT:
+            oldest_ids = sorted(
+                results, key=lambda key: results[key]["finished_at"]
+            )[: len(results) - AD_HOC_RESULTS_LIMIT]
+            for stale_id in oldest_ids:
+                del results[stale_id]
+        del overrides["ad_hoc_requests"][request_id]
+        save_overrides(overrides)
+        _append_history(
+            f"adhoc:{request_id}",
+            JobRecord(
+                occurrence=scan_label,
+                status=status,
+                attempted_at=request["requested_at"],
+                finished_at=finished_at,
+                return_code=0 if status == "done" else 1,
+            ),
+        )
 
 
 def _daily_occurrence(
@@ -552,6 +645,7 @@ def run_due_jobs(
 ) -> int:
     now = current_time or now_ist()
     overrides = load_overrides()
+    _run_ad_hoc_requests(overrides)
     failures = 0
     for job in jobs or configured_jobs():
         if _stop_requested:
