@@ -23,14 +23,20 @@ evaluation.db-*
 .app_scheduler.lock
 .app_scheduler.pid
 .dashboard_server.pid
+.control_api.pid
 .ollama.pid
 ollama.log
 dashboard_server.log
+control_api.log
 scheduler_history.jsonl
 dashboard.html
 
 # On-disk data cache
 .cache/
+
+# Frontend build artifacts / dependencies
+webapp/frontend/node_modules/
+webapp/frontend/dist/
 
 # Cron output -- with EMAIL_ENABLED=0, notify.py logs full email bodies (real trade
 # verdicts/proposals) here; never commit it.
