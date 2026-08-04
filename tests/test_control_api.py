@@ -36,5 +36,40 @@ class JobsEndpointTests(unittest.TestCase):
                 self.assertIn("intraday_recheck", names)
 
 
+class JobControlActionTests(unittest.TestCase):
+    def test_toggle_writes_an_enabled_override(self):
+        with TemporaryDirectory() as temporary:
+            overrides_path = Path(temporary) / "overrides.json"
+            with patch.object(app_scheduler, "OVERRIDES_PATH", overrides_path):
+                client = TestClient(app)
+                response = client.post(
+                    "/api/jobs/toggle", json={"job": "cleanup", "enabled": False}
+                )
+                self.assertEqual(response.status_code, 204)
+                self.assertEqual(
+                    app_scheduler.load_overrides()["enabled_overrides"]["cleanup"],
+                    False,
+                )
+
+    def test_toggle_rejects_unknown_job(self):
+        with TemporaryDirectory() as temporary:
+            overrides_path = Path(temporary) / "overrides.json"
+            with patch.object(app_scheduler, "OVERRIDES_PATH", overrides_path):
+                client = TestClient(app)
+                response = client.post(
+                    "/api/jobs/toggle", json={"job": "not_a_real_job", "enabled": True}
+                )
+                self.assertEqual(response.status_code, 404)
+
+    def test_run_now_queues_a_force_run_request(self):
+        with TemporaryDirectory() as temporary:
+            overrides_path = Path(temporary) / "overrides.json"
+            with patch.object(app_scheduler, "OVERRIDES_PATH", overrides_path):
+                client = TestClient(app)
+                response = client.post("/api/jobs/run-now", json={"job": "cleanup"})
+                self.assertEqual(response.status_code, 204)
+                self.assertIn("cleanup", app_scheduler.load_overrides()["force_run"])
+
+
 if __name__ == "__main__":
     unittest.main()
