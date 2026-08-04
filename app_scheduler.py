@@ -220,8 +220,11 @@ def _state_file(path: Path) -> Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
-def load_state(path: Path = STATE_PATH) -> dict[str, JobRecord]:
-    target = _state_file(path)
+def load_state(path: Path | None = None) -> dict[str, JobRecord]:
+    # `path` must default to None and resolve STATE_PATH here, not as a parameter
+    # default -- a parameter default binds at def-time, so patch.object(module,
+    # "STATE_PATH", ...) in tests would silently never take effect.
+    target = _state_file(path if path is not None else STATE_PATH)
     if not target.exists():
         return {}
     try:
@@ -237,8 +240,8 @@ def load_state(path: Path = STATE_PATH) -> dict[str, JobRecord]:
         raise
 
 
-def save_state(records: dict[str, JobRecord], path: Path = STATE_PATH) -> None:
-    target = _state_file(path)
+def save_state(records: dict[str, JobRecord], path: Path | None = None) -> None:
+    target = _state_file(path if path is not None else STATE_PATH)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(f"{target.suffix}.tmp")
     payload = {
@@ -249,13 +252,18 @@ def save_state(records: dict[str, JobRecord], path: Path = STATE_PATH) -> None:
     temporary.replace(target)
 
 
-def load_overrides(path: Path = OVERRIDES_PATH) -> dict:
+def load_overrides(path: Path | None = None) -> dict:
     """Dashboard-controlled state: per-job enabled override (takes precedence over
     the .env flag, no scheduler restart needed) and pending force-run requests.
 
     Read fresh on every tick since a separate dashboard_server.py process writes it.
+
+    `path` must default to None and resolve OVERRIDES_PATH here, not as a
+    parameter default -- a parameter default binds at def-time, so
+    patch.object(module, "OVERRIDES_PATH", ...) in tests would silently never
+    take effect.
     """
-    target = _state_file(path)
+    target = _state_file(path if path is not None else OVERRIDES_PATH)
     if not target.exists():
         return {
             "enabled_overrides": {},
@@ -280,8 +288,8 @@ def load_overrides(path: Path = OVERRIDES_PATH) -> dict:
     return payload
 
 
-def save_overrides(overrides: dict, path: Path = OVERRIDES_PATH) -> None:
-    target = _state_file(path)
+def save_overrides(overrides: dict, path: Path | None = None) -> None:
+    target = _state_file(path if path is not None else OVERRIDES_PATH)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(f"{target.suffix}.tmp")
     temporary.write_text(json.dumps(overrides, indent=2, sort_keys=True) + "\n")
