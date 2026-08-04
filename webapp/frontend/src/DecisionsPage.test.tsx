@@ -46,4 +46,26 @@ describe('DecisionsPage', () => {
     await userEvent.click(screen.getByText('RELIANCE'))
     await waitFor(() => expect(screen.getByText(/"note": "first"/)).toBeInTheDocument())
   })
+
+  it('shows an empty state instead of a blank page when nothing matches', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(JSON.stringify({ total: 0, results: [] }), { status: 200 })),
+    )
+    render(<DecisionsPage />)
+    await waitFor(() =>
+      expect(screen.getByText(/no decisions recorded yet/i)).toBeInTheDocument(),
+    )
+  })
+
+  it('shows an error instead of failing silently when the server is unreachable', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(null, { status: 404 })),
+    )
+    render(<DecisionsPage />)
+    await waitFor(() =>
+      expect(screen.getByText(/could not load decisions/i)).toBeInTheDocument(),
+    )
+  })
 })

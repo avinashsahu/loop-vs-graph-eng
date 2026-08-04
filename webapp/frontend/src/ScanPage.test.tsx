@@ -42,4 +42,21 @@ describe('ScanPage', () => {
     await userEvent.click(screen.getByRole('button', { name: /run scan/i }))
     await waitFor(() => expect(screen.getByText(/PROPOSE/)).toBeInTheDocument())
   })
+
+  it('shows an error instead of failing silently when the server rejects the request', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(JSON.stringify({ detail: 'Method Not Allowed' }), { status: 405 })),
+    )
+    render(<ScanPage pollIntervalMs={10} />)
+    await userEvent.type(screen.getByLabelText(/symbols/i), 'LODHA')
+    await userEvent.click(screen.getByRole('button', { name: /run scan/i }))
+    await waitFor(() => expect(screen.getByText(/Method Not Allowed/)).toBeInTheDocument())
+  })
+
+  it('shows an error when submitting with no symbols', async () => {
+    render(<ScanPage pollIntervalMs={10} />)
+    await userEvent.click(screen.getByRole('button', { name: /run scan/i }))
+    await waitFor(() => expect(screen.getByText(/enter at least one symbol/i)).toBeInTheDocument())
+  })
 })

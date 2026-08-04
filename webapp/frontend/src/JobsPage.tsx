@@ -20,13 +20,31 @@ type Job = {
 
 const POLL_INTERVAL_MS = 5000
 
+function statusBadgeClass(status: string | undefined): string {
+  switch (status) {
+    case 'success':
+      return 'badge badge-success'
+    case 'failed':
+      return 'badge badge-danger'
+    case 'running':
+      return 'badge badge-warning'
+    default:
+      return 'badge badge-neutral'
+  }
+}
+
 export default function JobsPage() {
   const [jobs, setJobs] = useState<Job[]>([])
+  const [error, setError] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
-    const response = await fetch('/api/jobs')
-    if (response.ok) {
+    try {
+      const response = await fetch('/api/jobs')
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
       setJobs(await response.json())
+      setError(null)
+    } catch {
+      setError('Could not load jobs. Is the control API running?')
     }
   }, [])
 
@@ -55,34 +73,50 @@ export default function JobsPage() {
   }
 
   return (
-    <table>
-      <thead>
-        <tr>
-          <th>Job</th>
-          <th>Enabled</th>
-          <th>Last status</th>
-          <th>Occurrence</th>
-          <th>Controls</th>
-        </tr>
-      </thead>
-      <tbody>
-        {jobs.map((job) => (
-          <tr key={job.name}>
-            <td>{job.name}</td>
-            <td>{job.enabled ? 'enabled' : 'disabled'}</td>
-            <td>{job.last_record?.status ?? 'never run'}</td>
-            <td>{job.last_record?.occurrence ?? job.current_occurrence ?? '-'}</td>
-            <td>
-              <button onClick={() => toggle(job)}>
-                {job.enabled ? 'Disable' : 'Enable'}
-              </button>{' '}
-              <button onClick={() => runNow(job)} disabled={job.force_run_requested}>
-                {job.force_run_requested ? 'Queued...' : 'Run now'}
-              </button>
-            </td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <section>
+      <h2>Scheduled jobs</h2>
+      {error && <p className="error-text">{error}</p>}
+      <div className="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Job</th>
+              <th>Enabled</th>
+              <th>Last status</th>
+              <th>Occurrence</th>
+              <th>Controls</th>
+            </tr>
+          </thead>
+          <tbody>
+            {jobs.map((job) => (
+              <tr key={job.name}>
+                <td>{job.name}</td>
+                <td>
+                  <span className={job.enabled ? 'badge badge-success' : 'badge badge-neutral'}>
+                    {job.enabled ? 'enabled' : 'disabled'}
+                  </span>
+                </td>
+                <td>
+                  <span className={statusBadgeClass(job.last_record?.status)}>
+                    {job.last_record?.status ?? 'never run'}
+                  </span>
+                </td>
+                <td>{job.last_record?.occurrence ?? job.current_occurrence ?? '-'}</td>
+                <td>
+                  <div className="row-buttons">
+                    <button onClick={() => toggle(job)}>
+                      {job.enabled ? 'Disable' : 'Enable'}
+                    </button>
+                    <button onClick={() => runNow(job)} disabled={job.force_run_requested}>
+                      {job.force_run_requested ? 'Queued…' : 'Run now'}
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
   )
 }
