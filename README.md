@@ -205,7 +205,33 @@ Jobs execute one at a time to preserve slow NSE access:
 
 Failures retry after 30 minutes. Successful jobs run once per occurrence even
 across restarts. `./nse_app.sh run-once` runs whatever is due and exits;
-`foreground` is available for debugging.
+`foreground` is available for debugging. A job's subprocess is killed if it runs
+past `APP_SCHEDULER_JOB_TIMEOUT_MINUTES` (default 180) so one hung NSE call
+cannot block every job queued after it. Slack receives an alert the first time a
+job fails, and again if it is still failing after
+`APP_SCHEDULER_STALE_ALERT_MINUTES` (default 90).
+
+### Scheduler dashboard
+
+`./nse_app.sh start` also launches a localhost-only control panel at
+`http://127.0.0.1:8787/` (`APP_DASHBOARD_PORT`). It shows every configured job
+-- including disabled ones, which otherwise never appear anywhere -- with its
+enabled state, last status, occurrence, and recent run history, plus **Enable /
+Disable** and **Run now** buttons per job.
+
+Toggling or requesting a run writes to `.app_scheduler_overrides.json`; the
+running scheduler applies it on its next poll tick (within
+`APP_SCHEDULER_POLL_SECONDS`), so no restart or `.env` edit is needed. An
+override takes precedence over the `.env` flag until cleared. **Run now**
+bypasses the normal due/dedup check entirely -- it can trigger a currently
+disabled job on demand -- but still goes through the scheduler's own
+sequential queue, so it is never run concurrently with another job.
+
+The dashboard has no authentication and must never be exposed beyond the local
+machine. `./nse_app.sh status` also reports whether it is running, and
+`./nse_app.sh dashboard` opens it in a browser. A read-only static snapshot is
+additionally written to `dashboard.html` every tick, if you'd rather open a
+plain file.
 
 On macOS, install the TA-Lib C library before `uv sync` if a compatible wheel
 is unavailable:
@@ -367,6 +393,9 @@ and their credentials are configured in `.env`.
 | `scan_runs.jsonl` | Batch crash-recovery journal | Retained for a bounded period |
 | `.intraday_alert_state.json` | Material-transition and channel deduplication | Retain while alerts are active |
 | `.app_scheduler_state.json` | Last attempt/success for each scheduled occurrence | Retain to prevent duplicate work |
+| `.app_scheduler_overrides.json` | Dashboard enable/disable overrides and pending run-now requests | Disposable; cleared once applied/reverted |
+| `scheduler_history.jsonl` | Append-only log of every job run (state file only keeps the latest) | Retained for audit; not size-bounded yet |
+| `dashboard.html` | Read-only static snapshot regenerated every scheduler tick | Disposable |
 | `cron.log` | Scheduled-job output | Size bounded |
 
 Do not routinely delete `bhavcopy.db` or the Aerospike volume: they are expensive

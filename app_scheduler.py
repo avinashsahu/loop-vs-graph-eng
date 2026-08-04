@@ -27,15 +27,28 @@ load_dotenv()
 
 from logging_config import setup_logging  # noqa: E402
 from market_time import MARKET_CLOSE, MARKET_OPEN, now_ist  # noqa: E402
+from notify import send_slack  # noqa: E402
 
 log = setup_logging("scheduler")
 
 REPO_ROOT = Path(__file__).resolve().parent
 STATE_PATH = Path(os.environ.get("APP_SCHEDULER_STATE_PATH", ".app_scheduler_state.json"))
 LOCK_PATH = Path(os.environ.get("APP_SCHEDULER_LOCK_PATH", ".app_scheduler.lock"))
+HISTORY_PATH = Path(
+    os.environ.get("APP_SCHEDULER_HISTORY_PATH", "scheduler_history.jsonl")
+)
+OVERRIDES_PATH = Path(
+    os.environ.get("APP_SCHEDULER_OVERRIDES_PATH", ".app_scheduler_overrides.json")
+)
 POLL_SECONDS = float(os.environ.get("APP_SCHEDULER_POLL_SECONDS", "30"))
 RETRY_DELAY = timedelta(
     minutes=float(os.environ.get("APP_SCHEDULER_RETRY_MINUTES", "30"))
+)
+JOB_TIMEOUT = timedelta(
+    minutes=float(os.environ.get("APP_SCHEDULER_JOB_TIMEOUT_MINUTES", "180"))
+)
+STALE_ALERT_AFTER = timedelta(
+    minutes=float(os.environ.get("APP_SCHEDULER_STALE_ALERT_MINUTES", "90"))
 )
 BHAVCOPY_BACKFILL_DAYS = int(os.environ.get("BHAVCOPY_BACKFILL_DAYS", "30"))
 XBRL_WARM_LIMIT = int(os.environ.get("APP_XBRL_WARM_LIMIT", "100"))
@@ -66,6 +79,9 @@ class JobRecord:
     attempted_at: str
     finished_at: str | None = None
     return_code: int | None = None
+    first_attempted_at: str | None = None
+    failure_alerted: bool = False
+    stale_alerted: bool = False
 
 
 @dataclass(frozen=True)
@@ -230,6 +246,38 @@ def save_state(records: dict[str, JobRecord], path: Path = STATE_PATH) -> None:
     }
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     temporary.replace(target)
+
+
+def load_overrides(path: Path = OVERRIDES_PATH) -> dict:
+    """Dashboard-controlled state: per-job enabled override (takes precedence over
+    the .env flag, no scheduler restart needed) and pending force-run requests.
+
+    Read fresh on every tick since a separate dashboard_server.py process writes it.
+    """
+    target = _state_file(path)
+    if not target.exists():
+        return {"enabled_overrides": {}, "force_run": {}}
+    try:
+        payload = json.loads(target.read_text())
+    except (OSError, ValueError):
+        log.exception("scheduler overrides file is invalid; ignoring it: %s", target)
+        return {"enabled_overrides": {}, "force_run": {}}
+    payload.setdefault("enabled_overrides", {})
+    payload.setdefault("force_run", {})
+    return payload
+
+
+def save_overrides(overrides: dict, path: Path = OVERRIDES_PATH) -> None:
+    target = _state_file(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(f"{target.suffix}.tmp")
+    temporary.write_text(json.dumps(overrides, indent=2, sort_keys=True) + "\n")
+    temporary.replace(target)
+
+
+def effective_enabled(job: "Job", overrides: dict) -> bool:
+    override = overrides.get("enabled_overrides", {}).get(job.name)
+    return job.enabled if override is None else bool(override)
 
 
 def _daily_occurrence(
@@ -452,6 +500,50 @@ def configured_jobs() -> tuple[Job, ...]:
     )
 
 
+def job_status_summary(
+    records: dict[str, JobRecord] | None = None,
+    *,
+    now: datetime | None = None,
+    overrides: dict | None = None,
+) -> list[dict]:
+    """Per-job snapshot: enabled flag, whether it's due right now, and its last
+    recorded outcome. Disabled jobs never appear in the scheduler's own job list,
+    so this is the only place that surfaces them for visibility."""
+    records = records if records is not None else load_state()
+    overrides = overrides if overrides is not None else load_overrides()
+    now = now or now_ist()
+    summary = []
+    for job in configured_jobs():
+        record = records.get(job.name)
+        summary.append(
+            {
+                "name": job.name,
+                "base_enabled": job.enabled,
+                "override": overrides.get("enabled_overrides", {}).get(job.name),
+                "enabled": effective_enabled(job, overrides),
+                "due_now": job.occurrence(now) is not None,
+                "current_occurrence": job.occurrence(now),
+                "force_run_requested": job.name in overrides.get("force_run", {}),
+                "last_record": asdict(record) if record else None,
+            }
+        )
+    return summary
+
+
+def _alert(text: str) -> None:
+    try:
+        send_slack(text)
+    except Exception:
+        log.exception("scheduler could not send an alert")
+
+
+def _append_history(name: str, record: JobRecord) -> None:
+    target = _state_file(HISTORY_PATH)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a") as handle:
+        handle.write(json.dumps({"job": name, **asdict(record)}, sort_keys=True) + "\n")
+
+
 def run_due_jobs(
     records: dict[str, JobRecord],
     *,
@@ -459,12 +551,22 @@ def run_due_jobs(
     current_time: datetime | None = None,
 ) -> int:
     now = current_time or now_ist()
+    overrides = load_overrides()
     failures = 0
     for job in jobs or configured_jobs():
-        if _stop_requested or not job.enabled:
+        if _stop_requested:
+            continue
+        forced = job.name in overrides.get("force_run", {})
+        if not forced and not effective_enabled(job, overrides):
             continue
         occurrence = job.occurrence(now)
-        if occurrence is None or not should_run(
+        if forced:
+            # A dashboard "run now" click bypasses the normal due/dedup check
+            # (and can even run a currently-disabled job on demand); jobs whose
+            # occurrence() is inherently None (e.g. off-hours intraday) still
+            # need a synthetic occurrence id to record the manual run against.
+            occurrence = occurrence or f"manual-{now.strftime('%Y%m%dT%H%M%S')}"
+        elif occurrence is None or not should_run(
             records.get(job.name),
             occurrence,
             now,
@@ -472,11 +574,24 @@ def run_due_jobs(
         ):
             continue
 
+        previous = records.get(job.name)
+        same_occurrence = previous is not None and previous.occurrence == occurrence
+        carried_failure_alerted = same_occurrence and previous.failure_alerted
+        carried_stale_alerted = same_occurrence and previous.stale_alerted
+
         attempted_at = now_ist()
+        first_attempted_at = (
+            (previous.first_attempted_at or previous.attempted_at)
+            if same_occurrence
+            else attempted_at.isoformat()
+        )
         records[job.name] = JobRecord(
             occurrence=occurrence,
             status="running",
             attempted_at=attempted_at.isoformat(),
+            first_attempted_at=first_attempted_at,
+            failure_alerted=carried_failure_alerted,
+            stale_alerted=carried_stale_alerted,
         )
         save_state(records)
         log.info(
@@ -491,8 +606,16 @@ def run_due_jobs(
                 cwd=REPO_ROOT,
                 env=os.environ.copy(),
                 check=False,
+                timeout=JOB_TIMEOUT.total_seconds(),
             )
             return_code = result.returncode
+        except subprocess.TimeoutExpired:
+            log.error(
+                "job[%s] exceeded %.0f minute timeout; killed",
+                job.name,
+                JOB_TIMEOUT.total_seconds() / 60,
+            )
+            return_code = -1
         except OSError:
             log.exception("job[%s] could not start", job.name)
             return_code = 127
@@ -503,14 +626,9 @@ def run_due_jobs(
             status = job.verify(occurrence, finished_at)
             if status == "failed":
                 return_code = 3
-        records[job.name] = JobRecord(
-            occurrence=occurrence,
-            status=status,
-            attempted_at=attempted_at.isoformat(),
-            finished_at=finished_at.isoformat(),
-            return_code=return_code,
-        )
-        save_state(records)
+
+        failure_alerted = carried_failure_alerted
+        stale_alerted = carried_stale_alerted
         if status == "failed":
             failures += 1
             log.warning(
@@ -520,6 +638,21 @@ def run_due_jobs(
                 return_code,
                 RETRY_DELAY.total_seconds() / 60,
             )
+            if not carried_failure_alerted:
+                _alert(
+                    f":warning: scheduler job `{job.name}` failed "
+                    f"(occurrence={occurrence}, return_code={return_code}). "
+                    f"Retrying every {RETRY_DELAY.total_seconds() / 60:.0f} min."
+                )
+                failure_alerted = True
+            stuck_for = finished_at - datetime.fromisoformat(first_attempted_at)
+            if stuck_for >= STALE_ALERT_AFTER and not carried_stale_alerted:
+                _alert(
+                    f":rotating_light: scheduler job `{job.name}` has been failing "
+                    f"for {stuck_for.total_seconds() / 60:.0f} min "
+                    f"(occurrence={occurrence}) with no success yet."
+                )
+                stale_alerted = True
         else:
             log.info(
                 "job[%s] completed occurrence=%s status=%s",
@@ -527,6 +660,24 @@ def run_due_jobs(
                 occurrence,
                 status,
             )
+            failure_alerted = False
+            stale_alerted = False
+
+        records[job.name] = JobRecord(
+            occurrence=occurrence,
+            status=status,
+            attempted_at=attempted_at.isoformat(),
+            finished_at=finished_at.isoformat(),
+            return_code=return_code,
+            first_attempted_at=first_attempted_at,
+            failure_alerted=failure_alerted,
+            stale_alerted=stale_alerted,
+        )
+        save_state(records)
+        _append_history(job.name, records[job.name])
+        if forced:
+            overrides.get("force_run", {}).pop(job.name, None)
+            save_overrides(overrides)
     return failures
 
 
@@ -554,13 +705,7 @@ def _arguments(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _arguments(argv)
     if args.show_state:
-        print(
-            json.dumps(
-                {name: asdict(record) for name, record in load_state().items()},
-                indent=2,
-                sort_keys=True,
-            )
-        )
+        print(json.dumps(job_status_summary(), indent=2, sort_keys=True))
         return 0
     if POLL_SECONDS <= 0:
         raise ValueError("APP_SCHEDULER_POLL_SECONDS must be greater than zero")
@@ -591,6 +736,12 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 log.exception("scheduler tick failed; state was preserved")
                 exit_code = 1
+            try:
+                import scheduler_dashboard
+
+                scheduler_dashboard.write_dashboard()
+            except Exception:
+                log.exception("could not regenerate dashboard.html")
             if args.once:
                 break
             deadline = time.monotonic() + POLL_SECONDS

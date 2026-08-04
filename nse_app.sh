@@ -5,8 +5,10 @@ cd "$(dirname "$0")"
 
 PID_FILE=".app_scheduler.pid"
 OLLAMA_PID_FILE=".ollama.pid"
+DASHBOARD_PID_FILE=".dashboard_server.pid"
 SCHEDULER_LOG="${APP_SCHEDULER_LOG_PATH:-cron.log}"
 OLLAMA_LOG="${APP_OLLAMA_LOG_PATH:-ollama.log}"
+DASHBOARD_LOG="${APP_DASHBOARD_LOG_PATH:-dashboard_server.log}"
 
 configured_value() {
     local name="$1"
@@ -95,6 +97,30 @@ start_scheduler() {
     echo "Logs: $SCHEDULER_LOG"
 }
 
+dashboard_url() {
+    local port
+    port="$(configured_value APP_DASHBOARD_PORT 8787)"
+    printf 'http://127.0.0.1:%s/' "$port"
+}
+
+start_dashboard_server() {
+    if process_is_running "$DASHBOARD_PID_FILE" "dashboard_server.py"; then
+        echo "Dashboard server is already running (PID $(<"$DASHBOARD_PID_FILE"))."
+        return
+    fi
+    unlink "$DASHBOARD_PID_FILE" 2>/dev/null || true
+    echo "Starting dashboard server..."
+    nohup setsid uv run dashboard_server.py >>"$DASHBOARD_LOG" 2>&1 </dev/null &
+    local pid="$!"
+    printf '%s\n' "$pid" >"$DASHBOARD_PID_FILE"
+    sleep 1
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "error: dashboard server exited during startup; inspect $DASHBOARD_LOG" >&2
+        return 1
+    fi
+    echo "Dashboard: $(dashboard_url)"
+}
+
 stop_pid_group() {
     local pid_file="$1"
     local label="$2"
@@ -125,6 +151,11 @@ show_status() {
     else
         echo "Scheduler: stopped"
     fi
+    if process_is_running "$DASHBOARD_PID_FILE" "dashboard_server.py"; then
+        echo "Dashboard: running (PID $(<"$DASHBOARD_PID_FILE")) at $(dashboard_url)"
+    else
+        echo "Dashboard: stopped"
+    fi
     if ollama_is_ready; then
         echo "Ollama: ready"
     else
@@ -145,11 +176,12 @@ Commands:
   start       Start Aerospike, Ollama if needed, and the background scheduler
   stop        Stop the scheduler
   restart     Restart the scheduler and verify dependencies
-  status      Show dependency, scheduler, and last-job state
+  status      Show dependency, scheduler, dashboard, and last-job state
+  dashboard   Ensure the dashboard server is running and open it in a browser
   logs        Follow scheduler/application logs
   run-once    Start dependencies and run all jobs currently due once
   foreground  Start dependencies and keep the scheduler in this terminal
-  down        Stop the scheduler and services started by this application
+  down        Stop the scheduler, dashboard, and services started by this application
 EOF
 }
 
@@ -158,14 +190,18 @@ case "$command" in
     start)
         prepare_dependencies
         start_scheduler
+        start_dashboard_server
         ;;
     stop)
         stop_pid_group "$PID_FILE" "scheduler" "app_scheduler.py"
+        stop_pid_group "$DASHBOARD_PID_FILE" "dashboard server" "dashboard_server.py"
         ;;
     restart)
         stop_pid_group "$PID_FILE" "scheduler" "app_scheduler.py"
+        stop_pid_group "$DASHBOARD_PID_FILE" "dashboard server" "dashboard_server.py"
         prepare_dependencies
         start_scheduler
+        start_dashboard_server
         ;;
     status)
         show_status
@@ -178,12 +214,17 @@ case "$command" in
         prepare_dependencies
         exec uv run app_scheduler.py --once
         ;;
+    dashboard)
+        start_dashboard_server
+        command -v xdg-open >/dev/null 2>&1 && xdg-open "$(dashboard_url)" >/dev/null 2>&1 || true
+        ;;
     foreground)
         prepare_dependencies
         exec uv run app_scheduler.py
         ;;
     down)
         stop_pid_group "$PID_FILE" "scheduler" "app_scheduler.py"
+        stop_pid_group "$DASHBOARD_PID_FILE" "dashboard server" "dashboard_server.py"
         docker compose down
         if [[ -f "$OLLAMA_PID_FILE" ]]; then
             stop_pid_group "$OLLAMA_PID_FILE" "managed Ollama" "ollama serve"

@@ -19,10 +19,15 @@ evaluation.db
 evaluation.db-*
 .intraday_alert_state.json*
 .app_scheduler_state.json*
+.app_scheduler_overrides.json*
 .app_scheduler.lock
 .app_scheduler.pid
+.dashboard_server.pid
 .ollama.pid
 ollama.log
+dashboard_server.log
+scheduler_history.jsonl
+dashboard.html
 
 # On-disk data cache
 .cache/
