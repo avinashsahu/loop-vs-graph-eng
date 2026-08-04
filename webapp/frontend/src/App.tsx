@@ -1,9 +1,11 @@
 import JobsPage from './JobsPage'
+import ScanPage from './ScanPage'
 
 function App() {
   return (
     <main>
       <h1>NSE Stock Picker — Control</h1>
+      <ScanPage />
       <JobsPage />
     </main>
   )
