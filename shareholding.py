@@ -490,6 +490,19 @@ class AerospikeFilingStore:
             limit=limit,
         )
 
+    def list_universe(self, universe: str) -> list[dict]:
+        """All known members of `universe`, active or not -- for coverage
+        reporting, unlike due_universe_symbols which filters to due-only."""
+        records = self._client.scan(
+            self._namespace,
+            self._universe_set,
+        ).results()
+        return [
+            record_bins
+            for _, _, record_bins in records
+            if isinstance(record_bins, dict) and record_bins.get("universe") == universe
+        ]
+
     def record_universe_attempt(
         self,
         universe: str,

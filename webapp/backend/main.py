@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -10,11 +11,27 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import app_scheduler
+import shareholding as shareholding_module
 from market_time import now_ist
 
 app = FastAPI(title="NSE Stock Picker Control API")
 
 EVALUATION_DB_PATH = Path(os.environ.get("EVALUATION_DB_PATH", "evaluation.db"))
+
+_shareholding_store_instance = None
+
+
+def _shareholding_store():
+    global _shareholding_store_instance
+    if _shareholding_store_instance is None:
+        _shareholding_store_instance = shareholding_module.AerospikeFilingStore()
+    return _shareholding_store_instance
+
+
+def _epoch_to_iso(epoch: int | None) -> str | None:
+    if not epoch:
+        return None
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
 
 
 class ToggleRequest(BaseModel):
@@ -173,6 +190,31 @@ def get_decision(decision_id: str) -> dict:
     except ValueError:
         decision["evidence"] = None
     return decision
+
+
+@app.get("/api/coverage/shareholding")
+def shareholding_coverage(universe: str = "NIFTY TOTAL MKT") -> dict:
+    try:
+        store = _shareholding_store()
+        members = store.list_universe(universe)
+        queued = set(store.queued_symbols())
+    except Exception as error:
+        raise HTTPException(
+            status_code=503, detail=f"Aerospike unavailable: {error}"
+        ) from error
+    results = [
+        {
+            "symbol": str(bins.get("symbol", "")),
+            "active": bool(bins.get("active")),
+            "last_status": bins.get("last_status"),
+            "last_attempt": _epoch_to_iso(bins.get("last_attempt")),
+            "completed_at": _epoch_to_iso(bins.get("completed_at")),
+            "periods": bins.get("periods"),
+            "queued": str(bins.get("symbol", "")) in queued,
+        }
+        for bins in sorted(members, key=lambda b: str(b.get("symbol", "")))
+    ]
+    return {"universe": universe, "total": len(results), "results": results}
 
 
 _FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"

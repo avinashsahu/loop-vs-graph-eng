@@ -1,8 +1,10 @@
+import json
 import sqlite3
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -231,6 +233,53 @@ class DecisionsEndpointTests(unittest.TestCase):
                 client = TestClient(app)
                 response = client.get("/api/decisions/not-a-real-id")
                 self.assertEqual(response.status_code, 404)
+
+
+class ShareholdingCoverageTests(unittest.TestCase):
+    def test_coverage_reports_universe_members(self):
+        fake_store = Mock()
+        fake_store.list_universe.return_value = [
+            {
+                "symbol": "RELIANCE",
+                "active": 1,
+                "last_status": "complete",
+                "last_attempt": 1754270400,
+                "completed_at": 1754270400,
+                "periods": 5,
+            },
+            {
+                "symbol": "TCS",
+                "active": 1,
+                "last_status": "pending",
+                "last_attempt": 0,
+                "completed_at": 0,
+                "periods": 0,
+            },
+        ]
+        fake_store.queued_symbols.return_value = ["TCS"]
+        with patch.object(main_module, "_shareholding_store", return_value=fake_store):
+            client = TestClient(app)
+            response = client.get(
+                "/api/coverage/shareholding", params={"universe": "NIFTY TOTAL MKT"}
+            )
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            self.assertEqual(body["total"], 2)
+            by_symbol = {row["symbol"]: row for row in body["results"]}
+            self.assertEqual(by_symbol["RELIANCE"]["last_status"], "complete")
+            self.assertFalse(by_symbol["RELIANCE"]["queued"])
+            self.assertTrue(by_symbol["TCS"]["queued"])
+            self.assertIsNone(by_symbol["TCS"]["last_attempt"])
+
+    def test_coverage_returns_503_when_aerospike_unreachable(self):
+        with patch.object(
+            main_module,
+            "_shareholding_store",
+            side_effect=RuntimeError("connection refused"),
+        ):
+            client = TestClient(app)
+            response = client.get("/api/coverage/shareholding")
+            self.assertEqual(response.status_code, 503)
 
 
 if __name__ == "__main__":
