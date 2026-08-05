@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import app_scheduler
+import evaluation
 import shareholding as shareholding_module
 from market_time import now_ist
 
@@ -271,6 +272,32 @@ def cache_coverage(system: str) -> dict:
         "total": len(results),
         "results": results,
     }
+
+
+@app.get("/api/calibration-report")
+def calibration_report() -> dict:
+    if not EVALUATION_DB_PATH.exists():
+        return {
+            "decisions": {
+                "total": 0,
+                "status_counts": {},
+                "evaluable": 0,
+                "raw_evaluable": 0,
+                "repeated_evaluable": 0,
+                "canonical": [],
+                "reason_codes": [],
+                "model_configs": [],
+                "policy_versions": [],
+            },
+            "horizons": {},
+            "technical_score_bands": {},
+            "model_performance": [],
+            "decision_graph_performance": [],
+            "methodology_performance": [],
+            "methodology": {},
+        }
+    ledger = evaluation.EvaluationLedger(str(EVALUATION_DB_PATH))
+    return ledger.calibration_report()
 
 
 _FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"

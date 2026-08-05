@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 
 import app_scheduler
+import evaluation
 import webapp.backend.main as main_module
 from webapp.backend.main import app
 
@@ -316,6 +317,38 @@ class CacheCoverageTests(unittest.TestCase):
                 response = client.get("/api/coverage/cache/governance")
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.json()["total"], 0)
+
+
+class CalibrationReportTests(unittest.TestCase):
+    def test_report_reflects_recorded_decisions(self):
+        with TemporaryDirectory() as temporary:
+            db_path = Path(temporary) / "evaluation.db"
+            ledger = evaluation.EvaluationLedger(str(db_path))
+            ledger.record_decision(
+                {
+                    "timestamp": "2026-08-01T09:00:00+05:30",
+                    "scan_label": "overnight_1",
+                    "symbol": "RELIANCE",
+                    "status": "proposed",
+                }
+            )
+            with patch.object(main_module, "EVALUATION_DB_PATH", db_path):
+                client = TestClient(app)
+                response = client.get("/api/calibration-report")
+                self.assertEqual(response.status_code, 200)
+                body = response.json()
+                self.assertEqual(body["decisions"]["total"], 1)
+                self.assertEqual(body["decisions"]["status_counts"], {"proposed": 1})
+                self.assertIn("methodology", body)
+
+    def test_report_handles_missing_database(self):
+        with TemporaryDirectory() as temporary:
+            missing_db = Path(temporary) / "does-not-exist.db"
+            with patch.object(main_module, "EVALUATION_DB_PATH", missing_db):
+                client = TestClient(app)
+                response = client.get("/api/calibration-report")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["decisions"]["total"], 0)
 
 
 if __name__ == "__main__":
