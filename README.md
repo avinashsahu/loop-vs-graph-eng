@@ -237,10 +237,10 @@ plain file.
 
 `./nse_app.sh start` also launches a FastAPI + React control website at
 `http://127.0.0.1:8788/` (`APP_CONTROL_API_PORT`). It covers job control, an
-ad-hoc scan trigger, a decisions browser, and data-warm coverage (shareholding
-completeness vs universe membership; cache freshness for
-disclosures/governance/document-research, which have no persisted universe
-table to compare against). Frontend development requires Node.js/npm (`webapp/frontend/`, built with
+ad-hoc scan trigger, a decisions browser, data-warm coverage, and the
+calibration report (decision/outcome statistics, reason codes, model and
+policy breakdowns) -- more modules are planned. Frontend development requires
+Node.js/npm (`webapp/frontend/`, built with
 Vite) -- run `npm run dev` there for hot reload against a running control API,
 or `npm run build` to produce the static files the API serves in normal use.
 Like the dashboard, this has no authentication and must stay localhost-only.
