@@ -1,3 +1,4 @@
+import CoveragePage from './CoveragePage'
 import DecisionsPage from './DecisionsPage'
 import JobsPage from './JobsPage'
 import ScanPage from './ScanPage'
@@ -13,6 +14,9 @@ function App() {
       </div>
       <div className="panel">
         <DecisionsPage />
+      </div>
+      <div className="panel">
+        <CoveragePage />
       </div>
       <div className="panel">
         <JobsPage />
