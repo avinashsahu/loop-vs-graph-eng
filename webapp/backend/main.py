@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -215,6 +216,61 @@ def shareholding_coverage(universe: str = "NIFTY TOTAL MKT") -> dict:
         for bins in sorted(members, key=lambda b: str(b.get("symbol", "")))
     ]
     return {"universe": universe, "total": len(results), "results": results}
+
+
+CACHE_DIR = Path(os.environ.get("CACHE_DIR", ".cache"))
+
+CACHE_COVERAGE_SYSTEMS = {
+    "disclosures": (
+        "material_disclosures_v1_",
+        float(os.environ.get("MATERIAL_DISCLOSURE_CACHE_TTL_HOURS", "336")),
+    ),
+    "governance": (
+        "governance_v1_",
+        float(os.environ.get("GOVERNANCE_CACHE_TTL_HOURS", "168")),
+    ),
+    "document_research": (
+        "document_research_v1_",
+        float(os.environ.get("DOCUMENT_RESEARCH_CACHE_TTL_HOURS", "720")),
+    ),
+}
+
+
+@app.get("/api/coverage/cache/{system}")
+def cache_coverage(system: str) -> dict:
+    if system not in CACHE_COVERAGE_SYSTEMS:
+        raise HTTPException(status_code=404, detail=f"unknown system {system!r}")
+    prefix, ttl_hours = CACHE_COVERAGE_SYSTEMS[system]
+    results = []
+    if CACHE_DIR.exists():
+        for path in CACHE_DIR.glob(f"{prefix}*.json"):
+            symbol = path.stem[len(prefix):]
+            fetched_at = None
+            try:
+                fetched_at = json.loads(path.read_text()).get("fetched_at")
+            except (OSError, ValueError):
+                pass
+            age_hours = (time.time() - fetched_at) / 3600 if fetched_at else None
+            results.append(
+                {
+                    "symbol": symbol,
+                    "fetched_at": _epoch_to_iso(
+                        int(fetched_at) if fetched_at else None
+                    ),
+                    "age_hours": round(age_hours, 1) if age_hours is not None else None,
+                    "fresh": age_hours is not None and age_hours < ttl_hours,
+                }
+            )
+    results.sort(
+        key=lambda row: row["age_hours"] if row["age_hours"] is not None else -1,
+        reverse=True,
+    )
+    return {
+        "system": system,
+        "ttl_hours": ttl_hours,
+        "total": len(results),
+        "results": results,
+    }
 
 
 _FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"

@@ -282,5 +282,41 @@ class ShareholdingCoverageTests(unittest.TestCase):
             self.assertEqual(response.status_code, 503)
 
 
+class CacheCoverageTests(unittest.TestCase):
+    def test_disclosures_coverage_lists_cached_symbols_by_staleness(self):
+        with TemporaryDirectory() as temporary:
+            cache_dir = Path(temporary)
+            now = time.time()
+            (cache_dir / "material_disclosures_v1_RELIANCE.json").write_text(
+                json.dumps({"fetched_at": now - 3600, "data": {}})
+            )
+            (cache_dir / "material_disclosures_v1_TCS.json").write_text(
+                json.dumps({"fetched_at": now - 3600 * 400, "data": {}})
+            )
+            with patch.object(main_module, "CACHE_DIR", cache_dir):
+                client = TestClient(app)
+                response = client.get("/api/coverage/cache/disclosures")
+                self.assertEqual(response.status_code, 200)
+                body = response.json()
+                self.assertEqual(body["total"], 2)
+                self.assertEqual(body["results"][0]["symbol"], "TCS")
+                self.assertFalse(body["results"][0]["fresh"])
+                self.assertTrue(body["results"][1]["fresh"])
+
+    def test_coverage_cache_returns_404_for_unknown_system(self):
+        client = TestClient(app)
+        response = client.get("/api/coverage/cache/not_a_real_system")
+        self.assertEqual(response.status_code, 404)
+
+    def test_coverage_cache_handles_missing_directory(self):
+        with TemporaryDirectory() as temporary:
+            missing_dir = Path(temporary) / "does-not-exist"
+            with patch.object(main_module, "CACHE_DIR", missing_dir):
+                client = TestClient(app)
+                response = client.get("/api/coverage/cache/governance")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["total"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
